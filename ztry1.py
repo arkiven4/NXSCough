@@ -30,7 +30,7 @@ PATIENCE = 5
 
 CLASS_NAMES = ["Healhty", "TB"]
 NUM_CLASS = 2
-HIDDEN_SIZE = 256
+HIDDEN_SIZE = 128
 AUDIO_LENGTH = 0.5 #0.89
 SAMPLE_RATE = 22050
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
