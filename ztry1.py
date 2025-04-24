@@ -14,7 +14,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import label_binarize
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix, roc_curve, auc, roc_auc_score, f1_score
 
-from datasets import AudioDataset, collate_fn, df_sampler
+from datasets import AudioDatasetBaseFeature, collate_fn, df_sampler
 import models
 import utils
 
@@ -30,7 +30,7 @@ PATIENCE = 5
 
 CLASS_NAMES = ["Healhty", "TB"]
 NUM_CLASS = 2
-HIDDEN_SIZE = 256
+HIDDEN_SIZE = 8
 AUDIO_LENGTH = 0.5 #0.89
 SAMPLE_RATE = 22050
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -55,10 +55,10 @@ train_df, test_df =  train_test_split(df, test_size=0.2, stratify=df['disease_la
 sampler, class_weights = df_sampler(train_df)
 class_weights = class_weights.to(DEVICE)
 
-dataset_train = AudioDataset(DATA_PATH, train_df, sample_rate=SAMPLE_RATE, desired_length=AUDIO_LENGTH)
+dataset_train = AudioDatasetBaseFeature(DATA_PATH, train_df, sample_rate=SAMPLE_RATE, desired_length=AUDIO_LENGTH)
 dataloader_train = DataLoader(dataset_train, batch_size=BATCH_SIZE, pin_memory=True, shuffle=False, sampler=sampler, collate_fn=collate_fn)
 
-dataset_test = AudioDataset(DATA_PATH, test_df, sample_rate=SAMPLE_RATE, desired_length=AUDIO_LENGTH)
+dataset_test = AudioDatasetBaseFeature(DATA_PATH, test_df, sample_rate=SAMPLE_RATE, desired_length=AUDIO_LENGTH)
 dataloader_test = DataLoader(dataset_test, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
 
 DATAINPUT_SHAPE = next(iter(dataloader_train))[0].shape

@@ -1,4 +1,4 @@
-import pickle
+import os, pickle, random
 import pandas as pd
 
 import torch
@@ -6,10 +6,13 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchaudio import transforms as T
+from sklearn.utils import shuffle 
 
 import utils
+from augmentation import DataAugmentator
 
-class AudioDataset(torch.utils.data.Dataset):
+
+class AudioDatasetBaseFeature(torch.utils.data.Dataset):
     def __init__(self, data_path, df_data, sample_rate, desired_length):
         self.data = df_data
         self.sample_rate = sample_rate
@@ -60,3 +63,105 @@ def df_sampler(train_df):
     sampler = torch.utils.data.WeightedRandomSampler(df_balanced['weights'].values, len(df_balanced))
 
     return sampler, class_weights
+
+class SERDatasets(torch.utils.data.Dataset):
+    def __init__(self, data_numpy, hparams):
+        # ['FileName', 'EmoAct', 'EmoVal', 'EmoDom', 'SpkrID', 'EmoClassCode']
+        self.audiopaths_and_text = shuffle(data_numpy, random_state=20)
+        self.hop_length = hparams.hop_length
+        self.max_wav_value = hparams.max_wav_value
+        self.sampling_rate = hparams.sampling_rate
+        self.add_noise = hparams.add_noise
+
+        self.audio_path = hparams.audio_path
+        self.db_path = hparams.db_path
+        self.wav_mean, self.wav_std = None, None
+        self.vocabs = None
+
+        self.augment_data = hparams.augment_data
+
+        if self.augment_data:
+            self.data_augmentator = DataAugmentator(
+                None,
+                "/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_noises_labels.tsv",
+                None,
+                "/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_rirs_labels.tsv",
+                5.5,
+                ["apply_reverb", "add_background_noise"],
+            )
+
+        #self._filter()
+        #random.seed(1234)
+        #random.shuffle(self.audiopaths_and_text)
+
+    def _filter(self):
+        lengths = []
+        for audiopath_and_text in self.audiopaths_and_text:
+            audiopath = self.audio_path + audiopath_and_text[0]
+            lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
+        self.lengths = lengths
+
+    def get_mel_text_pair(self, audiopath_and_text):
+        wavname, dse_id = audiopath_and_text[0], audiopath_and_text[1] #, audiopath_and_text[2], audiopath_and_text[3], 0, audiopath_and_text[5] #audiopath_and_text[4], audiopath_and_text[5]
+        wav = self.get_audio(self.audio_path + wavname)
+
+        return (wavname, wav, dse_id)
+
+    def get_audio(self, filename): # random.randint(1, 6)
+        audio = utils.load_audio_sample(filename, None, None, 
+                                       0.5, fade_samples_ratio=6, pad_types='zero') # repeat zero
+        audio = audio.squeeze(0)
+
+        if self.augment_data:
+            if random.uniform(0, 0.999) > 1 - 0.6:
+                try:
+                    audio = self.data_augmentator(audio.unsqueeze(0), self.sampling_rate).squeeze(0)
+                except:
+                    audio = audio
+
+        if self.add_noise:
+            audio = audio + torch.rand_like(audio)
+
+        audio = audio.unsqueeze(0)
+        return audio
+
+    def __getitem__(self, index):
+        return self.get_mel_text_pair(self.audiopaths_and_text[index])
+
+    def __len__(self):
+        return len(self.audiopaths_and_text)
+
+class SERDatasetsCollate():
+    """ Zero-pads model inputs and targets based on number of frames per step
+    """
+    def __init__(self, n_frames_per_step=1):
+        self.n_frames_per_step = n_frames_per_step
+
+    def __call__(self, batch):
+        """Collate's training batch from normalized text and mel-spectrogram
+        PARAMS
+        ------
+        batch: [text_normalized, mel_normalized]
+        """
+        wav_name = []
+        input_lengths, ids_sorted_decreasing = torch.sort(
+            torch.LongTensor([x[1].size(1) for x in batch]),
+            dim=0, descending=True)
+        max_wav_len = input_lengths[0] # max([x[0].size(1) for x in batch])
+
+        dse_ids = torch.LongTensor(len(batch))
+
+        wav_padded = torch.FloatTensor(len(batch), 1, max_wav_len)
+        wav_padded.zero_()
+        attention_masks = torch.FloatTensor(len(batch), max_wav_len)
+        attention_masks.zero_()
+
+        for i in range(len(ids_sorted_decreasing)):
+            wav_name.append(batch[i][0])
+            wav = batch[ids_sorted_decreasing[i]][1]
+            wav_padded[i, :, :wav.size(1)] = wav
+            attention_masks[i, :wav.size(1)] = 1
+
+            dse_ids[i] = batch[ids_sorted_decreasing[i]][2]
+        
+        return wav_name, wav_padded, attention_masks, dse_ids
