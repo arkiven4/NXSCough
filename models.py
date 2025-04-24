@@ -116,3 +116,40 @@ class ResNet101(torchvision.models.resnet.ResNet):
         x = self.fc(x)
 
         return x
+    
+
+class HeadCatPrediction(nn.Module):
+    def __init__(self, pooling_hidden, regress_hidden_dim, regress_dropout, regress_layers, output_dim, **kwargs):
+        super(HeadCatPrediction, self).__init__()
+
+        self.inp_drop = nn.Dropout(regress_dropout)
+        self.fc=nn.ModuleList([nn.Sequential(
+                nn.Linear(pooling_hidden, regress_hidden_dim), 
+                nn.LayerNorm(regress_hidden_dim), nn.ReLU(), nn.Dropout(regress_dropout))])
+
+        for lidx in range(regress_layers-1):
+            self.fc.append(nn.Sequential(
+                    nn.Linear(regress_hidden_dim, regress_hidden_dim), 
+                    nn.LayerNorm(regress_hidden_dim), nn.ReLU(), nn.Dropout(regress_dropout)))
+
+        self.out = nn.Sequential(nn.Linear(regress_hidden_dim, output_dim))
+
+        self.dense = nn.Linear(pooling_hidden, regress_hidden_dim)
+        self.dropout = nn.Dropout(regress_dropout)
+        self.out_proj = nn.Linear(regress_hidden_dim, output_dim)
+
+    # def get_repr(self, x):
+    #     h = self.inp_drop(x)
+    #     for lidx, fc in enumerate(self.fc):
+    #         h=fc(h)
+    #     return h
+
+    def forward(self, x):
+        x = self.dropout(x)
+        x = self.dense(x)
+        x = torch.tanh(x)
+        x = self.dropout(x)
+        out_dim = self.out_proj(x)
+        # h = self.get_repr(x)
+        # out_dim = self.out(h)
+        return out_dim
