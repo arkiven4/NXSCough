@@ -27,7 +27,7 @@ warnings.simplefilter("ignore", UserWarning)
 # SECTION: Intialize Data
 # =============================================================
 
-MODEL_NAME = "lstm_try1"
+MODEL_NAME = "lstm_try12"
 CONFIG_PATH = "configs/lstm.json"
 
 model_dir = os.path.join("./logs", MODEL_NAME)
@@ -59,8 +59,8 @@ cur_bs = BATCH_SIZE // ACCUMULATION_STEP
 Diseases_codes = [0, 1]
 CLASS_NAMES = ["Healthy", "TB"]
 
-df = pd.read_csv(f'{hps.data.db_path}/metadata_combine.csv')
-df = df[df['database'].isin(['tb_longitudinal_data', 'tb_solicited_data'])]
+df = pd.read_csv(f'{hps.data.db_path}/{hps.data.metadata_csv}')
+#df = df[df['database'].isin(['tb_longitudinal_data', 'tb_solicited_data'])]
 
 df_train, df_test = train_test_split(df, test_size=0.03, random_state=42, shuffle=True)
 # df_train = df[df['database'].isin(['tb_longitudinal_data'])]
@@ -72,8 +72,8 @@ class_weights = {cls: total_samples / (len(Diseases_codes) * freq) if freq != 0 
 weights_list = [class_weights[cls] for cls in Diseases_codes]
 class_weights_tensor = torch.tensor(weights_list, device='cuda', dtype=torch.float)
 
-df_train.drop(['database'], axis=1, inplace=True)
-df_test.drop(['database'], axis=1, inplace=True)
+#df_train.drop(['database'], axis=1, inplace=True)
+#df_test.drop(['database'], axis=1, inplace=True)
 
 # =============================================================
 # SECTION: Setup Logger, Dataloader

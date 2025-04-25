@@ -34,8 +34,8 @@
     "augment_data": false,
     "add_noise": false,
     "emotion_class": 2,
-    "db_path": "/run/media/fourier/Data1/Pras/Database_ThesisNew/",
-    "norm_file": "normmax_clean_stat_file.pkl"
+    "db_path": "/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/",
+    "metadata_csv": "tb_solic_filt.csv"
   }, 
   "model": {
     "pooling_type": "LSTMModel1",

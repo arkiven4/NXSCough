@@ -2,3 +2,4 @@ __pycache__
 output/*/
 logs/
 *.zip
+data/TB_resample/
