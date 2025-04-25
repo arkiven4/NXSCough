@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import GradScaler
 from sklearn.model_selection import train_test_split
 
 import utils
@@ -59,7 +59,7 @@ cur_bs = BATCH_SIZE // ACCUMULATION_STEP
 Diseases_codes = [0, 1]
 CLASS_NAMES = ["Healthy", "TB"]
 
-df = pd.read_csv('/run/media/fourier/Data1/Pras/Database_ThesisNew/metadata_combine.csv')
+df = pd.read_csv(f'{hps.data.db_path}/metadata_combine.csv')
 df = df[df['database'].isin(['tb_longitudinal_data', 'tb_solicited_data'])]
 
 df_train, df_test = train_test_split(df, test_size=0.03, random_state=42, shuffle=True)
@@ -133,7 +133,7 @@ else:
     except Exception as e:
         print(e)
 
-scaler = GradScaler()
+scaler = GradScaler('cuda')
 optimizer_p.zero_grad(set_to_none=True)
 
 # =============================================================
@@ -302,7 +302,7 @@ sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=CLASS_NAMES, ytic
 plt.xlabel("Predicted")
 plt.ylabel("Actual")
 plt.title("Confusion Matrix")
-plt.savefig(f"{model_dir}/cm.png")
+plt.savefig(f"{model_dir}/result_cm.png")
 
 # --- ROC Curve ---
 n_classes = len(CLASS_NAMES)
@@ -319,7 +319,7 @@ plt.ylabel("True Positive Rate")
 plt.title("ROC Curve")
 plt.legend(loc="lower right")
 plt.grid(True)
-plt.savefig(f"{model_dir}/roc.png")
+plt.savefig(f"{model_dir}/result_roc.png")
 
 accuracy = accuracy_score(all_labels, all_preds, normalize=True)
 b_accuracy = balanced_accuracy_score(all_labels, all_preds)
@@ -329,7 +329,7 @@ try:
 except Exception as exception:
     roc_auc = None
 
-with open(f"{model_dir}/result.txt", "w") as file:
+with open(f"{model_dir}/result_summary.txt", "w") as file:
     file.write(df['disease_label'].value_counts().to_string() + "\n")
     file.write("\n")
     file.write(f"Accuracy {accuracy:.2f} | Balanced Accuracy {b_accuracy:.2f} | AUC {auc_score:.2f} |ROC AUC {roc_auc:.2f} | F1 Score Accuracy: {f1:.2f}\n")
