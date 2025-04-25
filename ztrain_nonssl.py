@@ -27,7 +27,7 @@ warnings.simplefilter("ignore", UserWarning)
 # SECTION: Intialize Data
 # =============================================================
 
-MODEL_NAME = "lstm_try5"
+MODEL_NAME = "cnn_try2"
 CONFIG_PATH = "configs/lstm.json"
 
 model_dir = os.path.join("./logs", MODEL_NAME)
@@ -93,6 +93,7 @@ val_dataset = SERDatasets(df_test.values, hps.data)
 train_loader = DataLoader(train_dataset, num_workers=28, shuffle=True, batch_size=cur_bs, pin_memory=True, drop_last=True, collate_fn=collate_fn)
 val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size, pin_memory=True, drop_last=True, collate_fn=collate_fn)
 
+print(next(iter(train_loader))[1][0].numpy().shape)
 # =============================================================
 # SECTION: Setup Logger, Dataloader
 # =============================================================
@@ -153,7 +154,7 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
         
         with torch.amp.autocast("cuda", enabled=True):
             x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True)
-            dse_pred = pool_model(audio, x_lengths)
+            dse_pred = pool_model(audio)
 
             loss, f1_micro, f1_macro, accuracy = utils.CE_weight_category(dse_pred, dse_id, class_weights_tensor)
 
@@ -202,7 +203,7 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
             dse_ids = dse_ids.cuda(non_blocking=True).long()
 
             x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True).long()
-            dse_pred = pool_model(audio, x_lengths)
+            dse_pred = pool_model(audio)
 
             loss, f1_micro, f1_macro, accuracy = utils.CE_weight_category(dse_pred, dse_ids, class_weights_tensor)
 
@@ -287,7 +288,7 @@ with torch.no_grad():
         dse_ids = dse_ids.cuda(non_blocking=True).long()
 
         x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True).long()
-        outputs = pool_model(audio, x_lengths)
+        outputs = pool_model(audio)
         
         probs = torch.softmax(outputs, dim=1)
         preds = torch.argmax(outputs, dim=1)

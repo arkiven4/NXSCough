@@ -31,13 +31,12 @@
     "mel_fmin": 0.0,
     "mel_fmax": 8000.0,
     "acoustic_feature": false,
-    "augment_data": true,
-    "add_noise": true,
-    "add_blank": true,
+    "augment_data": false,
+    "add_noise": false,
+    "add_blank": false,
     "emotion_class": 2,
-    "db_path": "/run/media/fourier/Data1/Pras/Interspeech2025/Data_Raw/",
-    "norm_file": "normmax_clean_stat_file.pkl",
-    "audio_path": ""
+    "db_path": "/run/media/fourier/Data1/Pras/Database_ThesisNew/",
+    "metadata_csv": "metadata_combine.csv"
   }, 
   "model": {
     "pooling_type": "SimplePooling2",

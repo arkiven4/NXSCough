@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from torchaudio import transforms as T
 from sklearn.utils import shuffle 
 
-import utils
+import utils, commons
 from augmentation import DataAugmentator
 
 
@@ -67,6 +67,9 @@ class SERDatasets(torch.utils.data.Dataset):
         self.hop_length = hparams.hop_length
         self.max_wav_value = hparams.max_wav_value
         self.sampling_rate = hparams.sampling_rate
+        self.desired_length = hparams.desired_length
+        self.fade_samples_ratio = hparams.fade_samples_ratio
+        self.pad_types = hparams.pad_types
         self.add_noise = hparams.add_noise
         self.db_path = hparams.db_path
 
@@ -84,13 +87,17 @@ class SERDatasets(torch.utils.data.Dataset):
 
         self.wav_transform = None
         if hparams.acoustic_feature:
-            self.wav_transform = T.MFCC(sample_rate=hparams.sampling_rate, n_mfcc=13, 
-                                        melkwargs={"n_fft": hparams.win_length, "hop_length": hparams.hop_length, 
-                                                   "n_mels": hparams.n_mel_channels, "window_fn": torch.hann_window,
-                                                   "power": 2.0, "center": True, "normalized": False})
-            # self.wav_transform = T.MelSpectrogram(sample_rate=hparams.sampling_rate, n_fft=hparams.win_length,
-            #                                         hop_length=hparams.hop_length, n_mels=hparams.n_mel_channels, 
-            #                                         power=2.0)
+            # self.wav_transform = T.MFCC(sample_rate=hparams.sampling_rate, n_mfcc=13, 
+            #                             melkwargs={"n_fft": hparams.win_length, "hop_length": hparams.hop_length, 
+            #                                        "n_mels": hparams.n_mel_channels, "window_fn": torch.hann_window,
+            #                                        "power": 2.0, "center": True, "normalized": False})
+            self.wav_transform = T.MelSpectrogram(sample_rate=hparams.sampling_rate, n_fft=hparams.win_length,
+                                                    hop_length=hparams.hop_length, n_mels=hparams.n_mel_channels, 
+                                                    power=2.0, normalized=True)
+            self.wav_transform = commons.TacotronSTFT(
+                            hparams.filter_length, hparams.hop_length, hparams.win_length,
+                            hparams.n_mel_channels, hparams.sampling_rate, hparams.mel_fmin,
+                            hparams.mel_fmax)
         
         #self._filter()
         #random.seed(1234)
@@ -110,8 +117,9 @@ class SERDatasets(torch.utils.data.Dataset):
         return (wavname, wav, dse_id)
 
     def get_audio(self, filename): # random.randint(1, 6)
-        audio = utils.load_audio_sample(filename, None, None, 
-                                       0.5, fade_samples_ratio=6, pad_types='zero') # repeat zero
+        audio = utils.load_audio_sample(filename, self.sampling_rate, None, 
+                                       self.desired_length, fade_samples_ratio=self.fade_samples_ratio, 
+                                       pad_types=self.pad_types) # repeat zero
         audio = audio.squeeze(0)
 
         if self.augment_data:
