@@ -60,7 +60,7 @@ Diseases_codes = [0, 1]
 CLASS_NAMES = ["Healthy", "TB"]
 
 df = pd.read_csv(f'{hps.data.db_path}/{hps.data.metadata_csv}')
-#df = df[df['database'].isin(['tb_longitudinal_data', 'tb_solicited_data'])]
+df = df[df['database'].isin(['tb_longitudinal_data', 'tb_solicited_data'])]
 
 df_train, df_test = train_test_split(df, test_size=0.03, random_state=42, shuffle=True)
 # df_train = df[df['database'].isin(['tb_longitudinal_data'])]
@@ -72,8 +72,8 @@ class_weights = {cls: total_samples / (len(Diseases_codes) * freq) if freq != 0 
 weights_list = [class_weights[cls] for cls in Diseases_codes]
 class_weights_tensor = torch.tensor(weights_list, device='cuda', dtype=torch.float)
 
-#df_train.drop(['database'], axis=1, inplace=True)
-#df_test.drop(['database'], axis=1, inplace=True)
+# df_train.drop(['database'], axis=1, inplace=True)
+# df_test.drop(['database'], axis=1, inplace=True)
 
 # =============================================================
 # SECTION: Setup Logger, Dataloader
@@ -191,7 +191,6 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
             )
 
         global_step += 1
-        scheduler_p.step()
         
     pool_model.eval()
     losses_tot = []
@@ -228,6 +227,7 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
     )
 
     pool_model.train()
+    scheduler_p.step()
 
     if loss_tot < best_lost and loss_tot > 0:
         logger.info(f"Get Best New Validation!!!!")
