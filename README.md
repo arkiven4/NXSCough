@@ -14,7 +14,7 @@ pip install -r requirements.txt
 Before training, ensure that the path to your dataset is correctly set in your config in the `config/lstm.json` folder:
 
 ```bash
-"db_path": "/run/media/fourier/Data1/Pras/Database_ThesisNew/"
+"db_path": "/run/media/fourier/Data1/Pras/Database_ThesisNew/data/"
 ```
 This folder must contain:
 
