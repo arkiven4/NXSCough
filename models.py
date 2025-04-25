@@ -117,7 +117,42 @@ class ResNet101(torchvision.models.resnet.ResNet):
 
         return x
     
+class LSTMModel1(nn.Module):
+    def __init__(self, input_size, pooling_hidden, p_dropout, output_dim, **kwargs):
+        super(LSTMModel1, self).__init__()
+        
+        self.batch_norm1 = nn.BatchNorm1d(input_size)
+        self.lstm1 = nn.LSTM(input_size, pooling_hidden, batch_first=True)
+        
+        self.batch_norm2 = nn.BatchNorm1d(pooling_hidden)
+        self.lstm2 = nn.LSTM(pooling_hidden, pooling_hidden, batch_first=True)
+        
+        #self.attention = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=8, batch_first=True)
 
+        self.flatten = nn.Flatten()
+        self.dropout = nn.Dropout(p_dropout)
+        self.fc = nn.Linear(pooling_hidden, output_dim)
+
+    def forward(self, x, lengths=None):
+        # x -> [10, 13, 125]
+        x = x.permute(0, 2, 1)
+        x = self.batch_norm1(x.transpose(1, 2)).transpose(1, 2)
+        x, _ = self.lstm1(x)
+        
+        x = self.batch_norm2(x.transpose(1, 2)).transpose(1, 2)
+        x, _ = self.lstm2(x)
+        
+        # attn_output, _ = self.attention(x, x, x)
+        # x = torch.mean(attn_output, dim=1)
+
+        x = self.flatten(x[:, -1, :])
+        x = self.dropout(x)
+        x = self.fc(x)
+        return x
+
+
+
+#################### REG SSL ###########################
 class HeadCatPrediction(nn.Module):
     def __init__(self, pooling_hidden, regress_hidden_dim, regress_dropout, regress_layers, output_dim, **kwargs):
         super(HeadCatPrediction, self).__init__()

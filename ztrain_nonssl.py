@@ -11,12 +11,14 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp import autocast, GradScaler
 from sklearn.model_selection import train_test_split
 
-from transformers import AutoModel, Wav2Vec2FeatureExtractor, WavLMForXVector
 import utils
 import commons
 import models
-import models_pooling
 from datasets import SERDatasets, SERDatasetsCollate
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix, roc_curve, auc, roc_auc_score, f1_score
 
 import warnings
 warnings.simplefilter("ignore", UserWarning)
@@ -25,8 +27,8 @@ warnings.simplefilter("ignore", UserWarning)
 # SECTION: Intialize Data
 # =============================================================
 
-MODEL_NAME = "Cat_PoolingSep_512_Roberto_normmax"
-CONFIG_PATH = "configs/emoclassicat.json"
+MODEL_NAME = "lstm_try1"
+CONFIG_PATH = "configs/lstm.json"
 
 model_dir = os.path.join("./logs", MODEL_NAME)
 if not os.path.exists(model_dir):
@@ -54,19 +56,20 @@ cur_bs = BATCH_SIZE // ACCUMULATION_STEP
 # =============================================================
 
 ##### Label Umum Semua
-emotion_codes = [0, 1]
+Diseases_codes = [0, 1]
+CLASS_NAMES = ["Healthy", "TB"]
 
 df = pd.read_csv('/run/media/fourier/Data1/Pras/Database_ThesisNew/metadata_combine.csv')
-#df = df[df['database'] == 'tb']
+df = df[df['database'].isin(['tb_longitudinal_data', 'tb_solicited_data'])]
 
-#df_train, df_test = train_test_split(df, test_size=0.03, random_state=42, shuffle=True)
-df_train = df[df['database'].isin(['tb_longitudinal_data'])]
-df_test = df[df['database'].isin(['tb_solicited_data'])]
+df_train, df_test = train_test_split(df, test_size=0.03, random_state=42, shuffle=True)
+# df_train = df[df['database'].isin(['tb_longitudinal_data'])]
+# df_test = df[df['database'].isin(['tb_solicited_data'])]
 
 class_frequencies = df_train['disease_label'].value_counts().to_dict()
 total_samples = len(df_train)
-class_weights = {cls: total_samples / (len(emotion_codes) * freq) if freq != 0 else 0 for cls, freq in class_frequencies.items()}
-weights_list = [class_weights[cls] for cls in emotion_codes]
+class_weights = {cls: total_samples / (len(Diseases_codes) * freq) if freq != 0 else 0 for cls, freq in class_frequencies.items()}
+weights_list = [class_weights[cls] for cls in Diseases_codes]
 class_weights_tensor = torch.tensor(weights_list, device='cuda', dtype=torch.float)
 
 df_train.drop(['database'], axis=1, inplace=True)
@@ -96,22 +99,11 @@ val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=h
 epoch_str = 1
 global_step = 0
 
-ssl_model = AutoModel.from_pretrained("microsoft/wavlm-large")
-ssl_model.freeze_feature_encoder()
-ssl_model.eval(); ssl_model.cuda()
-ssl_feat_dim = ssl_model.config.hidden_size
+pool_net = getattr(models, hps.model.pooling_type)
+pool_model = pool_net(hps.model.feature_dim, **hps.model).cuda()
 
-pool_net = getattr(models_pooling, hps.model.pooling_type)
-pool_model = pool_net(ssl_feat_dim, **hps.model).cuda()
-reg_model = models.HeadCatPrediction(**hps.model).cuda()
-
-optimizer_ssl = torch.optim.AdamW(ssl_model.parameters(), 1e-5)
 optimizer_p = torch.optim.AdamW(pool_model.parameters(), hps.train.learning_rate, betas=hps.train.betas, eps=hps.train.eps)
-optimizer_g = torch.optim.AdamW(reg_model.parameters(), hps.train.learning_rate, betas=hps.train.betas, eps=hps.train.eps)
-
-scheduler_ssl = torch.optim.lr_scheduler.ExponentialLR(optimizer_ssl, gamma=hps.train.lr_decay, last_epoch=epoch_str - 2)
 scheduler_p = torch.optim.lr_scheduler.ExponentialLR(optimizer_p, gamma=hps.train.lr_decay, last_epoch=epoch_str - 2)
-scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optimizer_g, gamma=hps.train.lr_decay, last_epoch=epoch_str - 2)
 
 # =============================================================
 # SECTION: Setup Logger, Dataloader
@@ -120,28 +112,14 @@ best_lost = np.inf
 patience_val = []
 
 if hps.train.warm_start:
-    ssl_model = utils.warm_start_model(hps.train.warm_start_checkpoint_ssl, ssl_model, hps.train.ignored_layer)
     pool_model = utils.warm_start_model(hps.train.warm_start_checkpoint_pool, pool_model, hps.train.ignored_layer)
-    reg_model = utils.warm_start_model(hps.train.warm_start_checkpoint_reg, reg_model, hps.train.ignored_layer)
 else:
     try:
-        _, _, _, _, epoch_str = utils.load_checkpoint(
-            utils.latest_checkpoint_path(hps.model_dir, "ssl_*.pth"),
-            ssl_model,
-            optimizer_ssl,
-            scheduler_ssl,
-        )
         _, _, _, _, epoch_str = utils.load_checkpoint(
             utils.latest_checkpoint_path(hps.model_dir, "pool_*.pth"),
             pool_model,
             optimizer_p,
             scheduler_p,
-        )
-        _, _, _, _, epoch_str = utils.load_checkpoint(
-            utils.latest_checkpoint_path(hps.model_dir, "reg_*.pth"),
-            reg_model,
-            optimizer_g,
-            scheduler_g,
         )
 
         epoch_str += 1
@@ -156,10 +134,7 @@ else:
         print(e)
 
 scaler = GradScaler()
-
-optimizer_ssl.zero_grad(set_to_none=True)
 optimizer_p.zero_grad(set_to_none=True)
-optimizer_g.zero_grad(set_to_none=True)
 
 # =============================================================
 # SECTION: Train Epoch
@@ -167,9 +142,7 @@ optimizer_g.zero_grad(set_to_none=True)
 
 for epoch in range(epoch_str, hps.train.epochs + 1):
     #train_loader.batch_sampler.set_epoch(epoch)
-    ssl_model.train()
     pool_model.train()
-    reg_model.train()
 
     batch_cnt = 0
 
@@ -179,16 +152,8 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
         dse_id = dse_id.cuda(non_blocking=True).long()
         
         with torch.amp.autocast("cuda", enabled=True):
-            ssl_hidden = ssl_model(audio, attention_mask=attention_masks, output_hidden_states=hps.model.output_hidden_states)
-            if hps.model.output_hidden_states:
-                ssl_hidden = ssl_hidden[2]
-                ssl_hidden = torch.stack(ssl_hidden, dim=1)
-            else:
-                ssl_hidden = ssl_hidden.last_hidden_state
-            
             x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True)
-            ssl_hidden = pool_model(ssl_hidden, x_lengths, attention_mask=attention_masks)
-            dse_pred = reg_model(ssl_hidden)
+            dse_pred = pool_model(audio, x_lengths)
 
             loss, f1_micro, f1_macro, accuracy = utils.CE_weight_category(dse_pred, dse_id, class_weights_tensor)
 
@@ -196,18 +161,12 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
         loss_g = sum(loss_gs) / ACCUMULATION_STEP
 
         scaler.scale(loss_g).backward()
-        grad_norm1 = commons.clip_grad_value_(ssl_model.parameters(), None)
-        grad_norm2 = commons.clip_grad_value_(pool_model.parameters(), None)
-        grad_norm3 = commons.clip_grad_value_(reg_model.parameters(), None)
+        grad_norm = commons.clip_grad_value_(pool_model.parameters(), None)
         
         if (batch_cnt + 1) % ACCUMULATION_STEP == 0 or (batch_cnt + 1) == len(train_loader):
-            scaler.step(optimizer_ssl)
             scaler.step(optimizer_p)
-            scaler.step(optimizer_g)
             scaler.update() 
-            optimizer_ssl.zero_grad(set_to_none=True)
             optimizer_p.zero_grad(set_to_none=True)
-            optimizer_g.zero_grad(set_to_none=True)
         
         batch_cnt = batch_cnt + 1
 
@@ -217,12 +176,8 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
                 "loss/g/f1_micro": f1_micro,
                 "loss/g/f1_macro": f1_macro,
                 "loss/g/accuracy": accuracy,
-                "learning_rate/1": optimizer_ssl.param_groups[0]["lr"],
-                "learning_rate/2": optimizer_p.param_groups[0]["lr"],
-                "learning_rate/3": optimizer_g.param_groups[0]["lr"],
-                "grad_norm/1": grad_norm1,
-                "grad_norm/2": grad_norm2,
-                "grad_norm/3": grad_norm3,
+                "info/learning_rate": optimizer_p.param_groups[0]["lr"],
+                "info/grad_norm": grad_norm,
             }
 
             scalar_dict.update(
@@ -236,10 +191,9 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
             )
 
         global_step += 1
+        scheduler_p.step()
         
-    ssl_model.eval()
     pool_model.eval()
-    reg_model.eval()
     losses_tot = []
     acc_tot = []
     with torch.no_grad():
@@ -247,17 +201,9 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
             audio = audio.cuda(non_blocking=True).float().squeeze(1)
             attention_masks = attention_masks.cuda(non_blocking=True).float()
             dse_ids = dse_ids.cuda(non_blocking=True).long()
-            
-            ssl_hidden = ssl_model(audio, attention_mask=attention_masks, output_hidden_states=hps.model.output_hidden_states)
-            if hps.model.output_hidden_states:
-                ssl_hidden = ssl_hidden[2]
-                ssl_hidden = torch.stack(ssl_hidden, dim=1)
-            else:
-                ssl_hidden = ssl_hidden.last_hidden_state            
-            
+
             x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True).long()
-            ssl_hidden = pool_model(ssl_hidden, x_lengths, attention_mask=attention_masks)
-            dse_pred = reg_model(ssl_hidden)
+            dse_pred = pool_model(audio, x_lengths)
 
             loss, f1_micro, f1_macro, accuracy = utils.CE_weight_category(dse_pred, dse_ids, class_weights_tensor)
 
@@ -281,13 +227,7 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
         writer=writer_eval, global_step=global_step, scalars=scalar_dict
     )
 
-    ssl_model.train()
     pool_model.train()
-    reg_model.train()
-
-    #scheduler_ssl.step()
-    #scheduler_p.step()
-    #scheduler_g.step()
 
     if loss_tot < best_lost and loss_tot > 0:
         logger.info(f"Get Best New Validation!!!!")
@@ -295,52 +235,103 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
         patience_val = []
 
         utils.save_checkpoint(
-            ssl_model, optimizer_ssl, scheduler_ssl,
-            hps.train.learning_rate, epoch,
-            os.path.join(hps.model_dir, "best_ssl.pth"))
-        utils.save_checkpoint(
             pool_model, optimizer_p, scheduler_p,
             hps.train.learning_rate, epoch,
             os.path.join(hps.model_dir, "best_pool.pth"))
-        utils.save_checkpoint(
-            reg_model, optimizer_g, scheduler_g,
-            hps.train.learning_rate, epoch,
-            os.path.join(hps.model_dir, "best_reg.pth"))
     else:
         patience_val.append(1)
         logger.info(f"Patience: {len(patience_val)}")
 
         if epoch > 3 and len(patience_val) >= 4:
-            for param_group in optimizer_ssl.param_groups:
-                param_group['lr'] = 1e-5 * (0.98 ** ((epoch - 3) // 1))
-
             new_lr = hps.train.learning_rate * (0.9 ** ((epoch - 3) // 1))
             for param_group in optimizer_p.param_groups:
                 param_group['lr'] = new_lr
-            for param_group in optimizer_g.param_groups:
-                param_group['lr'] = new_lr
 
-        if len(patience_val) > 15:
+        if len(patience_val) > 5:
             break
 
 
     logger.info("====> Epoch: {}".format(epoch))
     if epoch % 1 == 0:
         utils.save_checkpoint(
-            ssl_model, optimizer_ssl, scheduler_ssl,
-            hps.train.learning_rate, epoch,
-            os.path.join(hps.model_dir, "ssl_{}.pth".format(epoch)))
-        utils.save_checkpoint(
             pool_model, optimizer_p, scheduler_p,
             hps.train.learning_rate, epoch,
             os.path.join(hps.model_dir, "pool_{}.pth".format(epoch)))
-        utils.save_checkpoint(
-            reg_model, optimizer_g, scheduler_g,
-            hps.train.learning_rate, epoch,
-            os.path.join(hps.model_dir, "reg_{}.pth".format(epoch)))
 
         with open(os.path.join(hps.model_dir, "traindata.pickle"), 'wb') as handle:
             pickle.dump({
                 "best_lost": best_lost,
                 "patience_val": patience_val
             }, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+######################################################################
+#
+# Metric Best Model
+#
+######################################################################
+
+_, _, _, _, epoch_str = utils.load_checkpoint(
+    utils.latest_checkpoint_path(hps.model_dir, "best_pool.pth"),
+    pool_model,
+    optimizer_p,
+    scheduler_p,
+)
+
+pool_model.eval() 
+all_preds, all_labels, all_probs  = [], [], []
+with torch.no_grad():
+    for batch_idx, (wav_names, audio, attention_masks, dse_ids) in enumerate(tqdm(val_loader)):
+        audio = audio.cuda(non_blocking=True).float().squeeze(1)
+        attention_masks = attention_masks.cuda(non_blocking=True).float()
+        dse_ids = dse_ids.cuda(non_blocking=True).long()
+
+        x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True).long()
+        outputs = pool_model(audio, x_lengths)
+        
+        probs = torch.softmax(outputs, dim=1)
+        preds = torch.argmax(outputs, dim=1)
+
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(dse_ids.cpu().numpy())
+        all_probs.extend(probs.cpu().numpy())
+
+cm = confusion_matrix(all_labels, all_preds)
+plt.figure(figsize=(6, 5))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.title("Confusion Matrix")
+plt.savefig(f"{model_dir}/cm.png")
+
+# --- ROC Curve ---
+n_classes = len(CLASS_NAMES)
+all_probs = np.array(all_probs)
+all_labels = np.array(all_labels)
+fpr, tpr, _ = roc_curve(all_labels, all_probs[:, 1])
+auc_score = auc(fpr, tpr)
+
+plt.figure(figsize=(6, 5))
+plt.plot(fpr, tpr, label=f"AUC = {auc_score:.2f}", color="darkorange")
+plt.plot([0, 1], [0, 1], "k--")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve")
+plt.legend(loc="lower right")
+plt.grid(True)
+plt.savefig(f"{model_dir}/roc.png")
+
+accuracy = accuracy_score(all_labels, all_preds, normalize=True)
+b_accuracy = balanced_accuracy_score(all_labels, all_preds)
+f1 = f1_score(all_labels, all_preds, average="weighted")
+try:
+    roc_auc = roc_auc_score(all_labels, all_preds)
+except Exception as exception:
+    roc_auc = None
+
+with open(f"{model_dir}/result.txt", "w") as file:
+    file.write(df['disease_label'].value_counts().to_string() + "\n")
+    file.write("\n")
+    file.write(f"Accuracy {accuracy:.2f} | Balanced Accuracy {b_accuracy:.2f} | AUC {auc_score:.2f} |ROC AUC {roc_auc:.2f} | F1 Score Accuracy: {f1:.2f}\n")
+ 
+print(f"Saved In: {model_dir}, Accuracy: {accuracy:.2f}, AUC: {auc_score:.2f}")

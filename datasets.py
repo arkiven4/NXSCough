@@ -75,8 +75,6 @@ class SERDatasets(torch.utils.data.Dataset):
 
         self.audio_path = hparams.audio_path
         self.db_path = hparams.db_path
-        self.wav_mean, self.wav_std = None, None
-        self.vocabs = None
 
         self.augment_data = hparams.augment_data
 
@@ -90,6 +88,16 @@ class SERDatasets(torch.utils.data.Dataset):
                 ["apply_reverb", "add_background_noise"],
             )
 
+        self.wav_transform = None
+        if hparams.acoustic_feature:
+            self.wav_transform = T.MFCC(sample_rate=hparams.sampling_rate, n_mfcc=13, 
+                                        melkwargs={"n_fft": hparams.win_length, "hop_length": hparams.hop_length, 
+                                                   "n_mels": hparams.n_mel_channels, "window_fn": torch.hann_window,
+                                                   "power": 2.0, "center": True, "normalized": False})
+            # self.wav_transform = T.MelSpectrogram(sample_rate=hparams.sampling_rate, n_fft=hparams.win_length,
+            #                                         hop_length=hparams.hop_length, n_mels=hparams.n_mel_channels, 
+            #                                         power=2.0)
+        
         #self._filter()
         #random.seed(1234)
         #random.shuffle(self.audiopaths_and_text)
@@ -122,6 +130,9 @@ class SERDatasets(torch.utils.data.Dataset):
         if self.add_noise:
             audio = audio + torch.rand_like(audio)
 
+        if self.wav_transform != None:
+            audio = self.wav_transform(audio) # [13, T]
+
         audio = audio.unsqueeze(0)
         return audio
 
@@ -145,22 +156,27 @@ class SERDatasetsCollate():
         """
         wav_name = []
         input_lengths, ids_sorted_decreasing = torch.sort(
-            torch.LongTensor([x[1].size(1) for x in batch]),
+            torch.LongTensor([x[1].shape[-1] for x in batch]),
             dim=0, descending=True)
         max_wav_len = input_lengths[0] # max([x[0].size(1) for x in batch])
 
         dse_ids = torch.LongTensor(len(batch))
+    
+        feature_dim = 1
+        if len(batch[0][1].shape) == 3:
+            feature_dim = batch[0][1].shape[1]
 
-        wav_padded = torch.FloatTensor(len(batch), 1, max_wav_len)
+        wav_padded = torch.FloatTensor(len(batch), feature_dim, max_wav_len)
         wav_padded.zero_()
+
         attention_masks = torch.FloatTensor(len(batch), max_wav_len)
         attention_masks.zero_()
 
         for i in range(len(ids_sorted_decreasing)):
             wav_name.append(batch[i][0])
             wav = batch[ids_sorted_decreasing[i]][1]
-            wav_padded[i, :, :wav.size(1)] = wav
-            attention_masks[i, :wav.size(1)] = 1
+            wav_padded[i, :, :wav.shape[-1]] = wav
+            attention_masks[i, :wav.shape[-1]] = 1
 
             dse_ids[i] = batch[ids_sorted_decreasing[i]][2]
         

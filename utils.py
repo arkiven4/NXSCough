@@ -134,7 +134,7 @@ def warm_start_model(checkpoint_path, model, ignore_layers):
 
 def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None):
   assert os.path.isfile(checkpoint_path)
-  checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
+  checkpoint_dict = torch.load(checkpoint_path, weights_only=True, map_location='cpu')
   iteration = 1
   if 'iteration' in checkpoint_dict.keys():
     iteration = checkpoint_dict['iteration']
