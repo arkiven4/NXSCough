@@ -25,16 +25,12 @@ class AudioDatasetBaseFeature(torch.utils.data.Dataset):
         #                         hop_length=256, n_mels=64, power=2.0)
         self.data = self.data.reset_index(drop=True)
 
-        with open(f"{data_path}/norm_stat.pkl", 'rb') as f:
-            self.wav_mean, self.wav_std = pickle.load(f)
-            print("Loaded Norm Stats")
-
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
         file_path, label = self.data.iloc[idx]
-        audio_data = utils.load_audio_sample(file_path, self.sample_rate, [self.wav_mean, self.wav_std], 
+        audio_data = utils.load_audio_sample(file_path, self.sample_rate, None, 
                                        self.desired_length, fade_samples_ratio=6, pad_types='zero') # repeat zero
 
         audio_feat = self.wav_transform(audio_data)
@@ -103,13 +99,13 @@ class SERDatasets(torch.utils.data.Dataset):
     def _filter(self):
         lengths = []
         for audiopath_and_text in self.audiopaths_and_text:
-            audiopath = self.db_path + audiopath_and_text[0]
+            audiopath = self.db_path + "/"  + audiopath_and_text[0]
             lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
         self.lengths = lengths
 
     def get_mel_text_pair(self, audiopath_and_text):
         wavname, dse_id = audiopath_and_text[0], audiopath_and_text[1] #, audiopath_and_text[2], audiopath_and_text[3], 0, audiopath_and_text[5] #audiopath_and_text[4], audiopath_and_text[5]
-        wav = self.get_audio(self.db_path + wavname)
+        wav = self.get_audio(self.db_path + "/" + wavname)
 
         return (wavname, wav, dse_id)
 

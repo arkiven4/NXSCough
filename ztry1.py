@@ -18,7 +18,7 @@ from datasets import AudioDatasetBaseFeature, collate_fn, df_sampler
 import models
 import utils
 
-DATA_PATH = "/run/media/fourier/Data1/Pras/Database_ThesisNew/"
+DATA_PATH = "./data/"
 METADATA = "tb_solic_filt.csv" # tb_all_filt.csv
 RANDOM_CODE = utils.generate_random_code()
 OUTPUT_PATH = "./output/try1_" + RANDOM_CODE
