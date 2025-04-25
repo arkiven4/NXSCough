@@ -11,6 +11,25 @@ Install dependencies with:
 ```bash
 pip install -r requirements.txt
 ```
+Before training, ensure that the path to your dataset is correctly set in your config in the `config/lstm.json` folder:
+
+```bash
+"db_path": "/run/media/fourier/Data1/Pras/Database_ThesisNew/"
+```
+This folder must contain:
+
+- somedatasets.csv: includes audiopath, labels
+- audiodata folder: contains the actual audio files or processed data
+
+```
+/run/media/fourier/Data1/Pras/Database_ThesisNew/
+├── somedatasets.csv
+└── audiodata/
+    ├── file1.wav
+    └── file2.wav
+```
+Update the path according to your environment before running the training script.
+
 
 ### 2. Train the Model
 

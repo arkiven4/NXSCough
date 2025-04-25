@@ -72,8 +72,6 @@ class SERDatasets(torch.utils.data.Dataset):
         self.max_wav_value = hparams.max_wav_value
         self.sampling_rate = hparams.sampling_rate
         self.add_noise = hparams.add_noise
-
-        self.audio_path = hparams.audio_path
         self.db_path = hparams.db_path
 
         self.augment_data = hparams.augment_data
@@ -105,13 +103,13 @@ class SERDatasets(torch.utils.data.Dataset):
     def _filter(self):
         lengths = []
         for audiopath_and_text in self.audiopaths_and_text:
-            audiopath = self.audio_path + audiopath_and_text[0]
+            audiopath = self.db_path + audiopath_and_text[0]
             lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
         self.lengths = lengths
 
     def get_mel_text_pair(self, audiopath_and_text):
         wavname, dse_id = audiopath_and_text[0], audiopath_and_text[1] #, audiopath_and_text[2], audiopath_and_text[3], 0, audiopath_and_text[5] #audiopath_and_text[4], audiopath_and_text[5]
-        wav = self.get_audio(self.audio_path + wavname)
+        wav = self.get_audio(self.db_path + wavname)
 
         return (wavname, wav, dse_id)
 
