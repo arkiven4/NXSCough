@@ -30,15 +30,18 @@
     "n_mel_channels": 80,
     "mel_fmin": 0.0,
     "mel_fmax": 8000.0,
+    "desired_length": 0.5,
+    "fade_samples_ratio": 6,
+    "pad_types": "zero",
     "acoustic_feature": true,
     "augment_data": false,
     "add_noise": false,
     "emotion_class": 2,
-    "db_path": "/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/",
-    "metadata_csv": "tb_solic_filt.csv"
+    "db_path": "/run/media/fourier/Data1/Pras/Database_ThesisNew/",
+    "metadata_csv": "metadata_combine.csv"
   }, 
   "model": {
-    "pooling_type": "LSTMModel1",
+    "pooling_type": "ResNet101",
     "feature_dim": 13,
     "pooling_hidden": 128,
     "p_dropout": 0.1,

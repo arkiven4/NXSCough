@@ -56,12 +56,12 @@ cur_bs = BATCH_SIZE // ACCUMULATION_STEP
 ##### Label Umum Semua
 emotion_codes = [0, 1]
 
-df = pd.read_csv('/run/media/fourier/Data1/Pras/Database_ThesisNew/metadata_combine.csv')
-#df = df[df['database'] == 'tb']
+df = pd.read_csv(f'{hps.data.db_path}/{hps.data.metadata_csv}')
+df = df[df['database'].isin(['tb_longitudinal_data', 'tb_solicited_data'])]
 
-#df_train, df_test = train_test_split(df, test_size=0.03, random_state=42, shuffle=True)
-df_train = df[df['database'].isin(['tb_longitudinal_data'])]
-df_test = df[df['database'].isin(['tb_solicited_data'])]
+df_train, df_test = train_test_split(df, test_size=0.03, random_state=42, shuffle=True)
+# df_train = df[df['database'].isin(['tb_longitudinal_data'])]
+# df_test = df[df['database'].isin(['tb_solicited_data'])]
 
 class_frequencies = df_train['disease_label'].value_counts().to_dict()
 total_samples = len(df_train)

@@ -314,8 +314,11 @@ def cut_pad_sample_torchaudio(data, sample_rate, desired_length, pad_types='zero
     
     return data
 
-def load_audio_sample(file_path, sample_rate, wav_stats, desired_length, fade_samples_ratio=6, pad_types='zero'):
-    data, sample_rate = librosa.load(file_path, sr=sample_rate)
+def load_audio_sample(file_path, db_sample_rate, wav_stats, desired_length, fade_samples_ratio=6, pad_types='zero'):
+    data, sample_rate = librosa.load(file_path, sr=None)
+    if sample_rate != db_sample_rate:
+        raise ValueError("{} {} SR doesn't match target {} SR".format(sample_rate, db_sample_rate))
+    
     #data = data / 32768.0
     max_val = np.max(np.abs(data))
     data = data / max_val if max_val != 0 else data

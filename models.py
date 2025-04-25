@@ -78,10 +78,10 @@ class ResNet18(torchvision.models.resnet.ResNet):
         return x
 
 class ResNet101(torchvision.models.resnet.ResNet):
-    def __init__(self, num_classes, track_bn=True):
+    def __init__(self, dummy, output_dim, track_bn=True, **kwargs):
         def norm_layer(*args, **kwargs):
             return nn.BatchNorm2d(*args, **kwargs, track_running_stats=track_bn)
-        super().__init__(torchvision.models.resnet.Bottleneck, [3, 4, 23, 3], norm_layer=norm_layer, num_classes=num_classes)
+        super().__init__(torchvision.models.resnet.Bottleneck, [3, 4, 23, 3], norm_layer=norm_layer, num_classes=output_dim)
         #del self.fc
         self.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.final_feat_dim = 2048
@@ -98,7 +98,7 @@ class ResNet101(torchvision.models.resnet.ResNet):
     def load_ssl_official_weights(self, progress=True):
         raise NotImplemented
 
-    def _forward_impl(self, x: Tensor) -> Tensor:
+    def _forward_impl(self, x: Tensor, lengths=None) -> Tensor:
         # See note [TorchScript super()]
         x = x.unsqueeze(1)
         x = self.conv1(x)
@@ -150,7 +150,25 @@ class LSTMModel1(nn.Module):
         x = self.fc(x)
         return x
 
+class CNNClassifier(nn.Module):
+    def __init__(self, dummy, output_dim, **kwargs):
+        super(CNNClassifier, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=(3, 3), padding=1)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=(3, 3), padding=1)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))  # Global average pooling
+        self.fc = nn.Linear(32, output_dim)
 
+    def forward(self, x, lengths=None):
+        # x shape: [B, Feat_Dim, T]
+        x = x.unsqueeze(1)  # shape becomes [B, 1, Feat_Dim, T]
+        x = F.relu(self.bn1(self.conv1(x)))  # [B, 16, Feat_Dim, T]
+        x = F.relu(self.bn2(self.conv2(x)))  # [B, 32, Feat_Dim, T]
+        x = self.pool(x)  # [B, 32, 1, 1]
+        x = x.view(x.size(0), -1)  # Flatten to [B, 32]
+        x = self.fc(x)  # [B, num_classes]
+        return x
 
 #################### REG SSL ###########################
 class HeadCatPrediction(nn.Module):

@@ -5,6 +5,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from librosa.filters import mel as librosa_mel_fn
+from audio_processing import dynamic_range_compression, dynamic_range_decompression
+from stft import STFT
+
 def compute_length_from_mask(mask, frame_shift=0.02):
     """
     mask: (batch_size, T)
@@ -47,3 +51,44 @@ def clip_grad_value_(parameters, clip_value, norm_type=2):
       p.grad.data.clamp_(min=-clip_value, max=clip_value)
   total_norm = total_norm ** (1. / norm_type)
   return total_norm
+
+class TacotronSTFT(nn.Module):
+  def __init__(self, filter_length=1024, hop_length=256, win_length=1024,
+                 n_mel_channels=80, sampling_rate=22050, mel_fmin=0.0,
+                 mel_fmax=8000.0):
+    super(TacotronSTFT, self).__init__()
+    self.n_mel_channels = n_mel_channels
+    self.sampling_rate = sampling_rate
+    self.stft_fn = STFT(filter_length, hop_length, win_length)
+    mel_basis = librosa_mel_fn(
+        sampling_rate, filter_length, n_mel_channels, mel_fmin, mel_fmax)
+    mel_basis = torch.from_numpy(mel_basis).float()
+    self.register_buffer('mel_basis', mel_basis)
+
+  def spectral_normalize(self, magnitudes):
+    output = dynamic_range_compression(magnitudes)
+    return output
+
+  def spectral_de_normalize(self, magnitudes):
+    output = dynamic_range_decompression(magnitudes)
+    return output
+
+  def forward(self, y):
+    """Computes mel-spectrograms from a batch of waves
+    PARAMS
+    ------
+    y: Variable(torch.FloatTensor) with shape (B, T) in range [-1, 1]
+
+    RETURNS
+    -------
+    mel_output: torch.FloatTensor of shape (B, n_mel_channels, T)
+    """
+    y = y.unsqueeze(0)
+    assert(torch.min(y.data) >= -1)
+    assert(torch.max(y.data) <= 1)
+
+    magnitudes, phases = self.stft_fn.transform(y)
+    magnitudes = magnitudes.data
+    mel_output = torch.matmul(self.mel_basis, magnitudes)
+    mel_output = self.spectral_normalize(mel_output).squeeze(0)
+    return mel_output
