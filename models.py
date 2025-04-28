@@ -7,6 +7,8 @@ from torch.hub import load_state_dict_from_url
 
 import torchvision
 
+from typing import Any, Callable, Optional
+
 class LSTMAudioClassifier1(nn.Module):
     def __init__(self, input_size, seq_len, hidden_size, num_classes):
         super(LSTMAudioClassifier1, self).__init__()
@@ -37,45 +39,6 @@ class LSTMAudioClassifier1(nn.Module):
         x = self.dropout(x)
         x = self.fc(x)
         return x
-    
-class ResNet18(torchvision.models.resnet.ResNet):
-    def __init__(self, num_classes, track_bn=True):
-        def norm_layer(*args, **kwargs):
-            return nn.BatchNorm2d(*args, **kwargs, track_running_stats=track_bn)
-        super().__init__(torchvision.models.resnet.BasicBlock, [2, 2, 2, 2], norm_layer=norm_layer, num_classes=num_classes)
-        self.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.final_feat_dim = 512
-
-    def load_sl_official_weights(self, progress=True):
-        state_dict = load_state_dict_from_url(torchvision.models.resnet.ResNet18_Weights.IMAGENET1K_V1.url,
-                                              progress=progress)
-
-        del state_dict['conv1.weight']
-        missing, unexpected = self.load_state_dict(state_dict, strict=False)
-        # if len(missing) > 0:
-            # raise AssertionError('Model code may be incorrect')
-
-    def load_ssl_official_weights(self, progress=True):
-        raise NotImplemented
-
-    def _forward_impl(self, x: Tensor) -> Tensor:
-        # See note [TorchScript super()]
-        x = x.unsqueeze(1)
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-
-        return x
 
 class ResNet101(torchvision.models.resnet.ResNet):
     def __init__(self, dummy, output_dim, track_bn=True, **kwargs):
@@ -85,6 +48,11 @@ class ResNet101(torchvision.models.resnet.ResNet):
         #del self.fc
         self.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.final_feat_dim = 2048
+        self.grad_cam = False
+         # TODO : Coba tambah Rezize and Normalization
+        self.preprocess = torchvision.transforms.Compose([
+            torchvision.transforms.Resize((224,224))
+        ])
 
     def load_sl_official_weights(self, progress=True):
         state_dict = load_state_dict_from_url(torchvision.models.resnet.ResNet101_Weights.IMAGENET1K_V2.url,
@@ -100,7 +68,12 @@ class ResNet101(torchvision.models.resnet.ResNet):
 
     def _forward_impl(self, x: Tensor, lengths=None) -> Tensor:
         # See note [TorchScript super()]
-        x = x.unsqueeze(1)
+        if self.grad_cam == True:
+            x = x
+        else:
+            x = x.unsqueeze(0)
+            x = self.preprocess(x)
+
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
@@ -116,6 +89,85 @@ class ResNet101(torchvision.models.resnet.ResNet):
         x = self.fc(x)
 
         return x
+    
+class InceptionV3(torchvision.models.inception.Inception3):
+    def __init__(self, dummy, output_dim, track_bn=True, **kwargs):
+        super().__init__(num_classes=output_dim, aux_logits=False)
+        #del self.fc
+        self.Conv2d_1a_3x3 = torchvision.models.inception.BasicConv2d(1, 32, kernel_size=3, stride=2)
+        self.final_feat_dim = 2048
+        self.preprocess = torchvision.transforms.Compose([
+            torchvision.transforms.Resize((299, 299)),
+        ])
+       
+
+    def load_sl_official_weights(self, progress=True):
+        state_dict = load_state_dict_from_url(torchvision.models.inception.Inception_V3_Weights.IMAGENET1K_V1.url,
+                                              progress=progress)
+
+        del state_dict['Conv2d_1a_3x3.weight']
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        # if len(missing) > 0:
+            # raise AssertionError('Model code may be incorrect')
+
+    def load_ssl_official_weights(self, progress=True):
+        raise NotImplemented
+
+    def _forward(self, x: Tensor) -> Tensor:
+        x = x.unsqueeze(1)
+        x = self.preprocess(x)
+        # N x 3 x 299 x 299
+        x = self.Conv2d_1a_3x3(x)
+        # N x 32 x 149 x 149
+        x = self.Conv2d_2a_3x3(x)
+        # N x 32 x 147 x 147
+        x = self.Conv2d_2b_3x3(x)
+        # N x 64 x 147 x 147
+        x = self.maxpool1(x)
+        # N x 64 x 73 x 73
+        x = self.Conv2d_3b_1x1(x)
+        # N x 80 x 73 x 73
+        x = self.Conv2d_4a_3x3(x)
+        # N x 192 x 71 x 71
+        x = self.maxpool2(x)
+        # N x 192 x 35 x 35
+        x = self.Mixed_5b(x)
+        # N x 256 x 35 x 35
+        x = self.Mixed_5c(x)
+        # N x 288 x 35 x 35
+        x = self.Mixed_5d(x)
+        # N x 288 x 35 x 35
+        x = self.Mixed_6a(x)
+        # N x 768 x 17 x 17
+        x = self.Mixed_6b(x)
+        # N x 768 x 17 x 17
+        x = self.Mixed_6c(x)
+        # N x 768 x 17 x 17
+        x = self.Mixed_6d(x)
+        # N x 768 x 17 x 17
+        x = self.Mixed_6e(x)
+        # N x 768 x 17 x 17
+        aux: Optional[Tensor] = None
+        if self.AuxLogits is not None:
+            if self.training:
+                aux = self.AuxLogits(x)
+        # N x 768 x 17 x 17
+        x = self.Mixed_7a(x)
+        # N x 1280 x 8 x 8
+        x = self.Mixed_7b(x)
+        # N x 2048 x 8 x 8
+        x = self.Mixed_7c(x)
+        # N x 2048 x 8 x 8
+        # Adaptive average pooling
+        x = self.avgpool(x)
+        # N x 2048 x 1 x 1
+        x = self.dropout(x)
+        # N x 2048 x 1 x 1
+        x = torch.flatten(x, 1)
+        # N x 2048
+        x = self.fc(x)
+        # N x 1000 (num_classes)
+        return x, aux
     
 class LSTMModel1(nn.Module):
     def __init__(self, input_size, pooling_hidden, p_dropout, output_dim, **kwargs):
