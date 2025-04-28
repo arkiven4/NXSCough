@@ -3,8 +3,17 @@
 This repository contains a training pipeline for a Cough classification model using Various Model. It supports audio augmentation via the [RIRS noise dataset](https://www.openslr.org/28/) for realistic room simulation.
 
 ---
+## :trophy: Getting Started
 
-## 🚀 Getting Started
+| Model | Accuracy | Balanced Accuracy | AUC | ROC AUC | F1 Score Accuracy |
+|:-----:|:--------:|:-----------------:|:---:|:-------:|:-----------------:|
+| LSTM | 0.87 | 0.88 | 0.95 | 0.88 | 0.87 |
+| ResNet101 | 0.91 | 0.91 | 0.97 | 0.91 | 0.91 |
+| InceptionV3 | 0.92 | 0.92 | 0.98 | 0.92 | 0.92 |
+
+---
+
+## :rocket: Getting Started
 
 ### 1. Preparation
 Install dependencies with:
