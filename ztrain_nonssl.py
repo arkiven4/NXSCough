@@ -27,7 +27,7 @@ warnings.simplefilter("ignore", UserWarning)
 # SECTION: Intialize Data
 # =============================================================
 
-MODEL_NAME = "cnn_try2"
+MODEL_NAME = "cnn_try1_rezize224"
 CONFIG_PATH = "configs/lstm.json"
 
 model_dir = os.path.join("./logs", MODEL_NAME)
