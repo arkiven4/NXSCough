@@ -41,7 +41,7 @@
     "metadata_csv": "metadata_combine.csv"
   }, 
   "model": {
-    "pooling_type": "ResNet101",
+    "pooling_type": "LSTMModel1",
     "feature_dim": 13,
     "pooling_hidden": 128,
     "p_dropout": 0.1,
