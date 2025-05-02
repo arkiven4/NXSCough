@@ -4,10 +4,14 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.hub import load_state_dict_from_url
+from einops import rearrange, repeat
+from einops.layers.torch import Rearrange
 
 import torchvision
 
 from typing import Any, Callable, Optional
+
+import modules, commons
 
 class LSTMAudioClassifier1(nn.Module):
     def __init__(self, input_size, seq_len, hidden_size, num_classes):
@@ -221,6 +225,176 @@ class CNNClassifier(nn.Module):
         x = x.view(x.size(0), -1)  # Flatten to [B, 32]
         x = self.fc(x)  # [B, num_classes]
         return x
+
+##### VIT
+class ViT(nn.Module):
+    def __init__(self, dummmy, output_dim, image_size=256, patch_size=32, dim=1024, depth=6, heads=8, mlp_dim=2048, pool = 'cls', channels = 1, dim_head = 64, dropout = 0., emb_dropout = 0., **kwargs):
+        super().__init__()
+        image_height, image_width = commons.pair(image_size)
+        patch_height, patch_width = commons.pair(patch_size)
+
+        assert image_height % patch_height == 0 and image_width % patch_width == 0, 'Image dimensions must be divisible by the patch size.'
+
+        num_patches = (image_height // patch_height) * (image_width // patch_width)
+        patch_dim = channels * patch_height * patch_width
+        assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
+
+        self.pretrain = False
+        self.preprocess = torchvision.transforms.Compose([
+            torchvision.transforms.Resize((256,256))
+        ])
+
+        self.to_patch_embedding = nn.Sequential(
+            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width),
+            nn.LayerNorm(patch_dim),
+            nn.Linear(patch_dim, dim),
+            nn.LayerNorm(dim),
+        )
+
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+
+        self.transformer = modules.TransformerVIT(dim, depth, heads, dim_head, mlp_dim, dropout)
+
+        self.pool = pool
+        self.to_latent = nn.Identity()
+
+        self.mlp_head = nn.Linear(dim, output_dim)
+
+    def forward(self, img):
+        if self.pretrain == False:
+            img = img.unsqueeze(1)
+            img = self.preprocess(img)
+
+        x = self.to_patch_embedding(img)
+        b, n, _ = x.shape
+
+        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding[:, :(n + 1)]
+        x = self.dropout(x)
+
+        x = self.transformer(x)
+
+        x = x.mean(dim = 1) if self.pool == 'mean' else x[:, 0]
+
+        x = self.to_latent(x)
+        return self.mlp_head(x)
+
+class SimMIM(nn.Module):
+    def __init__(
+        self,
+        *,
+        encoder,
+        masking_ratio = 0.5
+    ):
+        super().__init__()
+        assert masking_ratio > 0 and masking_ratio < 1, 'masking ratio must be kept between 0 and 1'
+        self.masking_ratio = masking_ratio
+
+        # extract some hyperparameters and functions from encoder (vision transformer to be trained)
+
+        self.encoder = encoder
+        num_patches, encoder_dim = encoder.pos_embedding.shape[-2:]
+
+        self.to_patch = encoder.to_patch_embedding[0]
+        self.patch_to_emb = nn.Sequential(*encoder.to_patch_embedding[1:])
+
+        pixel_values_per_patch = encoder.to_patch_embedding[2].weight.shape[-1]
+
+        # simple linear head
+
+        self.mask_token = nn.Parameter(torch.randn(encoder_dim))
+        self.to_pixels = nn.Linear(encoder_dim, pixel_values_per_patch)
+
+    def forward(self, img):
+        device = img.device
+
+        # get patches
+
+        patches = self.to_patch(img)
+        batch, num_patches, *_ = patches.shape
+
+        # for indexing purposes
+
+        batch_range = torch.arange(batch, device = device)[:, None]
+
+        # get positions
+
+        pos_emb = self.encoder.pos_embedding[:, 1:(num_patches + 1)]
+
+        # patch to encoder tokens and add positions
+
+        tokens = self.patch_to_emb(patches)
+        tokens = tokens + pos_emb
+
+        # prepare mask tokens
+
+        mask_tokens = repeat(self.mask_token, 'd -> b n d', b = batch, n = num_patches)
+        mask_tokens = mask_tokens + pos_emb
+
+        # calculate of patches needed to be masked, and get positions (indices) to be masked
+
+        num_masked = int(self.masking_ratio * num_patches)
+        masked_indices = torch.rand(batch, num_patches, device = device).topk(k = num_masked, dim = -1).indices
+        masked_bool_mask = torch.zeros((batch, num_patches), device = device).scatter_(-1, masked_indices, 1).bool()
+
+        # mask tokens
+
+        tokens = torch.where(masked_bool_mask[..., None], mask_tokens, tokens)
+
+        # attend with vision transformer
+
+        encoded = self.encoder.transformer(tokens)
+
+        # get the masked tokens
+
+        encoded_mask_tokens = encoded[batch_range, masked_indices]
+
+        # small linear projection for predicted pixel values
+
+        pred_pixel_values = self.to_pixels(encoded_mask_tokens)
+
+        # get the masked patches for the final reconstruction loss
+
+        masked_patches = patches[batch_range, masked_indices]
+
+        # calculate reconstruction loss
+
+        recon_loss = F.l1_loss(pred_pixel_values, masked_patches) / num_masked
+        return recon_loss
+
+class SimpleMaskedModel(nn.Module):
+    def __init__(self, dummy, output_dim, **kwargs):
+        super(SimpleMaskedModel, self).__init__()
+
+        self.preprocess = torchvision.transforms.Compose([
+            torchvision.transforms.Resize((256,256))
+        ])
+
+        self.v = ViT(
+            image_size = 256,
+            patch_size = 32,
+            num_classes = output_dim,
+            dim = 1024,
+            depth = 6,
+            heads = 8,
+            mlp_dim = 2048,
+            channels=1
+        )
+
+        self.mim = SimMIM(
+            encoder = self.v,
+            masking_ratio = 0.5  # they found 50% to yield the best results
+        )
+
+    def forward(self, x):
+        # x shape: [128, 80, 32]
+        x = x.unsqueeze(1)
+        x = self.preprocess(x)
+        loss = self.mim(x)
+        return loss
 
 #################### REG SSL ###########################
 class HeadCatPrediction(nn.Module):

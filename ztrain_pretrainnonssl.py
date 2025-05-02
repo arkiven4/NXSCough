@@ -27,8 +27,8 @@ warnings.simplefilter("ignore", UserWarning)
 # SECTION: Intialize Data
 # =============================================================
 
-MODEL_NAME = "vit_masked_con"
-CONFIG_PATH = "configs/vit_pretrain.json"
+MODEL_NAME = "vit_masked"
+CONFIG_PATH = "configs/lstm.json"
 
 model_dir = os.path.join("./logs", MODEL_NAME)
 if not os.path.exists(model_dir):
@@ -113,23 +113,7 @@ best_lost = np.inf
 patience_val = []
 
 if hps.train.warm_start:
-    if hps.train.from_pretrain:
-        print(hps.train.warm_start_checkpoint_pool)
-        checkpoint = torch.load(hps.train.warm_start_checkpoint_pool, map_location='cpu', weights_only=True)['model']
-        state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
-        model_dict = {}
-
-        for key, value in state_dict.items():
-            if key.startswith('v.'):
-                new_key = key[2:]
-                model_dict[new_key] = value
-
-        if hasattr(pool_model, 'module'):
-            pool_model.module.load_state_dict(model_dict, strict=True)
-        else:
-            pool_model.load_state_dict(model_dict, strict=True)
-    else:
-        pool_model = utils.warm_start_model(hps.train.warm_start_checkpoint_pool, pool_model, hps.train.ignored_layer)
+    pool_model = utils.warm_start_model(hps.train.warm_start_checkpoint_pool, pool_model, hps.train.ignored_layer)
 else:
     try:
         _, _, _, _, epoch_str = utils.load_checkpoint(
@@ -171,8 +155,8 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
         with torch.amp.autocast("cuda", enabled=True):
             x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True)
 
-            dse_pred = pool_model(audio)
-            loss, f1_micro, f1_macro, accuracy = utils.CE_weight_category(dse_pred, dse_id, class_weights_tensor)
+            f1_micro, f1_macro, accuracy = 0.0, 0.0, 0.0
+            loss = pool_model(audio)
 
         loss_gs = [loss]
         loss_g = sum(loss_gs) / ACCUMULATION_STEP
@@ -220,8 +204,8 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
 
             x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True).long()
             
-            dse_pred = pool_model(audio)
-            loss, f1_micro, f1_macro, accuracy = utils.CE_weight_category(dse_pred, dse_ids, class_weights_tensor)
+            f1_micro, f1_macro, accuracy = 0.0, 0.0, 0.0
+            loss = pool_model(audio)
 
             loss_gs = [loss]
             loss_g = sum(loss_gs)
