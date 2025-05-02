@@ -20,6 +20,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix, roc_curve, auc, roc_auc_score, f1_score
 
+from tensorboard.backend.event_processing import event_accumulator
+
 import warnings
 warnings.simplefilter("ignore", UserWarning)
 
@@ -157,129 +159,129 @@ optimizer_p.zero_grad(set_to_none=True)
 # SECTION: Train Epoch
 # =============================================================
 
-for epoch in range(epoch_str, hps.train.epochs + 1):
-    #train_loader.batch_sampler.set_epoch(epoch)
-    pool_model.train()
+# for epoch in range(epoch_str, hps.train.epochs + 1):
+#     #train_loader.batch_sampler.set_epoch(epoch)
+#     pool_model.train()
 
-    batch_cnt = 0
+#     batch_cnt = 0
 
-    for batch_idx, (wav_names, audio, attention_masks, dse_id) in enumerate(tqdm(train_loader)):
-        audio = audio.cuda(non_blocking=True).float().squeeze(1)
-        attention_masks = attention_masks.cuda(non_blocking=True).float()
-        dse_id = dse_id.cuda(non_blocking=True).long()
+#     for batch_idx, (wav_names, audio, attention_masks, dse_id) in enumerate(tqdm(train_loader)):
+#         audio = audio.cuda(non_blocking=True).float().squeeze(1)
+#         attention_masks = attention_masks.cuda(non_blocking=True).float()
+#         dse_id = dse_id.cuda(non_blocking=True).long()
         
-        with torch.amp.autocast("cuda", enabled=True):
-            x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True)
+#         with torch.amp.autocast("cuda", enabled=True):
+#             x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True)
 
-            dse_pred = pool_model(audio)
-            loss, f1_micro, f1_macro, accuracy = utils.CE_weight_category(dse_pred, dse_id, class_weights_tensor)
+#             dse_pred = pool_model(audio)
+#             loss, f1_micro, f1_macro, accuracy = utils.CE_weight_category(dse_pred, dse_id, class_weights_tensor)
 
-        loss_gs = [loss]
-        loss_g = sum(loss_gs) / ACCUMULATION_STEP
+#         loss_gs = [loss]
+#         loss_g = sum(loss_gs) / ACCUMULATION_STEP
 
-        scaler.scale(loss_g).backward()
-        grad_norm = commons.clip_grad_value_(pool_model.parameters(), None)
+#         scaler.scale(loss_g).backward()
+#         grad_norm = commons.clip_grad_value_(pool_model.parameters(), None)
         
-        if (batch_cnt + 1) % ACCUMULATION_STEP == 0 or (batch_cnt + 1) == len(train_loader):
-            scaler.step(optimizer_p)
-            scaler.update() 
-            optimizer_p.zero_grad(set_to_none=True)
+#         if (batch_cnt + 1) % ACCUMULATION_STEP == 0 or (batch_cnt + 1) == len(train_loader):
+#             scaler.step(optimizer_p)
+#             scaler.update() 
+#             optimizer_p.zero_grad(set_to_none=True)
         
-        batch_cnt = batch_cnt + 1
+#         batch_cnt = batch_cnt + 1
 
-        if batch_idx % hps.train.log_interval == 0:
-            scalar_dict = {
-                "loss/g/total": loss_g,
-                "loss/g/f1_micro": f1_micro,
-                "loss/g/f1_macro": f1_macro,
-                "loss/g/accuracy": accuracy,
-                "info/learning_rate": optimizer_p.param_groups[0]["lr"],
-                "info/grad_norm": grad_norm,
-            }
+#         if batch_idx % hps.train.log_interval == 0:
+#             scalar_dict = {
+#                 "loss/g/total": loss_g,
+#                 "loss/g/f1_micro": f1_micro,
+#                 "loss/g/f1_macro": f1_macro,
+#                 "loss/g/accuracy": accuracy,
+#                 "info/learning_rate": optimizer_p.param_groups[0]["lr"],
+#                 "info/grad_norm": grad_norm,
+#             }
 
-            scalar_dict.update(
-                {"loss/g/{}".format(i): v for i, v in enumerate(loss_gs)}
-            )
+#             scalar_dict.update(
+#                 {"loss/g/{}".format(i): v for i, v in enumerate(loss_gs)}
+#             )
 
-            utils.summarize(
-                writer=writer,
-                global_step=global_step,
-                scalars=scalar_dict,
-            )
+#             utils.summarize(
+#                 writer=writer,
+#                 global_step=global_step,
+#                 scalars=scalar_dict,
+#             )
 
-        global_step += 1
+#         global_step += 1
         
-    pool_model.eval()
-    losses_tot = []
-    acc_tot = []
-    with torch.no_grad():
-        for batch_idx, (wav_names, audio, attention_masks, dse_ids) in enumerate(tqdm(val_loader)):
-            audio = audio.cuda(non_blocking=True).float().squeeze(1)
-            attention_masks = attention_masks.cuda(non_blocking=True).float()
-            dse_ids = dse_ids.cuda(non_blocking=True).long()
+#     pool_model.eval()
+#     losses_tot = []
+#     acc_tot = []
+#     with torch.no_grad():
+#         for batch_idx, (wav_names, audio, attention_masks, dse_ids) in enumerate(tqdm(val_loader)):
+#             audio = audio.cuda(non_blocking=True).float().squeeze(1)
+#             attention_masks = attention_masks.cuda(non_blocking=True).float()
+#             dse_ids = dse_ids.cuda(non_blocking=True).long()
 
-            x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True).long()
+#             x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True).long()
             
-            dse_pred = pool_model(audio)
-            loss, f1_micro, f1_macro, accuracy = utils.CE_weight_category(dse_pred, dse_ids, class_weights_tensor)
+#             dse_pred = pool_model(audio)
+#             loss, f1_micro, f1_macro, accuracy = utils.CE_weight_category(dse_pred, dse_ids, class_weights_tensor)
 
-            loss_gs = [loss]
-            loss_g = sum(loss_gs)
+#             loss_gs = [loss]
+#             loss_g = sum(loss_gs)
 
-            if batch_idx == 0:
-                losses_tot = loss_gs
-                acc_tot = [accuracy]
-            else:
-                losses_tot = [x + y for (x, y) in zip(losses_tot, loss_gs)]
-                acc_tot = [x + y for (x, y) in zip(acc_tot, [accuracy])]
+#             if batch_idx == 0:
+#                 losses_tot = loss_gs
+#                 acc_tot = [accuracy]
+#             else:
+#                 losses_tot = [x + y for (x, y) in zip(losses_tot, loss_gs)]
+#                 acc_tot = [x + y for (x, y) in zip(acc_tot, [accuracy])]
 
-    losses_tot = [x / len(val_loader) for x in losses_tot]
-    acc_tot = [x / len(val_loader) for x in acc_tot]
-    loss_tot = torch.mean(torch.tensor(losses_tot)) #sum(losses_tot)
-    acc_tot = torch.mean(torch.tensor(acc_tot)) #sum(losses_tot)
-    scalar_dict = {"loss/g/total": loss_tot, "ACC": acc_tot}
-    scalar_dict.update({"loss/g/{}".format(i): v for i, v in enumerate(losses_tot)})
-    utils.summarize(
-        writer=writer_eval, global_step=global_step, scalars=scalar_dict
-    )
+#     losses_tot = [x / len(val_loader) for x in losses_tot]
+#     acc_tot = [x / len(val_loader) for x in acc_tot]
+#     loss_tot = torch.mean(torch.tensor(losses_tot)) #sum(losses_tot)
+#     acc_tot = torch.mean(torch.tensor(acc_tot)) #sum(losses_tot)
+#     scalar_dict = {"loss/g/total": loss_tot, "ACC": acc_tot}
+#     scalar_dict.update({"loss/g/{}".format(i): v for i, v in enumerate(losses_tot)})
+#     utils.summarize(
+#         writer=writer_eval, global_step=global_step, scalars=scalar_dict
+#     )
 
-    pool_model.train()
-    scheduler_p.step()
+#     pool_model.train()
+#     scheduler_p.step()
 
-    if loss_tot < best_lost and loss_tot > 0:
-        logger.info(f"Get Best New Validation!!!!")
-        best_lost = loss_tot
-        patience_val = []
+#     if loss_tot < best_lost and loss_tot > 0:
+#         logger.info(f"Get Best New Validation!!!!")
+#         best_lost = loss_tot
+#         patience_val = []
 
-        utils.save_checkpoint(
-            pool_model, optimizer_p, scheduler_p,
-            hps.train.learning_rate, epoch,
-            os.path.join(hps.model_dir, "best_pool.pth"))
-    else:
-        patience_val.append(1)
-        logger.info(f"Patience: {len(patience_val)}")
+#         utils.save_checkpoint(
+#             pool_model, optimizer_p, scheduler_p,
+#             hps.train.learning_rate, epoch,
+#             os.path.join(hps.model_dir, "best_pool.pth"))
+#     else:
+#         patience_val.append(1)
+#         logger.info(f"Patience: {len(patience_val)}")
 
-        if epoch > 3 and len(patience_val) >= 4:
-            new_lr = hps.train.learning_rate * (0.9 ** ((epoch - 3) // 1))
-            for param_group in optimizer_p.param_groups:
-                param_group['lr'] = new_lr
+#         if epoch > 3 and len(patience_val) >= 4:
+#             new_lr = hps.train.learning_rate * (0.9 ** ((epoch - 3) // 1))
+#             for param_group in optimizer_p.param_groups:
+#                 param_group['lr'] = new_lr
 
-        if len(patience_val) > 5:
-            break
+#         if len(patience_val) > 5:
+#             break
 
 
-    logger.info("====> Epoch: {}".format(epoch))
-    if epoch % 1 == 0:
-        utils.save_checkpoint(
-            pool_model, optimizer_p, scheduler_p,
-            hps.train.learning_rate, epoch,
-            os.path.join(hps.model_dir, "pool_{}.pth".format(epoch)))
+#     logger.info("====> Epoch: {}".format(epoch))
+#     if epoch % 1 == 0:
+#         utils.save_checkpoint(
+#             pool_model, optimizer_p, scheduler_p,
+#             hps.train.learning_rate, epoch,
+#             os.path.join(hps.model_dir, "pool_{}.pth".format(epoch)))
 
-        with open(os.path.join(hps.model_dir, "traindata.pickle"), 'wb') as handle:
-            pickle.dump({
-                "best_lost": best_lost,
-                "patience_val": patience_val
-            }, handle, protocol=pickle.HIGHEST_PROTOCOL)
+#         with open(os.path.join(hps.model_dir, "traindata.pickle"), 'wb') as handle:
+#             pickle.dump({
+#                 "best_lost": best_lost,
+#                 "patience_val": patience_val
+#             }, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 ######################################################################
@@ -341,14 +343,25 @@ plt.savefig(f"{model_dir}/result_roc.png")
 accuracy = accuracy_score(all_labels, all_preds, normalize=True)
 b_accuracy = balanced_accuracy_score(all_labels, all_preds)
 f1 = f1_score(all_labels, all_preds, average="weighted")
+f1_pos = f1_score(all_labels, all_preds, pos_label=1)
 try:
     roc_auc = roc_auc_score(all_labels, all_preds)
 except Exception as exception:
     roc_auc = None
 
+tn, fp, fn, tp = cm.ravel()
+sensitivity = tp / (tp + fn)
+specificity = tn / (tn + fp)
+
 with open(f"{model_dir}/result_summary.txt", "w") as file:
     file.write(df['disease_label'].value_counts().to_string() + "\n")
     file.write("\n")
-    file.write(f"Accuracy {accuracy:.2f} | Balanced Accuracy {b_accuracy:.2f} | AUC {auc_score:.2f} |ROC AUC {roc_auc:.2f} | F1 Score Accuracy: {f1:.2f}\n")
- 
+    file.write(f"Accuracy {accuracy:.2f} | Balanced Accuracy {b_accuracy:.2f} | AUC {auc_score:.2f} | ROC AUC {roc_auc:.2f} | Weighted F1: {f1:.2f} | Positive F1: {f1_pos:.2f} | Sensitivity: {sensitivity:.2f} | Specificity: {specificity:.2f} \n")
+
+utils.plot_loss_from_tensorboard(
+    best_lost,
+    train_log_dir=hps.model_dir,
+    val_log_dir=os.path.join(hps.model_dir, "eval"), save_path=f"{model_dir}/result_loss.png"
+)
+
 print(f"Saved In: {model_dir}, Accuracy: {accuracy:.2f}, AUC: {auc_score:.2f}")

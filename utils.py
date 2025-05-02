@@ -9,6 +9,7 @@ import logging
 import random
 import string
 import subprocess
+import matplotlib.pyplot as plt
 
 import numpy as np
 from scipy.io.wavfile import read
@@ -17,6 +18,7 @@ import librosa
 
 import torch
 from torchaudio import transforms as T
+from tensorboard.backend.event_processing import event_accumulator
 
 MATPLOTLIB_FLAG = False
 
@@ -330,3 +332,42 @@ def load_audio_sample(file_path, db_sample_rate, wav_stats, desired_length, fade
     data = fade(data)
     data = cut_pad_sample_torchaudio(data, sample_rate, desired_length, pad_types=pad_types)
     return data
+
+def extract_scalar(log_dir, tag='loss/g/total'):
+    ea = event_accumulator.EventAccumulator(log_dir)
+    ea.Reload()
+    return ea.Scalars(tag)
+
+def plot_loss_from_tensorboard(best_lost, train_log_dir, val_log_dir, tag='loss/g/total', save_path='loss_plot.png'):
+    train_events = extract_scalar(train_log_dir, tag)
+    val_events = extract_scalar(val_log_dir, tag)
+
+    stop_step = 9999999
+    steps_val = []
+    values_val = []
+    for event in val_events:
+        steps_val.append(event.step)
+        values_val.append(event.value)
+        if event.value == best_lost:
+            stop_step = event.step
+            break
+
+    steps_train = []
+    values_train = []
+    for e in train_events:
+        if e.step > stop_step:
+            break
+        steps_train.append(e.step)
+        values_train.append(e.value)
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(steps_train, values_train, label='Loss Train', color='red')
+    plt.plot(steps_val, values_val, label='Loss Validation', color='blue')
+    plt.xlabel('Step')
+    plt.ylabel('Loss')
+    plt.title(f'Loss Curve: {tag}')
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
