@@ -31,6 +31,7 @@
     "desired_length": 0.5,
     "fade_samples_ratio": 6,
     "pad_types": "zero",
+    "feature_type": "melspectogram",
     "acoustic_feature": true,
     "augment_data": false,
     "add_noise": false,
@@ -39,7 +40,7 @@
     "metadata_csv": "metadata_combine.csv"
   }, 
   "model": {
-    "pooling_type": "SimpleMaskedModel",
+    "pooling_type": "ResNet101",
     "feature_dim": 13,
     "pooling_hidden": 128,
     "p_dropout": 0.1,

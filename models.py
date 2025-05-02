@@ -75,8 +75,8 @@ class ResNet101(torchvision.models.resnet.ResNet):
         if self.grad_cam == True:
             x = x
         else:
-            x = x.unsqueeze(0)
-            x = self.preprocess(x)
+            x = x.unsqueeze(1)
+            #x = self.preprocess(x)
 
         x = self.conv1(x)
         x = self.bn1(x)
