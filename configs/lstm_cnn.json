@@ -28,15 +28,15 @@
     "n_mel_channels": 80,
     "mel_fmin": 0.0,
     "mel_fmax": 8000.0,
-    "desired_length": 0.5,
+    "desired_length": 1,
     "fade_samples_ratio": 6,
-    "pad_types": "zero",
+    "pad_types": "repeat",
     "feature_type": "melspectogram",
     "acoustic_feature": true,
     "augment_data": false,
     "add_noise": false,
     "emotion_class": 2,
-    "db_path": "/run/media/fourier/Data1/Pras/Database_ThesisNew/",
+    "db_path": "/mnt/data/",
     "metadata_csv": "metadata_combine.csv"
   }, 
   "model": {
