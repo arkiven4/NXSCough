@@ -1,6 +1,9 @@
 Bootstrap: docker
 From: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
+%files
+    ./requirements.txt ./requirements.txt
+
 %post
 	# Downloads the latest package lists (important).
 	apt-get update -y
@@ -13,10 +16,7 @@ From: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 	python3-pip \
 	python3-setuptools \
 	systemd \
-	git \
-	imagemagick \
-	curl \
-	openslide-tools
+	git
 	
 	# Install nodejs
 	curl -fsSL https://deb.nodesource.com/setup_22.x | bash - 
@@ -27,14 +27,7 @@ From: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
 	# Update pip
 	python3 -m pip install --upgrade pip==24.0
-
-	# Install python libraries
-	python3 -m pip install wheel
-	python3 -m pip install torch torchvision numpy matplotlib torchsummary tensorboardX tensorboard einops
-  
-  git clone https://github.com/arkiven4/NXSCough
-  cd NXSCough
-  python3 -m pip install -r requirements.txt
+  	python3 -m pip install -r requirements.txt
 
 #%runscript
   #python3 -c 'print("Hello World! Hello from our custom Singularity image!")'
