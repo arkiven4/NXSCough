@@ -27,8 +27,8 @@ warnings.simplefilter("ignore", UserWarning)
 # SECTION: Intialize Data
 # =============================================================
 
-MODEL_NAME = "vit_masked_con"
-CONFIG_PATH = "configs/vit_pretrain.json"
+MODEL_NAME = "resnet_reproduce"
+CONFIG_PATH = "configs/lstm_cnn.json"
 
 model_dir = os.path.join("./logs", MODEL_NAME)
 if not os.path.exists(model_dir):

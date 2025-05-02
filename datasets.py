@@ -87,14 +87,16 @@ class SERDatasets(torch.utils.data.Dataset):
 
         self.wav_transform = None
         if hparams.acoustic_feature:
-            # self.wav_transform = T.MFCC(sample_rate=hparams.sampling_rate, n_mfcc=13, 
-            #                             melkwargs={"n_fft": hparams.win_length, "hop_length": hparams.hop_length, 
-            #                                        "n_mels": hparams.n_mel_channels, "window_fn": torch.hann_window,
-            #                                        "power": 2.0, "center": True, "normalized": False})
-            self.wav_transform = commons.TacotronSTFT(
-                            hparams.filter_length, hparams.hop_length, hparams.win_length,
-                            hparams.n_mel_channels, hparams.sampling_rate, hparams.mel_fmin,
-                            hparams.mel_fmax)
+            if hparams.feature_type == "mfcc":
+                self.wav_transform = T.MFCC(sample_rate=hparams.sampling_rate, n_mfcc=13, 
+                                            melkwargs={"n_fft": hparams.win_length, "hop_length": hparams.hop_length, 
+                                                       "n_mels": hparams.n_mel_channels, "window_fn": torch.hann_window,
+                                                       "power": 2.0, "center": True, "normalized": False})
+            elif hparams.feature_type == "melspectogram":
+                self.wav_transform = commons.TacotronSTFT(
+                                hparams.filter_length, hparams.hop_length, hparams.win_length,
+                                hparams.n_mel_channels, hparams.sampling_rate, hparams.mel_fmin,
+                                hparams.mel_fmax)
         
         #self._filter()
         #random.seed(1234)
