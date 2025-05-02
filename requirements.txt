@@ -13,3 +13,5 @@ torchaudio
 torchvision
 tqdm
 transformers
+tensorboard 
+einops

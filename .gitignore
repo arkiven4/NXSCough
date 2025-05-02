@@ -4,3 +4,4 @@ logs/
 *.zip
 data/TB_resample/
 test.ipynb
+*.sif

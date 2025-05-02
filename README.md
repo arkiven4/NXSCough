@@ -15,7 +15,14 @@ This repository contains a training pipeline for a Cough classification model us
 
 ## :rocket: Getting Started
 
-### 1. Preparation
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/arkiven4/NXSCough
+cd NXSCough
+```
+
+### 2. Preparation
 Install dependencies with:
 ```bash
 pip install -r requirements.txt
@@ -40,7 +47,7 @@ This folder must contain:
 Update the path according to your environment before running the training script.
 
 
-### 2. Train the Model
+### 3. Train the Model
 
 ```bash
 python ztrain_nonssl.py
@@ -55,6 +62,35 @@ tensorboard --logdir ./logs/lstm_try1
 Open the provided [localhost](http://localhost:6006) link in your browser to monitor loss, accuracy, and other metrics during training.
 
 After training is complete, please check the `logs` folder.
+
+## :rocket: Getting Started For Singularity User
+
+Follow the steps below to clone the repository, build the Singularity image, bind necessary folders, and execute your application.
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/arkiven4/NXSCough
+cd NXSCough
+```
+### 2. Build the Singularity Image
+
+```bash
+singularity build nxscough.sif nxscough.def
+```
+### 3. Configure Config
+
+```bash
+
+```
+
+### 4. Run Training
+
+```bash
+sudo singularity exec --bind /run/media/fourier/Data1/Pras/Database_ThesisNew/:/mnt/data --nv nxscough.sif python3 ztrain_nonssl.py
+
+
+```
+
 
 ### Optional: Data Augmentation with RIRS
 
