@@ -92,3 +92,6 @@ class TacotronSTFT(nn.Module):
     mel_output = torch.matmul(self.mel_basis, magnitudes)
     mel_output = self.spectral_normalize(mel_output).squeeze(0)
     return mel_output
+  
+def pair(t):
+    return t if isinstance(t, tuple) else (t, t)

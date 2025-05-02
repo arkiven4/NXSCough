@@ -4,7 +4,7 @@
     "log_interval": 20,
     "seed": 1234,
     "epochs": 10000,
-    "learning_rate": 5e-4,
+    "learning_rate": 2e-5,
     "betas": [0.8, 0.99],
     "eps": 1e-9,
     "lr_decay": 0.999875,
@@ -13,9 +13,9 @@
     "batch_size": 128,
     "accumulation_steps": 1,
     "fp16_run": false,
-    "warm_start": false, 
-    "from_pretrain": false, 
-    "warm_start_checkpoint_pool": "./logs/Dim_PoolingSep_VATTTry6_Roberto_normmax/best_pool.pth",
+    "warm_start": true, 
+    "from_pretrain": true, 
+    "warm_start_checkpoint_pool": "./logs/vit_masked/best_pool.pth",
     "ignored_layer": []
   },
   "data": {
@@ -39,7 +39,7 @@
     "metadata_csv": "metadata_combine.csv"
   }, 
   "model": {
-    "pooling_type": "SimpleMaskedModel",
+    "pooling_type": "ViT",
     "feature_dim": 13,
     "pooling_hidden": 128,
     "p_dropout": 0.1,
