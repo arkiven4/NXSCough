@@ -78,19 +78,30 @@ cd NXSCough
 singularity build nxscough.sif nxscough.def
 ```
 ### 3. Configure Config
+Before training, ensure that the path to your dataset is correctly set in your config like this:
 
 ```bash
-
+"db_path": "/mnt/data/"
 ```
 
 ### 4. Run Training
 
 ```bash
 sudo singularity exec --bind /run/media/fourier/Data1/Pras/Database_ThesisNew/:/mnt/data --nv nxscough.sif python3 ztrain_nonssl.py
-
-
 ```
+The path `/run/media/fourier/Data1/Pras/Database_ThesisNew/` replace with path on your host machine and **must contain**:
+```
+/run/media/fourier/Data1/Pras/Database_ThesisNew/
+├── metadata_combine.csv
+└── CombineData/
+├── file1.wav
+├── file2.wav
+└── ...
+```
+- `metadata_combine.csv`: A CSV file containing metadata about the audio files.
+- `CombineData/`: A folder containing `.wav` files used for training.
 
+These files will be mounted to `/mnt/data` inside the container.
 
 ### Optional: Data Augmentation with RIRS
 
