@@ -14,22 +14,23 @@ from typing import Any, Callable, Optional
 import modules, commons
 
 class LSTMAudioClassifier1(nn.Module):
-    def __init__(self, input_size, seq_len, hidden_size, num_classes):
+    def __init__(self, input_size, regress_hidden_dim, output_dim, **kwargs):
         super(LSTMAudioClassifier1, self).__init__()
         
         self.batch_norm1 = nn.BatchNorm1d(input_size)
-        self.lstm1 = nn.LSTM(input_size, hidden_size, batch_first=True)
+        self.lstm1 = nn.LSTM(input_size, regress_hidden_dim, batch_first=True)
         
-        self.batch_norm2 = nn.BatchNorm1d(hidden_size)
-        self.lstm2 = nn.LSTM(hidden_size, hidden_size, batch_first=True)
+        self.batch_norm2 = nn.BatchNorm1d(regress_hidden_dim)
+        self.lstm2 = nn.LSTM(regress_hidden_dim, regress_hidden_dim, batch_first=True)
         
         #self.attention = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=8, batch_first=True)
 
         self.flatten = nn.Flatten()
         self.dropout = nn.Dropout(0.1)
-        self.fc = nn.Linear(hidden_size, num_classes)
+        self.fc = nn.Linear(regress_hidden_dim, output_dim)
 
     def forward(self, x, lengths=None):
+        x = x.permute(0, 2, 1)
         x = self.batch_norm1(x.transpose(1, 2)).transpose(1, 2)
         x, _ = self.lstm1(x)
         
@@ -54,9 +55,9 @@ class ResNet101(torchvision.models.resnet.ResNet):
         self.final_feat_dim = 2048
         self.grad_cam = False
          # TODO : Coba tambah Rezize and Normalization
-        self.preprocess = torchvision.transforms.Compose([
-            torchvision.transforms.Resize((224,224))
-        ])
+        # self.preprocess = torchvision.transforms.Compose([
+        #     torchvision.transforms.Resize((224, 224))
+        # ])
 
     def load_sl_official_weights(self, progress=True):
         state_dict = load_state_dict_from_url(torchvision.models.resnet.ResNet101_Weights.IMAGENET1K_V2.url,

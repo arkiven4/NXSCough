@@ -29,7 +29,7 @@ warnings.simplefilter("ignore", UserWarning)
 # SECTION: Intialize Data
 # =============================================================
 
-MODEL_NAME = "resnet_reproduce"
+MODEL_NAME = "apsipa_lstm_sken2_solic_aug"
 CONFIG_PATH = "configs/lstm_cnn.json"
 
 model_dir = os.path.join("./logs", MODEL_NAME)
@@ -62,9 +62,21 @@ Diseases_codes = [0, 1]
 CLASS_NAMES = ["Healthy", "TB"]
 
 df = pd.read_csv(f'{hps.data.db_path}/{hps.data.metadata_csv}')
-df = df[df['database'].isin(['tb_longitudinal_data', 'tb_solicited_data'])]
+df = df[df['cough_score'] >= 0.90].sample(frac=1, random_state=40)
 
-df_train, df_test = train_test_split(df, test_size=0.03, random_state=42, shuffle=True)
+df_solic = df[df['type_cough'] == 0].sample(frac=1, random_state=41)
+df_long = df[df['type_cough'] == 1].sample(frac=1, random_state=42) # 0 Solic, 1 Longi
+df_long_array = []
+for i_rand in range(5):
+    df_0 = df_long[df_long['disease_label'] == 0].sample(n=df_solic['disease_label'].value_counts()[0], random_state=i_rand * 4)
+    df_1 = df_long[df_long['disease_label'] == 1].sample(n=df_solic['disease_label'].value_counts()[1], random_state=i_rand * 4)
+    df_long_array.append(pd.concat([df_0, df_1], ignore_index=True, sort=False))
+
+df = df_long_array[4]
+print(df.shape)
+#df = df[df['database'].isin(['tb_longitudinal_data', 'tb_solicited_data'])]
+
+df_train, df_test = train_test_split(df, test_size=0.1, random_state=42, shuffle=True)
 # df_train = df[df['database'].isin(['tb_longitudinal_data'])]
 # df_test = df[df['database'].isin(['tb_solicited_data'])]
 
@@ -73,9 +85,6 @@ total_samples = len(df_train)
 class_weights = {cls: total_samples / (len(Diseases_codes) * freq) if freq != 0 else 0 for cls, freq in class_frequencies.items()}
 weights_list = [class_weights[cls] for cls in Diseases_codes]
 class_weights_tensor = torch.tensor(weights_list, device='cuda', dtype=torch.float)
-
-# df_train.drop(['database'], axis=1, inplace=True)
-# df_test.drop(['database'], axis=1, inplace=True)
 
 # =============================================================
 # SECTION: Setup Logger, Dataloader
