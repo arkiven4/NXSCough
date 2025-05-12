@@ -72,6 +72,7 @@ class SERDatasets(torch.utils.data.Dataset):
         self.pad_types = hparams.pad_types
         self.add_noise = hparams.add_noise
         self.db_path = hparams.db_path
+        self.feature_type = hparams.feature_type
 
         self.augment_data = hparams.augment_data
 
@@ -97,6 +98,9 @@ class SERDatasets(torch.utils.data.Dataset):
                                 hparams.filter_length, hparams.hop_length, hparams.win_length,
                                 hparams.n_mel_channels, hparams.sampling_rate, hparams.mel_fmin,
                                 hparams.mel_fmax)
+            elif hparams.feature_type == "ifas":
+                self.wav_transform = commons.IFASv2(hparams.sampling_rate, K_sca=hparams.K_sca, 
+                                                    K_max=hparams.K_max, B_sca=hparams.B_sca)
         
         #self._filter()
         #random.seed(1234)
@@ -125,6 +129,8 @@ class SERDatasets(torch.utils.data.Dataset):
             if random.uniform(0, 0.999) > 1 - 0.6:
                 try:
                     audio = self.data_augmentator(audio.unsqueeze(0), self.sampling_rate).squeeze(0)
+                    max_val = torch.max(torch.abs(audio))
+                    audio = audio / max_val if max_val != 0 else audio
                 except:
                     audio = audio
 
@@ -132,7 +138,8 @@ class SERDatasets(torch.utils.data.Dataset):
             audio = audio + torch.rand_like(audio)
 
         if self.wav_transform != None:
-            audio = self.wav_transform(audio) # [13, T]
+            audio = self.wav_transform(audio)
+            #audio = self.wav_transform(filename)
 
         audio = audio.unsqueeze(0)
         return audio
