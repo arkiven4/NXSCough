@@ -114,10 +114,10 @@ class SERDatasets(torch.utils.data.Dataset):
         self.lengths = lengths
 
     def get_mel_text_pair(self, audiopath_and_text):
-        wavname, dse_id = audiopath_and_text[0], audiopath_and_text[1] #, audiopath_and_text[2], audiopath_and_text[3], 0, audiopath_and_text[5] #audiopath_and_text[4], audiopath_and_text[5]
+        wavname, dse_id, spk_id = audiopath_and_text[0], audiopath_and_text[1], audiopath_and_text[4] #, audiopath_and_text[2], audiopath_and_text[3], 0, audiopath_and_text[5] #audiopath_and_text[4], audiopath_and_text[5]
         wav = self.get_audio(self.db_path + "/" + wavname)
 
-        return (wavname, wav, dse_id)
+        return (wavname, wav, dse_id, spk_id)
 
     def get_audio(self, filename): # random.randint(1, 6)
         audio = utils.load_audio_sample(filename, self.sampling_rate, None, 
@@ -169,6 +169,7 @@ class SERDatasetsCollate():
         max_wav_len = input_lengths[0] # max([x[0].size(1) for x in batch])
 
         dse_ids = torch.LongTensor(len(batch))
+        spk_ids = torch.LongTensor(len(batch))
     
         feature_dim = 1
         if len(batch[0][1].shape) == 3:
@@ -187,5 +188,6 @@ class SERDatasetsCollate():
             attention_masks[i, :wav.shape[-1]] = 1
 
             dse_ids[i] = batch[ids_sorted_decreasing[i]][2]
+            spk_ids[i] = batch[ids_sorted_decreasing[i]][3]
         
-        return wav_name, wav_padded, attention_masks, dse_ids
+        return wav_name, wav_padded, attention_masks, dse_ids, spk_ids
