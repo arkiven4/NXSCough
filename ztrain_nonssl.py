@@ -29,19 +29,23 @@ warnings.simplefilter("ignore", UserWarning)
 # SECTION: Intialize Data
 # =============================================================
 
-MODEL_NAME = "apsipa_lstm_sken2_solic_aug"
+MODEL_NAME = "apsipa_lstm_sken1_longi_4"
 CONFIG_PATH = "configs/lstm_cnn.json"
+INIT = False
 
 model_dir = os.path.join("./logs", MODEL_NAME)
 if not os.path.exists(model_dir):
     os.makedirs(model_dir)
 
 config_save_path = os.path.join(model_dir, "config.json")
-if True:
+if INIT:
     with open(CONFIG_PATH, "r") as f:
       data = f.read()
     with open(config_save_path, "w") as f:
       f.write(data)
+else:
+    with open(config_save_path, "r") as f:
+      data = f.read()
 
 config = json.loads(data)
   
@@ -174,10 +178,11 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
 
     batch_cnt = 0
 
-    for batch_idx, (wav_names, audio, attention_masks, dse_id) in enumerate(tqdm(train_loader)):
+    for batch_idx, (wav_names, audio, attention_masks, dse_id, spk_ids) in enumerate(tqdm(train_loader)):
         audio = audio.cuda(non_blocking=True).float().squeeze(1)
         attention_masks = attention_masks.cuda(non_blocking=True).float()
         dse_id = dse_id.cuda(non_blocking=True).long()
+        spk_ids = spk_ids.cuda(non_blocking=True).long()
         
         with torch.amp.autocast("cuda", enabled=True):
             x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True)
@@ -224,10 +229,11 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
     losses_tot = []
     acc_tot = []
     with torch.no_grad():
-        for batch_idx, (wav_names, audio, attention_masks, dse_ids) in enumerate(tqdm(val_loader)):
+        for batch_idx, (wav_names, audio, attention_masks, dse_ids, spk_ids) in enumerate(tqdm(val_loader)):
             audio = audio.cuda(non_blocking=True).float().squeeze(1)
             attention_masks = attention_masks.cuda(non_blocking=True).float()
             dse_ids = dse_ids.cuda(non_blocking=True).long()
+            spk_ids = spk_ids.cuda(non_blocking=True).long()
 
             x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True).long()
             
@@ -309,10 +315,11 @@ _, _, _, _, epoch_str = utils.load_checkpoint(
 pool_model.eval() 
 all_preds, all_labels, all_probs  = [], [], []
 with torch.no_grad():
-    for batch_idx, (wav_names, audio, attention_masks, dse_ids) in enumerate(tqdm(val_loader)):
+    for batch_idx, (wav_names, audio, attention_masks, dse_ids, spk_ids) in enumerate(tqdm(val_loader)):
         audio = audio.cuda(non_blocking=True).float().squeeze(1)
         attention_masks = attention_masks.cuda(non_blocking=True).float()
         dse_ids = dse_ids.cuda(non_blocking=True).long()
+        spk_ids = spk_ids.cuda(non_blocking=True).long()
 
         x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True).long()
         outputs = pool_model(audio)

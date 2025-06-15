@@ -39,7 +39,7 @@
     "augment_data": false,
     "add_noise": false,
     "emotion_class": 2,
-    "db_path": "./data/",
+    "db_path": "/run/media/fourier/Data1/Pras/Database_ThesisNew/",
     "metadata_csv": "metadata_combine.csv"
   }, 
   "model": {

@@ -333,6 +333,16 @@ def load_audio_sample(file_path, db_sample_rate, wav_stats, desired_length, fade
     data = cut_pad_sample_torchaudio(data, sample_rate, desired_length, pad_types=pad_types)
     return data
 
+def smoothing_tensorboard(values, weight=0.9):
+    """EMA smoothing of a curve."""
+    smoothed = []
+    last = values[0]
+    for val in values:
+        smoothed_val = last * weight + (1 - weight) * val
+        smoothed.append(smoothed_val)
+        last = smoothed_val
+    return smoothed
+
 def extract_scalar(log_dir, tag='loss/g/total'):
     ea = event_accumulator.EventAccumulator(log_dir)
     ea.Reload()
@@ -360,12 +370,15 @@ def plot_loss_from_tensorboard(best_lost, train_log_dir, val_log_dir, tag='loss/
         steps_train.append(e.step)
         values_train.append(e.value)
 
-    plt.figure(figsize=(10, 5))
-    plt.plot(steps_train, values_train, label='Loss Train', color='red')
-    plt.plot(steps_val, values_val, label='Loss Validation', color='blue')
-    plt.xlabel('Step')
+    values_train = smoothing_tensorboard(values_train, weight=0.3)
+    values_val = smoothing_tensorboard(values_val, weight=0.3)
+
+    plt.figure(figsize=(10, 3))
+    plt.plot(steps_train, values_train, ':k', label='Train')
+    plt.plot(steps_val, values_val, '-k', label='Validation')
+    plt.xlabel('Steps')
     plt.ylabel('Loss')
-    plt.title(f'Loss Curve: {tag}')
+    plt.title(f'Loss Training')
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
