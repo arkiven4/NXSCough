@@ -1,5 +1,6 @@
 import os, pickle, random
 import pandas as pd
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -8,9 +9,8 @@ from torch.utils.data import DataLoader
 from torchaudio import transforms as T
 from sklearn.utils import shuffle 
 
-import utils, commons
+import utils, commons, audio_processing
 from augmentation import DataAugmentator
-
 
 class AudioDatasetBaseFeature(torch.utils.data.Dataset):
     def __init__(self, data_path, df_data, sample_rate, desired_length):
@@ -60,8 +60,8 @@ def df_sampler(train_df):
 
     return sampler, class_weights
 
-class SERDatasets(torch.utils.data.Dataset):
-    def __init__(self, data_numpy, hparams):
+class CoughDatasets(torch.utils.data.Dataset):
+    def __init__(self, data_numpy, hparams, train=True):
         # ['FileName', 'EmoAct', 'EmoVal', 'EmoDom', 'SpkrID', 'EmoClassCode']
         self.audiopaths_and_text = shuffle(data_numpy, random_state=20)
         self.hop_length = hparams.hop_length
@@ -74,17 +74,17 @@ class SERDatasets(torch.utils.data.Dataset):
         self.db_path = hparams.db_path
         self.feature_type = hparams.feature_type
 
+        self.train = train
         self.augment_data = hparams.augment_data
+        self.multimask_augment = hparams.multimask_augment
+        self.mix_audio = hparams.mix_audio
+        self.nClasses = hparams.many_class
+        print(self.train)
 
         if self.augment_data:
-            self.data_augmentator = DataAugmentator(
-                None,
-                "/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_noises_labels.tsv",
-                None,
-                "/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_rirs_labels.tsv",
-                5.5,
-                ["apply_reverb", "add_background_noise"],
-            )
+            self.data_augmentator = DataAugmentator(None, "/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_noises_labels.tsv",
+                None, "/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_rirs_labels.tsv",
+                5.5, ["apply_reverb", "add_background_noise"])
 
         self.wav_transform = None
         if hparams.acoustic_feature:
@@ -98,10 +98,27 @@ class SERDatasets(torch.utils.data.Dataset):
                                 hparams.filter_length, hparams.hop_length, hparams.win_length,
                                 hparams.n_mel_channels, hparams.sampling_rate, hparams.mel_fmin,
                                 hparams.mel_fmax)
-            elif hparams.feature_type == "ifas":
-                self.wav_transform = commons.IFASv2(hparams.sampling_rate, K_sca=hparams.K_sca, 
-                                                    K_max=hparams.K_max, B_sca=hparams.B_sca)
+            elif hparams.feature_type == "spectogram":
+                self.wav_transform = T.Spectrogram(
+                    n_fft=hparams.win_length,
+                    hop_length=hparams.hop_length,
+                    power=2.0,
+                    window_fn=torch.hann_window,
+                    center=True,
+                    normalized=False
+                )
         
+        if self.mix_audio == True:
+            if False:
+                print("Using BetweenClass Training With Weight")
+                weights = [1.2742, 0.8229]
+                inv_weights = [1 / w for w in weights]
+                total = sum(inv_weights)
+                self.probs = [w / total for w in inv_weights]
+            else:
+                print("Using BetweenClass Training All Same")
+                self.probs = [1 / self.nClasses] * self.nClasses
+
         #self._filter()
         #random.seed(1234)
         #random.shuffle(self.audiopaths_and_text)
@@ -116,6 +133,48 @@ class SERDatasets(torch.utils.data.Dataset):
     def get_mel_text_pair(self, audiopath_and_text):
         wavname, dse_id, spk_id = audiopath_and_text[0], audiopath_and_text[1], audiopath_and_text[4] #, audiopath_and_text[2], audiopath_and_text[3], 0, audiopath_and_text[5] #audiopath_and_text[4], audiopath_and_text[5]
         wav = self.get_audio(self.db_path + "/" + wavname)
+
+        if self.mix_audio == True and self.train == True:
+            r = np.array(random.random())
+            eye = np.eye(self.nClasses)
+            while True:
+                random_class = random.choices(range(self.nClasses), weights=self.probs, k=1)[0]
+                if dse_id != random_class:
+                    sampled_row = self.audiopaths_and_text[np.random.choice(np.where(self.audiopaths_and_text[:, 1] == random_class)[0])]
+                    dse_id_rand = sampled_row[1]
+                    dse_id = (eye[dse_id] * r + eye[dse_id_rand] * (1 - r)).astype(np.float32)
+                    dse_id = torch.from_numpy(dse_id).unsqueeze(0)
+                    break
+                
+            wav_rand = self.get_audio(self.db_path + "/" + sampled_row[0])
+            
+            # desired_length = wav.shape[-1] / self.sampling_rate
+            # wav_rand = audio_processing.cut_pad_sample_torchaudio(wav_rand, self.sampling_rate, desired_length, pad_types=self.pad_types)
+
+            sound1 = wav.squeeze(0).numpy()
+            sound2 = wav_rand.squeeze(0).numpy()
+            
+            size = min(len(sound1), len(sound2)) 
+            sound1 = sound1[:size]#wav[random.randint(0, len(wav) - size):][:size] if len(wav) > size else wav
+            sound2 = sound2[:size]#wav_rand[random.randint(0, len(wav_rand) - size):][:size] if len(wav_rand) > size else wav_rand
+
+            wav = audio_processing.mix(sound1, sound2, r, self.sampling_rate).astype(np.float32)
+            wav = torch.from_numpy(wav)
+        else:
+            wav = wav.squeeze(0)
+            eye = np.eye(self.nClasses)
+            dse_id = (eye[dse_id]).astype(np.float32)
+            dse_id = torch.from_numpy(dse_id).unsqueeze(0)
+        
+        max_val = torch.max(torch.abs(wav)) # Does It need again?
+        wav = wav / max_val if max_val != 0 else wav
+        wav = wav.unsqueeze(0)
+
+        if self.wav_transform != None:
+            wav = self.wav_transform(wav.squeeze(0)) # [80, 224]
+            if self.multimask_augment == True and self.train == True:
+                wav = audio_processing.multi_mask_spectrogram(wav, tau=24, nu=15, num_masks=2)
+            wav = wav.unsqueeze(0)
 
         return (wavname, wav, dse_id, spk_id)
 
@@ -137,10 +196,6 @@ class SERDatasets(torch.utils.data.Dataset):
         if self.add_noise:
             audio = audio + torch.rand_like(audio)
 
-        if self.wav_transform != None:
-            audio = self.wav_transform(audio)
-            #audio = self.wav_transform(filename)
-
         audio = audio.unsqueeze(0)
         return audio
 
@@ -150,11 +205,11 @@ class SERDatasets(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.audiopaths_and_text)
 
-class SERDatasetsCollate():
+class CoughDatasetsCollate():
     """ Zero-pads model inputs and targets based on number of frames per step
     """
-    def __init__(self, n_frames_per_step=1):
-        self.n_frames_per_step = n_frames_per_step
+    def __init__(self, many_data=2):
+        self.many_data = many_data
 
     def __call__(self, batch):
         """Collate's training batch from normalized text and mel-spectrogram
@@ -168,7 +223,7 @@ class SERDatasetsCollate():
             dim=0, descending=True)
         max_wav_len = input_lengths[0] # max([x[0].size(1) for x in batch])
 
-        dse_ids = torch.LongTensor(len(batch))
+        dse_ids = torch.FloatTensor(len(batch), self.many_data) # Change Depend on How Many Class
         spk_ids = torch.LongTensor(len(batch))
     
         feature_dim = 1
@@ -187,7 +242,7 @@ class SERDatasetsCollate():
             wav_padded[i, :, :wav.shape[-1]] = wav
             attention_masks[i, :wav.shape[-1]] = 1
 
-            dse_ids[i] = batch[ids_sorted_decreasing[i]][2]
+            dse_ids[i, :] = batch[ids_sorted_decreasing[i]][2]
             spk_ids[i] = batch[ids_sorted_decreasing[i]][3]
         
         return wav_name, wav_padded, attention_masks, dse_ids, spk_ids

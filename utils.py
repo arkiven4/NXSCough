@@ -20,6 +20,7 @@ import torch
 from torchaudio import transforms as T
 from tensorboard.backend.event_processing import event_accumulator
 
+import losses
 MATPLOTLIB_FLAG = False
 
 logging.basicConfig(stream=sys.stdout, level=logging.ERROR)
@@ -322,8 +323,8 @@ def load_audio_sample(file_path, db_sample_rate, wav_stats, desired_length, fade
         raise ValueError("{} {} SR doesn't match target {} SR".format(sample_rate, db_sample_rate))
     
     #data = data / 32768.0
-    max_val = np.max(np.abs(data))
-    data = data / max_val if max_val != 0 else data
+    # max_val = np.max(np.abs(data))
+    # data = data / max_val if max_val != 0 else data
 
     data = torch.from_numpy(data).unsqueeze(0)
 
@@ -384,3 +385,44 @@ def plot_loss_from_tensorboard(best_lost, train_log_dir, val_log_dir, tag='loss/
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
+
+
+def many_loss_category(pred, lab, loss_type="CE", test=False, weights=None, gate_weights=None, model=None):
+    if test == True:
+        pred_labels = torch.max(pred, 1).cpu().numpy()
+        lab = lab.cpu().numpy()
+
+        # Compute F1 scores and accuracy
+        f1_micro = f1_score(lab, pred_labels, average='micro')
+        f1_macro = f1_score(lab, pred_labels, average='macro')
+        accuracy = accuracy_score(lab, pred_labels)
+        return f1_micro, f1_macro, accuracy
+
+    if loss_type == "CE":
+        criterion = torch.nn.CrossEntropyLoss(weight=weights)
+        loss = criterion(pred, lab)
+        return [loss]
+    elif loss_type == "AFLoss":
+        criterion = losses.AFLoss(margin=0.2, scale=1, num_layers=len(list(range(1, 25))))
+        loss = criterion(pred, gate_weights, lab)
+        return [loss]
+    elif loss_type == "FocalLoss":
+        criterion = losses.FocalLoss(weight=weights)
+        loss = criterion(pred, lab)
+        return [loss]
+    elif loss_type == "AMSoftmaxLoss":
+        loss = model.objective(pred, lab)
+        return [loss]
+    elif loss_type == "KLDivLoss":
+        criterion = losses.KLDivLoss()
+        loss = criterion(pred, lab)
+        return [loss]
+    elif loss_type == "KLDivAFLoss":
+        criterion1 = losses.KLDivLoss()
+        loss1 = criterion1(pred, lab)
+
+        criterion2 = losses.AFLoss(margin=0.2, scale=1, num_layers=len(list(range(1, 25))))
+        loss2 = criterion2(pred, gate_weights, torch.argmax(lab, dim=-1))
+
+        loss = [loss1, loss2]
+        return loss
