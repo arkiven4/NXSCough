@@ -1,4 +1,4 @@
-import torch
+import torch, math
 from torch import Tensor
 import torch.nn as nn
 import torch.optim as optim
@@ -8,10 +8,12 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
 import torchvision
+from transformers import AutoConfig, AutoFeatureExtractor
 
 from typing import Any, Callable, Optional
+from collections import OrderedDict
 
-import modules, commons
+import modules, commons, layers
 
 class LSTMAudioClassifier1(nn.Module):
     def __init__(self, input_size, regress_hidden_dim, output_dim, **kwargs):
@@ -42,8 +44,12 @@ class LSTMAudioClassifier1(nn.Module):
 
         x = self.flatten(x[:, -1, :])
         x = self.dropout(x)
+
+        embedding = x.clone()
         x = self.fc(x)
-        return x
+
+        loss_internal = 0.0
+        return [x, embedding, loss_internal]
 
 class ResNet101(torchvision.models.resnet.ResNet):
     def __init__(self, dummy, output_dim, track_bn=True, **kwargs):
@@ -93,8 +99,215 @@ class ResNet101(torchvision.models.resnet.ResNet):
         x = torch.flatten(x, 1)
         x = self.fc(x)
 
+        return [x, 0.0, 0.0]
+
+class WavLM_MyOwn1(nn.Module):
+    def __init__(self, input_size, regress_hidden_dim, output_dim, **kwargs):
+        super(WavLM_MyOwn1, self).__init__()
+
+        config = AutoConfig.from_pretrained("microsoft/wavlm-large")
+        self.feature_extractor = layers.WavLMFeatureEncoder(config)
+        self.feature_projection = layers.WavLMFeatureProjection(config)
+
+        embed_dim=1024
+        num_heads=8
+        dropout=0.1
+
+        self.attention = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=dropout,
+            activation='relu',
+            batch_first=True  # [B, T, E]
+        )
+        self.encoder = nn.TransformerEncoder(self.attention, num_layers=1)
+        self.pooling = nn.AdaptiveAvgPool1d(1)  # or use mean over time dimension
+        self.classifier = nn.Linear(embed_dim, output_dim)
+
+    def forward(self, x, lengths=None):
+        extract_features = self.feature_extractor(x)
+        extract_features = extract_features.transpose(1, 2)
+        hidden_states, extract_features = self.feature_projection(extract_features) # B, T, D
+
+        hidden_states = self.encoder(hidden_states)  # Self-attention over time → same shape [64, 74, 1024]
+        hidden_states = hidden_states.transpose(1, 2)  # [64, 1024, 74] for pooling over time
+        hidden_states = self.pooling(hidden_states).squeeze(-1)  # [64, 1024]
+        out = self.classifier(hidden_states)  # [64, 2]
+
+        loss_internal = 0.0
+        return [out, hidden_states, loss_internal]
+
+class Whisper_MyOwn1(nn.Module):
+    def __init__(self, input_size, regress_hidden_dim, output_dim, **kwargs):
+        super(Whisper_MyOwn1, self).__init__()
+        
+        self.max_audio_len = 3
+        self.mel_extractor = AutoFeatureExtractor.from_pretrained("openai/whisper-large-v3", chunk_length=self.max_audio_len)
+        config = AutoConfig.from_pretrained("openai/whisper-large-v3")
+        config.max_source_positions = 150
+        self.feature_extractor = layers.WhisperFeatureEncoder(config)
+
+        embed_dim=1280
+        num_heads=8
+        dropout=0.1
+
+        self.attention = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=dropout,
+            activation='relu',
+            batch_first=True  # [B, T, E]
+        )
+        self.encoder = nn.TransformerEncoder(self.attention, num_layers=1)
+        self.pooling = nn.AdaptiveAvgPool1d(1)  # or use mean over time dimension
+        self.classifier = nn.Linear(embed_dim, output_dim)
+
+    def forward(self, x, lengths=None):
+        x = self.mel_extractor(x.detach().cpu().tolist(), return_tensors="pt", sampling_rate=16000, max_length=self.max_audio_len * 16000).input_features.cuda()
+        extract_features = self.feature_extractor(x) # torch.Size([64, 150, 1280])
+
+        hidden_states = self.encoder(extract_features)  # Self-attention over time → same shape [64, 74, 1024]
+        hidden_states = hidden_states.transpose(1, 2)  # [64, 1024, 74] for pooling over time
+        hidden_states = self.pooling(hidden_states).squeeze(-1)  # [64, 1024]
+        out = self.classifier(hidden_states)  # [64, 2]
+
+        loss_internal = 0.0
+        return [out, hidden_states, loss_internal]
+
+
+
+
+
+
+
+
+class SinusoidalPositionalEmbedding(nn.Module):
+    def __init__(self, dim, max_len=150):
+        super().__init__()
+        pe = torch.zeros(max_len, dim)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2) * (-math.log(10000.0) / dim))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # Shape: [1, max_len, dim]
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: (batch, seq_len, dim)
+        return self.pe[:, :x.size(1)].clone().detach()
+
+class MyOwn2(nn.Module):
+    def __init__(self, input_size, regress_hidden_dim, output_dim, **kwargs):
+        super(MyOwn2, self).__init__()
+        
+        config = AutoConfig.from_pretrained("microsoft/wavlm-large")
+        self.feature_extractor = layers.WavLMFeatureEncoder(config)
+        self.feature_projection = layers.WavLMFeatureProjection(config)
+
+        embed_dim=1024
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+        self.pos_embed = SinusoidalPositionalEmbedding(embed_dim) # torch.Size([1, 50, 1024])
+        self.dropout = nn.Dropout(0.1)
+
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=1, dim_feedforward=512)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
+
+        self.classifier = nn.Linear(embed_dim, output_dim)
+
+    def forward(self, x, lengths=None):
+        extract_features = self.feature_extractor(x)
+        extract_features = extract_features.transpose(1, 2)
+        hidden_states, extract_features = self.feature_projection(extract_features) # B, T, D
+
+        b, n, _ = hidden_states.shape
+        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b) # B, 1, D
+        hidden_states = torch.cat((cls_tokens, hidden_states), dim=1) 
+        hidden_states = hidden_states + self.pos_embed(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+
+        hidden_states = self.transformer(hidden_states)
+        cls_output = hidden_states[:, 0]
+        output = self.classifier(cls_output)
+        
+        loss_internal = 0.0
+        return [output, hidden_states, loss_internal]
+
+class VisionTransformerCoba(torchvision.models.vision_transformer.VisionTransformer):
+    def __init__(self, dummy, output_dim, track_bn=True, **kwargs):
+        def norm_layer(*args, **kwargs):
+            return nn.LayerNorm(*args, **kwargs, eps=1e-6)
+        super().__init__(image_size=518, patch_size=14, num_layers=32, num_heads=16, hidden_dim=1280, mlp_dim=5120, norm_layer=norm_layer, num_classes=output_dim)
+        
+        del self.heads
+        self.grad_cam = False
+
+        heads_layers: OrderedDict[str, nn.Module] = OrderedDict()
+        heads_layers["head"] = nn.Linear(1280, output_dim)
+        self.heads = nn.Sequential(heads_layers)
+        self.preprocess = torchvision.transforms.Compose([
+            torchvision.transforms.Resize((518,518))
+        ])
+
+    def load_sl_official_weights(self, progress=True):
+        state_dict = load_state_dict_from_url(torchvision.models.vision_transformer.ViT_H_14_Weights.IMAGENET1K_SWAG_E2E_V1.url,
+                                              progress=progress)
+
+        #del state_dict['conv1.weight']
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        # if len(missing) > 0:
+            # raise AssertionError('Model code may be incorrect')
+
+    def load_ssl_official_weights(self, progress=True):
+        raise NotImplemented
+
+    def _process_input(self, x: torch.Tensor) -> torch.Tensor:
+        n, c, h, w = x.shape
+        p = self.patch_size
+        torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
+        torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
+        n_h = h // p
+        n_w = w // p
+
+        # (n, c, h, w) -> (n, hidden_dim, n_h, n_w)
+        x = x.repeat(1, 3, 1, 1)
+        x = self.conv_proj(x)
+        # (n, hidden_dim, n_h, n_w) -> (n, hidden_dim, (n_h * n_w))
+        x = x.reshape(n, self.hidden_dim, n_h * n_w)
+
+        # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
+        # The self attention layer expects inputs in the format (N, S, E)
+        # where S is the source sequence length, N is the batch size, E is the
+        # embedding dimension
+        x = x.permute(0, 2, 1)
+
         return x
-    
+
+    def forward(self, x: torch.Tensor, lengths=None):
+        if self.grad_cam == True:
+            x = x
+        else:
+            x = x.unsqueeze(1)
+
+        # Reshape and permute the input tensor
+        x = self.preprocess(x)
+        x = self._process_input(x)
+        n = x.shape[0]
+
+        # Expand the class token to the full batch
+        batch_class_token = self.class_token.expand(n, -1, -1)
+        x = torch.cat([batch_class_token, x], dim=1)
+
+        x = self.encoder(x)
+
+        # Classifier "token" as used by standard language architectures
+        x = x[:, 0]
+
+        x = self.heads(x)
+
+        return [x, 0.0, 0.0]
+
 class InceptionV3(torchvision.models.inception.Inception3):
     def __init__(self, dummy, output_dim, track_bn=True, **kwargs):
         super().__init__(num_classes=output_dim, aux_logits=False)

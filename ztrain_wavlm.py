@@ -16,7 +16,7 @@ import utils
 import commons
 import models
 import models_pooling
-from datasets import SERDatasets, SERDatasetsCollate
+from cough_datasets import SERDatasets, SERDatasetsCollate
 
 import warnings
 warnings.simplefilter("ignore", UserWarning)

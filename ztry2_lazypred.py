@@ -30,21 +30,21 @@ smile = opensmile.Smile(
 ####################
 # Data Prep
 ####################
-with open(f"{DATA_PATH}/norm_stat.pkl", 'rb') as f:
-    wav_mean, wav_std = pickle.load(f)
-    print("Loaded Norm Stats")
+# with open(f"{DATA_PATH}/norm_stat.pkl", 'rb') as f:
+#     wav_mean, wav_std = pickle.load(f)
+#     print("Loaded Norm Stats")
 
-df = pd.read_csv(f"{DATA_PATH}/{METADATA}")
+df = pd.read_csv("mismatch_data.csv") #f"{DATA_PATH}/{METADATA}")
 df = df[df['path_file'].notna()]
-df['path_file'] = DATA_PATH + df['path_file']
+#df['path_file'] = DATA_PATH + df['path_file']
 df = df[df['disease_label'].isin([0, 1])]
 df = df[df['path_file'].apply(os.path.isfile)]
 df = df.sample(frac=1, random_state=42).reset_index(drop=True)
 
-df_0 = df[df['disease_label'] == 0].sample(n=df['disease_label'].value_counts().sort_index().values.min())
-df_1 = df[df['disease_label'] == 1].sample(n=df['disease_label'].value_counts().sort_index().values.min())
-#df_2 = df[df['disease_label'] == 2].sample(n=df['disease_label'].value_counts().sort_index().values.min())
-df = pd.concat([df_0, df_1], ignore_index=True, sort=False)
+# df_0 = df[df['disease_label'] == 0].sample(n=df['disease_label'].value_counts().sort_index().values.min())
+# df_1 = df[df['disease_label'] == 1].sample(n=df['disease_label'].value_counts().sort_index().values.min())
+# #df_2 = df[df['disease_label'] == 2].sample(n=df['disease_label'].value_counts().sort_index().values.min())
+# df = pd.concat([df_0, df_1], ignore_index=True, sort=False)
 print(df['disease_label'].value_counts())
 
 X_features = []
@@ -52,8 +52,10 @@ y_label = []
 
 for index, row in tqdm(df.iterrows(), total=df.shape[0]):
     signal, sampling_rate = librosa.load(row['path_file'], sr=SAMPLE_RATE)
-    signal = signal / 32768.0
-    signal = (signal - wav_mean) / (wav_std + 0.000001)
+    max_val = np.max(np.abs(signal))
+    signal = signal / max_val if max_val != 0 else signal
+    # signal = signal / 32768.0
+    # signal = (signal - wav_mean) / (wav_std + 0.000001)
 
     smile_feature = smile.process_signal(signal, sampling_rate).values.reshape(-1)
     if np.isnan(np.sum(smile_feature)) == False:

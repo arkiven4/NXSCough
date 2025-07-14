@@ -5,3 +5,6 @@ logs/
 data/TB_resample/
 test.ipynb
 *.sif
+*.csv
+*.png
+*.npy

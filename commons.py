@@ -9,8 +9,6 @@ from librosa.filters import mel as librosa_mel_fn
 from audio_processing import dynamic_range_compression, dynamic_range_decompression
 from stft import STFT
 
-from ifas import extract_IFAS
-
 def compute_length_from_mask(mask, frame_shift=0.02):
     """
     mask: (batch_size, T)
@@ -97,57 +95,3 @@ class TacotronSTFT(nn.Module):
   
 def pair(t):
     return t if isinstance(t, tuple) else (t, t)
-
-class IFASv2(nn.Module):
-  def __init__(self, fs_sca, K_sca=2048, K_max=160, B_sca=512):
-    super(IFASv2, self).__init__()
-    self.fs_sca = fs_sca
-    self.K_sca = K_sca
-    self.K_max = K_max
-    self.B_sca = B_sca
-
-  def spectral_normalize(self, magnitudes):
-    output = dynamic_range_compression(magnitudes)
-    return output
-
-  def forward(self, x_vec):
-    """Computes mel-spectrograms from a batch of waves
-    PARAMS
-    ------
-    y: Variable(torch.FloatTensor) with shape (B, T) in range [-1, 1]
-
-    RETURNS
-    -------
-    mel_output: torch.FloatTensor of shape (B, n_mel_channels, T)
-    """
-    path_metadata = x_vec.split("/")
-    file_metadata = path_metadata[-1].split(".wav")[0]
-    input_path = "/".join(path_metadata[:-1]) + "/"
-    input_path = input_path.replace("CombineData/", "Extracted_Feature/IFAS/")
-
-    if_mat = np.load(f'{input_path}/{file_metadata}.npy')
-    if_mat[np.isnan(if_mat)] = 1e-8
-    if_mat = np.log(if_mat)
-    if_mat = torch.from_numpy(if_mat)
-
-    # x_vec = x_vec.numpy()
-    # if_mat = extract_IFAS(x_vec, self.fs_sca, K_sca=self.K_sca, B_sca=self.B_sca) 
-    # if_mat = if_mat[:self.K_max, :]
-    # if_mat[np.isnan(if_mat)] = 1e-8
-    # if_mat = torch.from_numpy(if_mat).unsqueeze(0)
-    # if_mat = self.spectral_normalize(if_mat).squeeze(0)
-    return if_mat
-
-# def load_IFAS(fullpath):
-#   path_metadata = fullpath.split("/")
-#   file_metadata = path_metadata[-1].split(".wav")[0]
-#   input_path = "/".join(path_metadata[:-1]) + "/"
-#   input_path = input_path.replace("CombineData/", "Extracted_Feature/IFAS/")
-
-#   if_mat = np.load(f'{input_path}/{file_metadata}.npy')
-#   if_mat[np.isnan(if_mat)] = 0
-#   epsilon = 1e-8
-#   if_mat = np.log(if_mat + epsilon)
-#   if_mat = torch.from_numpy(if_mat)
-
-#   return if_mat

@@ -1,4 +1,4 @@
-import os, json, pickle
+import os, json, pickle, inspect
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
@@ -10,11 +10,12 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.amp import GradScaler
 from sklearn.model_selection import train_test_split
+from transformers import AutoModel, AutoConfig, AutoFeatureExtractor
 
 import utils
 import commons
 import models
-from datasets import SERDatasets, SERDatasetsCollate
+from cough_datasets import CoughDatasets, CoughDatasetsCollate
 
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -28,10 +29,9 @@ warnings.simplefilter("ignore", UserWarning)
 # =============================================================
 # SECTION: Intialize Data
 # =============================================================
-
-MODEL_NAME = "apsipa_lstm_sken1_longi_4"
+INIT = True
+MODEL_NAME = "try_resnet101_cam"
 CONFIG_PATH = "configs/lstm_cnn.json"
-INIT = False
 
 model_dir = os.path.join("./logs", MODEL_NAME)
 if not os.path.exists(model_dir):
@@ -76,19 +76,26 @@ for i_rand in range(5):
     df_1 = df_long[df_long['disease_label'] == 1].sample(n=df_solic['disease_label'].value_counts()[1], random_state=i_rand * 4)
     df_long_array.append(pd.concat([df_0, df_1], ignore_index=True, sort=False))
 
-df = df_long_array[4]
+df = df
+#df = df_solic
+#df = df_long_array[0]
+#df = df_long
 print(df.shape)
-#df = df[df['database'].isin(['tb_longitudinal_data', 'tb_solicited_data'])]
 
 df_train, df_test = train_test_split(df, test_size=0.1, random_state=42, shuffle=True)
-# df_train = df[df['database'].isin(['tb_longitudinal_data'])]
-# df_test = df[df['database'].isin(['tb_solicited_data'])]
+#df_train, df_test = df_long, df_solic
+
+df_issue = pd.read_csv("df_issue.csv")
+df_train = df_train[~df_train['path_file'].isin(df_issue['wavname'])]
+df_test = df_test[~df_test['path_file'].isin(df_issue['wavname'])]
 
 class_frequencies = df_train['disease_label'].value_counts().to_dict()
 total_samples = len(df_train)
 class_weights = {cls: total_samples / (len(Diseases_codes) * freq) if freq != 0 else 0 for cls, freq in class_frequencies.items()}
 weights_list = [class_weights[cls] for cls in Diseases_codes]
 class_weights_tensor = torch.tensor(weights_list, device='cuda', dtype=torch.float)
+class_weights_tensor = None
+print(class_weights_tensor)
 
 # =============================================================
 # SECTION: Setup Logger, Dataloader
@@ -99,9 +106,9 @@ logger.info(hps)
 writer = SummaryWriter(log_dir=hps.model_dir)
 writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
 
-collate_fn = SERDatasetsCollate(1)
-train_dataset = SERDatasets(df_train.values, hps.data)
-val_dataset = SERDatasets(df_test.values, hps.data)
+collate_fn = CoughDatasetsCollate(hps.data.many_class)
+train_dataset = CoughDatasets(df_train.values, hps.data, train=True)
+val_dataset = CoughDatasets(df_test.values, hps.data, train=False)
 
 #train_sampler = DistributedBucketSampler(train_dataset, cur_bs, [32,300,400,500,600,700,800,900,1000], num_replicas=1, rank=0, shuffle=True)
 #train_loader = DataLoader(train_dataset, num_workers=28, shuffle=False, pin_memory=True, collate_fn=collate_fn, batch_sampler=train_sampler)
@@ -112,14 +119,27 @@ print(next(iter(train_loader))[1][0].numpy().shape)
 # =============================================================
 # SECTION: Setup Logger, Dataloader
 # =============================================================
+logger.info(f"======================================")
+logger.info(f"✨ Loss: {hps.train.loss_function}")
+logger.info(f"✨ Use Between Class Training: {hps.data.mix_audio}")
+logger.info(f"✨ Use Augment: {hps.data.augment_data}")
+logger.info(f"✨ Padding Type: {hps.data.pad_types}")
+logger.info(f"✨ Using Model: {hps.model.pooling_model}")
+logger.info(f"======================================")
+
 epoch_str = 1
 global_step = 0
 
-pool_net = getattr(models, hps.model.pooling_type)
+pool_net = getattr(models, hps.model.pooling_model)
 pool_model = pool_net(hps.model.feature_dim, **hps.model).cuda()
 
 optimizer_p = torch.optim.AdamW(pool_model.parameters(), hps.train.learning_rate, betas=hps.train.betas, eps=hps.train.eps)
 scheduler_p = torch.optim.lr_scheduler.ExponentialLR(optimizer_p, gamma=hps.train.lr_decay, last_epoch=epoch_str - 2)
+
+class_code_pool_net = inspect.getsource(pool_net)
+with open(f'{hps.model_dir}/model_net.py.bak', 'w') as f:
+    f.write("import torch\nimport torch.nn as nn\n\n")
+    f.write(class_code_pool_net)
 
 # =============================================================
 # SECTION: Setup Logger, Dataloader
@@ -178,19 +198,19 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
 
     batch_cnt = 0
 
-    for batch_idx, (wav_names, audio, attention_masks, dse_id, spk_ids) in enumerate(tqdm(train_loader)):
+    for batch_idx, (wav_names, audio, attention_masks, dse_ids, spk_ids) in enumerate(tqdm(train_loader)):
         audio = audio.cuda(non_blocking=True).float().squeeze(1)
         attention_masks = attention_masks.cuda(non_blocking=True).float()
-        dse_id = dse_id.cuda(non_blocking=True).long()
+        dse_ids = dse_ids.cuda(non_blocking=True).float()
         spk_ids = spk_ids.cuda(non_blocking=True).long()
         
         with torch.amp.autocast("cuda", enabled=True):
             x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True)
 
-            dse_pred = pool_model(audio)
-            loss, f1_micro, f1_macro, accuracy = utils.CE_weight_category(dse_pred, dse_id, class_weights_tensor)
+            out_model = pool_model(audio)
+            loss = utils.many_loss_category(out_model[0], dse_ids, loss_type=hps.train.loss_function, weights=class_weights_tensor, model=pool_model)
 
-        loss_gs = [loss]
+        loss_gs = loss + [out_model[2]]
         loss_g = sum(loss_gs) / ACCUMULATION_STEP
 
         scaler.scale(loss_g).backward()
@@ -202,13 +222,9 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
             optimizer_p.zero_grad(set_to_none=True)
         
         batch_cnt = batch_cnt + 1
-
         if batch_idx % hps.train.log_interval == 0:
             scalar_dict = {
                 "loss/g/total": loss_g,
-                "loss/g/f1_micro": f1_micro,
-                "loss/g/f1_macro": f1_macro,
-                "loss/g/accuracy": accuracy,
                 "info/learning_rate": optimizer_p.param_groups[0]["lr"],
                 "info/grad_norm": grad_norm,
             }
@@ -232,29 +248,26 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
         for batch_idx, (wav_names, audio, attention_masks, dse_ids, spk_ids) in enumerate(tqdm(val_loader)):
             audio = audio.cuda(non_blocking=True).float().squeeze(1)
             attention_masks = attention_masks.cuda(non_blocking=True).float()
-            dse_ids = dse_ids.cuda(non_blocking=True).long()
+            dse_ids = dse_ids.cuda(non_blocking=True).float()
             spk_ids = spk_ids.cuda(non_blocking=True).long()
 
             x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True).long()
             
-            dse_pred = pool_model(audio)
-            loss, f1_micro, f1_macro, accuracy = utils.CE_weight_category(dse_pred, dse_ids, class_weights_tensor)
+            out_model = pool_model(audio)
+            loss = utils.many_loss_category(out_model[0], dse_ids, loss_type=hps.train.loss_function, weights=class_weights_tensor, model=pool_model)
+            #loss, f1_micro, f1_macro, accuracy = utils.CE_weight_category(dse_pred, dse_ids, class_weights_tensor)
 
-            loss_gs = [loss]
+            loss_gs = loss + [out_model[2]]
             loss_g = sum(loss_gs)
 
             if batch_idx == 0:
                 losses_tot = loss_gs
-                acc_tot = [accuracy]
             else:
                 losses_tot = [x + y for (x, y) in zip(losses_tot, loss_gs)]
-                acc_tot = [x + y for (x, y) in zip(acc_tot, [accuracy])]
 
     losses_tot = [x / len(val_loader) for x in losses_tot]
-    acc_tot = [x / len(val_loader) for x in acc_tot]
     loss_tot = torch.mean(torch.tensor(losses_tot)) #sum(losses_tot)
-    acc_tot = torch.mean(torch.tensor(acc_tot)) #sum(losses_tot)
-    scalar_dict = {"loss/g/total": loss_tot, "ACC": acc_tot}
+    scalar_dict = {"loss/g/total": loss_tot}
     scalar_dict.update({"loss/g/{}".format(i): v for i, v in enumerate(losses_tot)})
     utils.summarize(
         writer=writer_eval, global_step=global_step, scalars=scalar_dict
@@ -281,7 +294,7 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
             for param_group in optimizer_p.param_groups:
                 param_group['lr'] = new_lr
 
-        if len(patience_val) > 5:
+        if len(patience_val) > 4:
             break
 
 
@@ -315,20 +328,63 @@ _, _, _, _, epoch_str = utils.load_checkpoint(
 pool_model.eval() 
 all_preds, all_labels, all_probs  = [], [], []
 with torch.no_grad():
-    for batch_idx, (wav_names, audio, attention_masks, dse_ids, spk_ids) in enumerate(tqdm(val_loader)):
+    for batch_idx, (wav_names, audio, attention_masks, dse_ids, spk_ids) in enumerate(tqdm(train_loader)):
         audio = audio.cuda(non_blocking=True).float().squeeze(1)
         attention_masks = attention_masks.cuda(non_blocking=True).float()
-        dse_ids = dse_ids.cuda(non_blocking=True).long()
+        dse_ids = dse_ids.cuda(non_blocking=True).float()
         spk_ids = spk_ids.cuda(non_blocking=True).long()
 
         x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True).long()
-        outputs = pool_model(audio)
+        out_model = pool_model(audio)
+        outputs = out_model[0]
         
         probs = torch.softmax(outputs, dim=1)
         preds = torch.argmax(outputs, dim=1)
+        dse_ids = np.argmax(dse_ids.cpu().detach().numpy(), axis=-1)
 
         all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(dse_ids.cpu().numpy())
+        all_labels.extend(dse_ids)
+        all_probs.extend(probs.cpu().numpy())
+
+n_classes = len(CLASS_NAMES)
+all_probs = np.array(all_probs)
+all_labels = np.array(all_labels)
+fpr, tpr, _ = roc_curve(all_labels, all_probs[:, 1])
+train_auc_score = auc(fpr, tpr)
+
+cm = confusion_matrix(all_labels, all_preds)
+train_accuracy = accuracy_score(all_labels, all_preds, normalize=True)
+train_b_accuracy = balanced_accuracy_score(all_labels, all_preds)
+train_f1 = f1_score(all_labels, all_preds, average="weighted")
+train_f1_pos = f1_score(all_labels, all_preds, pos_label=1)
+try:
+    train_roc_auc = roc_auc_score(all_labels, all_preds)
+except Exception as exception:
+    train_roc_auc = None
+tn, fp, fn, tp = cm.ravel()
+train_sensitivity = tp / (tp + fn)
+train_specificity = tn / (tn + fp)
+
+########
+
+all_preds, all_labels, all_probs  = [], [], []
+with torch.no_grad():
+    for batch_idx, (wav_names, audio, attention_masks, dse_ids, spk_ids) in enumerate(tqdm(val_loader)):
+        audio = audio.cuda(non_blocking=True).float().squeeze(1)
+        attention_masks = attention_masks.cuda(non_blocking=True).float()
+        dse_ids = dse_ids.cuda(non_blocking=True).float()
+        spk_ids = spk_ids.cuda(non_blocking=True).long()
+
+        x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True).long()
+        out_model = pool_model(audio)
+        outputs = out_model[0]
+        
+        probs = torch.softmax(outputs, dim=1)
+        preds = torch.argmax(outputs, dim=1)
+        dse_ids = np.argmax(dse_ids.cpu().detach().numpy(), axis=-1)
+
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(dse_ids)
         all_probs.extend(probs.cpu().numpy())
 
 cm = confusion_matrix(all_labels, all_preds)
@@ -372,6 +428,7 @@ specificity = tn / (tn + fp)
 with open(f"{model_dir}/result_summary.txt", "w") as file:
     file.write(df['disease_label'].value_counts().to_string() + "\n")
     file.write("\n")
+    file.write(f"Accuracy {train_accuracy:.2f} | Balanced Accuracy {train_b_accuracy:.2f} | AUC {train_auc_score:.2f} | ROC AUC {train_roc_auc:.2f} | Weighted F1: {train_f1:.2f} | Positive F1: {train_f1_pos:.2f} | Sensitivity: {train_sensitivity:.2f} | Specificity: {train_specificity:.2f} \n")
     file.write(f"Accuracy {accuracy:.2f} | Balanced Accuracy {b_accuracy:.2f} | AUC {auc_score:.2f} | ROC AUC {roc_auc:.2f} | Weighted F1: {f1:.2f} | Positive F1: {f1_pos:.2f} | Sensitivity: {sensitivity:.2f} | Specificity: {specificity:.2f} \n")
 
 utils.plot_loss_from_tensorboard(
@@ -379,5 +436,17 @@ utils.plot_loss_from_tensorboard(
     train_log_dir=hps.model_dir,
     val_log_dir=os.path.join(hps.model_dir, "eval"), save_path=f"{model_dir}/result_loss.png"
 )
+
+import glob
+patterns = ['pool_*.pth']
+for pattern in patterns:
+    search_pattern = os.path.join(model_dir, pattern)
+    files = glob.glob(search_pattern)
+    
+    for file_path in files:
+        try:
+            os.remove(file_path)
+        except Exception as e:
+            print(f"Error deleting {file_path}: {e}")
 
 print(f"Saved In: {model_dir}, Accuracy: {accuracy:.2f}, AUC: {auc_score:.2f}")
