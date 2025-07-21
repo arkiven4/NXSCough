@@ -10,7 +10,7 @@
     "lr_decay": 0.999875,
     "warmup_steps": 0,
     "scheduler": "noam",
-    "batch_size": 128,
+    "batch_size": 256,
     "accumulation_steps": 1,
     "fp16_run": false,
     "warm_start": false, 
@@ -43,7 +43,7 @@
     "metadata_csv": "metadata_combine.csv"
   }, 
   "model": {
-    "pooling_model": "Whisper_MyOwn1",
+    "pooling_model": "WavLM_MyOwn1",
     "feature_dim": 80,
     "p_dropout": 0.1,
     "regress_hidden_dim": 1024,

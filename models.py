@@ -171,16 +171,10 @@ class Whisper_MyOwn1(nn.Module):
         hidden_states = self.encoder(extract_features)  # Self-attention over time → same shape [64, 74, 1024]
         hidden_states = hidden_states.transpose(1, 2)  # [64, 1024, 74] for pooling over time
         hidden_states = self.pooling(hidden_states).squeeze(-1)  # [64, 1024]
-        out = self.classifier(hidden_states)  # [64, 2]
+        out = self.classifier(hidden_states)  # [64,0 2]
 
         loss_internal = 0.0
         return [out, hidden_states, loss_internal]
-
-
-
-
-
-
 
 
 class SinusoidalPositionalEmbedding(nn.Module):
