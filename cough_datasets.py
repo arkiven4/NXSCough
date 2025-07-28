@@ -148,9 +148,6 @@ class CoughDatasets(torch.utils.data.Dataset):
                 
             wav_rand = self.get_audio(self.db_path + "/" + sampled_row[0])
             
-            # desired_length = wav.shape[-1] / self.sampling_rate
-            # wav_rand = audio_processing.cut_pad_sample_torchaudio(wav_rand, self.sampling_rate, desired_length, pad_types=self.pad_types)
-
             sound1 = wav.squeeze(0).numpy()
             sound2 = wav_rand.squeeze(0).numpy()
             
@@ -246,3 +243,162 @@ class CoughDatasetsCollate():
             spk_ids[i] = batch[ids_sorted_decreasing[i]][3]
         
         return wav_name, wav_padded, attention_masks, dse_ids, spk_ids
+
+############################ Multi Task Datasets
+
+class MTCoughDatasets(torch.utils.data.Dataset):
+    def __init__(self, data_numpy, hparams, train=True):
+        # ['path_file', 'disease_label', 'smoker', 'hemoptysis', 'sex', 'age', 'tb_prior', 'tb_prior_Pul', 'tb_prior_Extrapul', 'tb_prior_Unknown', 'cough_score'],
+        self.audiopaths_and_text = shuffle(data_numpy, random_state=20)
+        self.hop_length = hparams.hop_length
+        self.max_wav_value = hparams.max_wav_value
+        self.sampling_rate = hparams.sampling_rate
+        self.desired_length = hparams.desired_length
+        self.fade_samples_ratio = hparams.fade_samples_ratio
+        self.pad_types = hparams.pad_types
+        self.add_noise = hparams.add_noise
+        self.db_path = hparams.db_path
+        self.feature_type = hparams.feature_type
+
+        self.train = train
+        self.augment_data = hparams.augment_data
+        self.multimask_augment = hparams.multimask_augment
+
+        if self.augment_data:
+            self.data_augmentator = DataAugmentator(None, "/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_noises_labels.tsv",
+                None, "/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_rirs_labels.tsv",
+                5.5, ["apply_reverb", "add_background_noise"])
+
+        self.wav_transform = None
+        if hparams.acoustic_feature:
+            if hparams.feature_type == "mfcc":
+                self.wav_transform = T.MFCC(sample_rate=hparams.sampling_rate, n_mfcc=13, 
+                                            melkwargs={"n_fft": hparams.win_length, "hop_length": hparams.hop_length, 
+                                                       "n_mels": hparams.n_mel_channels, "window_fn": torch.hann_window,
+                                                       "power": 2.0, "center": True, "normalized": False})
+            elif hparams.feature_type == "melspectogram":
+                self.wav_transform = commons.TacotronSTFT(
+                                hparams.filter_length, hparams.hop_length, hparams.win_length,
+                                hparams.n_mel_channels, hparams.sampling_rate, hparams.mel_fmin,
+                                hparams.mel_fmax)
+            elif hparams.feature_type == "spectogram":
+                self.wav_transform = T.Spectrogram(
+                    n_fft=hparams.win_length,
+                    hop_length=hparams.hop_length,
+                    power=2.0,
+                    window_fn=torch.hann_window,
+                    center=True,
+                    normalized=False
+                )
+
+    def _filter(self):
+        lengths = []
+        for audiopath_and_text in self.audiopaths_and_text:
+            audiopath = self.db_path + "/"  + audiopath_and_text[0]
+            lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
+        self.lengths = lengths
+
+    def get_mel_text_pair(self, audiopath_and_text):
+        wavname, dse_id, speaker, gender, age = audiopath_and_text[0], audiopath_and_text[1], audiopath_and_text[2], audiopath_and_text[3], audiopath_and_text[4] #, audiopath_and_text[2], audiopath_and_text[3], 0, audiopath_and_text[5] #audiopath_and_text[4], audiopath_and_text[5]
+        smoke_lweek, hemoptysis, cough_dur = audiopath_and_text[5], audiopath_and_text[6], audiopath_and_text[7]
+        tb_type  = audiopath_and_text[8]
+        
+        wav = self.get_audio(self.db_path + "/" + wavname)
+
+        max_val = torch.max(torch.abs(wav)) # Does It need again?
+        wav = wav / max_val if max_val != 0 else wav
+        wav = wav.unsqueeze(0)
+
+        if self.wav_transform != None:
+            wav = self.wav_transform(wav.squeeze(0)) # [80, 224]
+            if self.multimask_augment == True and self.train == True:
+                wav = audio_processing.multi_mask_spectrogram(wav, tau=24, nu=15, num_masks=2)
+            wav = wav.unsqueeze(0)
+
+        return (wavname, wav, dse_id, [speaker, gender, smoke_lweek, hemoptysis, tb_type], [age, cough_dur])
+
+    def get_audio(self, filename): # random.randint(1, 6)
+        audio = utils.load_audio_sample(filename, self.sampling_rate, None, 
+                                       self.desired_length, fade_samples_ratio=self.fade_samples_ratio, 
+                                       pad_types=self.pad_types) # repeat zero
+        audio = audio.squeeze(0)
+
+        if self.augment_data:
+            if random.uniform(0, 0.999) > 1 - 0.6:
+                try:
+                    audio = self.data_augmentator(audio.unsqueeze(0), self.sampling_rate).squeeze(0)
+                    max_val = torch.max(torch.abs(audio))
+                    audio = audio / max_val if max_val != 0 else audio
+                except:
+                    audio = audio
+
+        if self.add_noise:
+            audio = audio + torch.rand_like(audio)
+
+        audio = audio.unsqueeze(0)
+        return audio
+
+    def __getitem__(self, index):
+        return self.get_mel_text_pair(self.audiopaths_and_text[index])
+
+    def __len__(self):
+        return len(self.audiopaths_and_text)
+
+class MTCoughDatasetsCollate():
+    """ Zero-pads model inputs and targets based on number of frames per step
+    """
+    def __init__(self, many_data=2):
+        self.many_data = many_data
+
+    def __call__(self, batch):
+        """Collate's training batch from normalized text and mel-spectrogram
+        PARAMS
+        ------
+        batch: [text_normalized, mel_normalized]
+        """
+        wav_name = []
+        input_lengths, ids_sorted_decreasing = torch.sort(
+            torch.LongTensor([x[1].shape[-1] for x in batch]),
+            dim=0, descending=True)
+        max_wav_len = input_lengths[0] # max([x[0].size(1) for x in batch])
+
+        #wavname, wav, dse_id, [speaker, gender, smoke_lweek, hemoptysis, tb_type, age, cough_dur]
+        dse_ids = torch.LongTensor(len(batch))
+
+        spk_ids = torch.LongTensor(len(batch))
+        gender_ids = torch.LongTensor(len(batch))
+        smokers = torch.LongTensor(len(batch))
+        hemoptysis = torch.LongTensor(len(batch))
+        tb_types = torch.LongTensor(len(batch))
+
+        ages = torch.FloatTensor(len(batch))
+        cough_durs = torch.FloatTensor(len(batch))
+    
+        feature_dim = 1
+        if len(batch[0][1].shape) == 3:
+            feature_dim = batch[0][1].shape[1]
+
+        wav_padded = torch.FloatTensor(len(batch), feature_dim, max_wav_len)
+        wav_padded.zero_()
+
+        attention_masks = torch.FloatTensor(len(batch), max_wav_len)
+        attention_masks.zero_()
+
+        for i in range(len(ids_sorted_decreasing)):
+            wav_name.append(batch[i][0])
+            wav = batch[ids_sorted_decreasing[i]][1]
+            wav_padded[i, :, :wav.shape[-1]] = wav
+            attention_masks[i, :wav.shape[-1]] = 1
+
+            dse_ids[i] = batch[ids_sorted_decreasing[i]][2]
+
+            spk_ids[i] = batch[ids_sorted_decreasing[i]][3][0]
+            gender_ids[i] = batch[ids_sorted_decreasing[i]][3][1]
+            smokers[i] = batch[ids_sorted_decreasing[i]][3][2]
+            hemoptysis[i] = batch[ids_sorted_decreasing[i]][3][3]
+            tb_types[i] = batch[ids_sorted_decreasing[i]][3][4]
+            
+            ages[i] = batch[ids_sorted_decreasing[i]][4][0]
+            cough_durs[i] = batch[ids_sorted_decreasing[i]][4][1]
+        
+        return wav_name, wav_padded, attention_masks, dse_ids, [spk_ids, gender_ids, smokers, hemoptysis, tb_types], [ages, cough_durs]

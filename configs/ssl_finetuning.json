@@ -10,7 +10,7 @@
     "lr_decay": 0.999875,
     "warmup_steps": 0,
     "scheduler": "noam",
-    "batch_size": 256,
+    "batch_size": 32,
     "accumulation_steps": 1,
     "fp16_run": false,
     "warm_start": false, 
@@ -39,11 +39,12 @@
     "add_noise": false,
     "mix_audio": false,
     "many_class": 2,
-    "db_path": "/run/media/fourier/Data1/Pras/Database_ThesisNew/",
-    "metadata_csv": "TB/tb_metadata_all_cleaned.csv" 
+    "db_path": "/run/media/fourier/Data1/Pras/Database_ThesisNew/TB/",
+    "metadata_csv": "metadata_cut_processed.csv" 
   }, 
   "model": {
-    "pooling_model": "WavLM_MyOwn2MT",
+    "output_hidden_states": false,
+    "pooling_model": "DownstreamMT",
     "feature_dim": 80,
     "p_dropout": 0.1,
     "regress_hidden_dim": 1024,

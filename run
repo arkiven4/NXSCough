@@ -1,0 +1,12 @@
+python zfinetune_ssl.py \
+    --use_lora \
+    --lora_r 32 \
+    --train_csv /run/media/fourier/Data1/Pras/Database_ThesisNew/TB/metadata_cut_processed.csv.train \
+    --test_csv /run/media/fourier/Data1/Pras/Database_ThesisNew/TB/metadata_cut_processed.csv.test \
+    --audio_column file_path \
+    --target_column disease_label \
+    --output_dir logs/valence_model \
+    --num_labels 2
+
+
+python zfinetune_ssl2.py --init --model_name try_wavlmfinetune_full --config_path configs/ssl_finetuning.json

@@ -29,17 +29,19 @@ warnings.simplefilter("ignore", UserWarning)
 # =============================================================
 # SECTION: Intialize Data
 # =============================================================
-INIT = True
-MODEL_NAME = "try_resnet101_cam"
-CONFIG_PATH = "configs/lstm_cnn.json"
+parser = argparse.ArgumentParser()
+parser.add_argument("--init", action="store_true")
+parser.add_argument("--model_name", type=str, default="try_wavlmlora_downstream")
+parser.add_argument("--config_path", type=str, default="configs/ssl_finetuning.json")
+args = parser.parse_args()
 
-model_dir = os.path.join("./logs", MODEL_NAME)
+model_dir = os.path.join("./logs", args.model_name)
 if not os.path.exists(model_dir):
     os.makedirs(model_dir)
 
 config_save_path = os.path.join(model_dir, "config.json")
-if INIT:
-    with open(CONFIG_PATH, "r") as f:
+if args.init:
+    with open(args.config_path, "r") as f:
       data = f.read()
     with open(config_save_path, "w") as f:
       f.write(data)
@@ -65,29 +67,31 @@ cur_bs = BATCH_SIZE // ACCUMULATION_STEP
 Diseases_codes = [0, 1]
 CLASS_NAMES = ["Healthy", "TB"]
 
-df = pd.read_csv(f'{hps.data.db_path}/{hps.data.metadata_csv}')
-df = df[df['cough_score'] >= 0.90].sample(frac=1, random_state=40)
+df_train = pd.read_csv(f'{hps.data.db_path}/{hps.data.metadata_csv}.train')
+df_test = pd.read_csv(f'{hps.data.db_path}/{hps.data.metadata_csv}.test')
+# df = pd.read_csv(f'{hps.data.db_path}/{hps.data.metadata_csv}')
+# df = df[df['cough_score'] >= 0.90].sample(frac=1, random_state=40)
 
-df_solic = df[df['type_cough'] == 0].sample(frac=1, random_state=41)
-df_long = df[df['type_cough'] == 1].sample(frac=1, random_state=42) # 0 Solic, 1 Longi
-df_long_array = []
-for i_rand in range(5):
-    df_0 = df_long[df_long['disease_label'] == 0].sample(n=df_solic['disease_label'].value_counts()[0], random_state=i_rand * 4)
-    df_1 = df_long[df_long['disease_label'] == 1].sample(n=df_solic['disease_label'].value_counts()[1], random_state=i_rand * 4)
-    df_long_array.append(pd.concat([df_0, df_1], ignore_index=True, sort=False))
+# df_solic = df[df['type_cough'] == 0].sample(frac=1, random_state=41)
+# df_long = df[df['type_cough'] == 1].sample(frac=1, random_state=42) # 0 Solic, 1 Longi
+# df_long_array = []
+# for i_rand in range(5):
+#     df_0 = df_long[df_long['disease_label'] == 0].sample(n=df_solic['disease_label'].value_counts()[0], random_state=i_rand * 4)
+#     df_1 = df_long[df_long['disease_label'] == 1].sample(n=df_solic['disease_label'].value_counts()[1], random_state=i_rand * 4)
+#     df_long_array.append(pd.concat([df_0, df_1], ignore_index=True, sort=False))
 
-df = df
-#df = df_solic
-#df = df_long_array[0]
-#df = df_long
-print(df.shape)
+# df = df
+# #df = df_solic
+# #df = df_long_array[0]
+# #df = df_long
+# print(df.shape)
 
-df_train, df_test = train_test_split(df, test_size=0.1, random_state=42, shuffle=True)
-#df_train, df_test = df_long, df_solic
+# df_train, df_test = train_test_split(df, test_size=0.1, random_state=42, shuffle=True)
+# #df_train, df_test = df_long, df_solic
 
-df_issue = pd.read_csv("df_issue.csv")
-df_train = df_train[~df_train['path_file'].isin(df_issue['wavname'])]
-df_test = df_test[~df_test['path_file'].isin(df_issue['wavname'])]
+# df_issue = pd.read_csv("df_issue.csv")
+# df_train = df_train[~df_train['path_file'].isin(df_issue['wavname'])]
+# df_test = df_test[~df_test['path_file'].isin(df_issue['wavname'])]
 
 class_frequencies = df_train['disease_label'].value_counts().to_dict()
 total_samples = len(df_train)
@@ -197,7 +201,6 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
     pool_model.train()
 
     batch_cnt = 0
-
     for batch_idx, (wav_names, audio, attention_masks, dse_ids, spk_ids) in enumerate(tqdm(train_loader)):
         audio = audio.cuda(non_blocking=True).float().squeeze(1)
         attention_masks = attention_masks.cuda(non_blocking=True).float()
