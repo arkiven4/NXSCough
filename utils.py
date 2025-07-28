@@ -402,6 +402,18 @@ def many_loss_category(pred, lab, loss_type="CE", test=False, weights=None, gate
         criterion = torch.nn.CrossEntropyLoss(weight=weights)
         loss = criterion(pred, lab)
         return [loss]
+    elif loss_type == "BCE":
+        criterion = torch.nn.BCEWithLogitsLoss(weight=weights)
+        loss = criterion(pred, lab.unsqueeze(1).float())
+        return [loss]
+    elif loss_type == "MSE":
+        criterion = torch.nn.MSELoss()
+        loss = criterion(pred, lab)
+        return [loss]
+    elif loss_type == "L1":
+        criterion = torch.nn.L1Loss()
+        loss = criterion(pred, lab)
+        return [loss]
     elif loss_type == "AFLoss":
         criterion = losses.AFLoss(margin=0.2, scale=1, num_layers=len(list(range(1, 25))))
         loss = criterion(pred, gate_weights, lab)
