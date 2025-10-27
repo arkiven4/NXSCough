@@ -1,30 +1,230 @@
-import os
-import sys
-import glob
-import gc
-import math
-import json
-import argparse
-import logging
-import random
-import string
-import subprocess
-import matplotlib.pyplot as plt
-
-import numpy as np
-from scipy.io.wavfile import read
-from sklearn.metrics import f1_score, accuracy_score
+import argparse, gc, glob, json, logging, math, os, random, socket, string, subprocess, sys
 import librosa
-
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
-from torchaudio import transforms as T
+from torch.nn import functional as F
+from scipy.io.wavfile import read
+from sklearn.metrics import accuracy_score, f1_score
 from tensorboard.backend.event_processing import event_accumulator
+from torchaudio import transforms as T
+from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 
 import losses
 MATPLOTLIB_FLAG = False
 
 logging.basicConfig(stream=sys.stdout, level=logging.ERROR)
 logger = logging
+
+DEFAULT_MIN_BIN_WIDTH = 1e-3
+DEFAULT_MIN_BIN_HEIGHT = 1e-3
+DEFAULT_MIN_DERIVATIVE = 1e-3
+
+def piecewise_rational_quadratic_transform(
+    inputs,
+    unnormalized_widths,
+    unnormalized_heights,
+    unnormalized_derivatives,
+    inverse=False,
+    tails=None,
+    tail_bound=1.0,
+    min_bin_width=DEFAULT_MIN_BIN_WIDTH,
+    min_bin_height=DEFAULT_MIN_BIN_HEIGHT,
+    min_derivative=DEFAULT_MIN_DERIVATIVE,
+):
+    if tails is None:
+        spline_fn = rational_quadratic_spline
+        spline_kwargs = {}
+    else:
+        spline_fn = unconstrained_rational_quadratic_spline
+        spline_kwargs = {"tails": tails, "tail_bound": tail_bound}
+
+    outputs, logabsdet = spline_fn(
+        inputs=inputs,
+        unnormalized_widths=unnormalized_widths,
+        unnormalized_heights=unnormalized_heights,
+        unnormalized_derivatives=unnormalized_derivatives,
+        inverse=inverse,
+        min_bin_width=min_bin_width,
+        min_bin_height=min_bin_height,
+        min_derivative=min_derivative,
+        **spline_kwargs,
+    )
+    return outputs, logabsdet
+
+
+def searchsorted(bin_locations, inputs, eps=1e-6):
+    bin_locations[..., -1] += eps
+    return torch.sum(inputs[..., None] >= bin_locations, dim=-1) - 1
+
+
+def unconstrained_rational_quadratic_spline(
+    inputs,
+    unnormalized_widths,
+    unnormalized_heights,
+    unnormalized_derivatives,
+    inverse=False,
+    tails="linear",
+    tail_bound=1.0,
+    min_bin_width=DEFAULT_MIN_BIN_WIDTH,
+    min_bin_height=DEFAULT_MIN_BIN_HEIGHT,
+    min_derivative=DEFAULT_MIN_DERIVATIVE,
+):
+    inside_interval_mask = (inputs >= -tail_bound) & (inputs <= tail_bound)
+    outside_interval_mask = ~inside_interval_mask
+
+    outputs = torch.zeros_like(inputs)
+    logabsdet = torch.zeros_like(inputs)
+
+    if tails == "linear":
+        unnormalized_derivatives = F.pad(unnormalized_derivatives, pad=(1, 1))
+        constant = np.log(np.exp(1 - min_derivative) - 1)
+        unnormalized_derivatives[..., 0] = constant
+        unnormalized_derivatives[..., -1] = constant
+
+        outputs[outside_interval_mask] = inputs[outside_interval_mask]
+        logabsdet[outside_interval_mask] = 0
+    else:
+        raise RuntimeError("{} tails are not implemented.".format(tails))
+
+    outputs[inside_interval_mask], logabsdet[inside_interval_mask] = rational_quadratic_spline(
+        inputs=inputs[inside_interval_mask],
+        unnormalized_widths=unnormalized_widths[inside_interval_mask, :],
+        unnormalized_heights=unnormalized_heights[inside_interval_mask, :],
+        unnormalized_derivatives=unnormalized_derivatives[inside_interval_mask, :],
+        inverse=inverse,
+        left=-tail_bound,
+        right=tail_bound,
+        bottom=-tail_bound,
+        top=tail_bound,
+        min_bin_width=min_bin_width,
+        min_bin_height=min_bin_height,
+        min_derivative=min_derivative,
+    )
+
+    return outputs, logabsdet
+
+
+def rational_quadratic_spline(
+    inputs,
+    unnormalized_widths,
+    unnormalized_heights,
+    unnormalized_derivatives,
+    inverse=False,
+    left=0.0,
+    right=1.0,
+    bottom=0.0,
+    top=1.0,
+    min_bin_width=DEFAULT_MIN_BIN_WIDTH,
+    min_bin_height=DEFAULT_MIN_BIN_HEIGHT,
+    min_derivative=DEFAULT_MIN_DERIVATIVE,
+):
+    if torch.min(inputs) < left or torch.max(inputs) > right:
+        raise ValueError("Input to a transform is not within its domain")
+
+    num_bins = unnormalized_widths.shape[-1]
+
+    if min_bin_width * num_bins > 1.0:
+        raise ValueError("Minimal bin width too large for the number of bins")
+    if min_bin_height * num_bins > 1.0:
+        raise ValueError("Minimal bin height too large for the number of bins")
+
+    widths = F.softmax(unnormalized_widths, dim=-1)
+    widths = min_bin_width + (1 - min_bin_width * num_bins) * widths
+    cumwidths = torch.cumsum(widths, dim=-1)
+    cumwidths = F.pad(cumwidths, pad=(1, 0), mode="constant", value=0.0)
+    cumwidths = (right - left) * cumwidths + left
+    cumwidths[..., 0] = left
+    cumwidths[..., -1] = right
+    widths = cumwidths[..., 1:] - cumwidths[..., :-1]
+
+    derivatives = min_derivative + F.softplus(unnormalized_derivatives)
+
+    heights = F.softmax(unnormalized_heights, dim=-1)
+    heights = min_bin_height + (1 - min_bin_height * num_bins) * heights
+    cumheights = torch.cumsum(heights, dim=-1)
+    cumheights = F.pad(cumheights, pad=(1, 0), mode="constant", value=0.0)
+    cumheights = (top - bottom) * cumheights + bottom
+    cumheights[..., 0] = bottom
+    cumheights[..., -1] = top
+    heights = cumheights[..., 1:] - cumheights[..., :-1]
+
+    if inverse:
+        bin_idx = searchsorted(cumheights, inputs)[..., None]
+    else:
+        bin_idx = searchsorted(cumwidths, inputs)[..., None]
+
+    input_cumwidths = cumwidths.gather(-1, bin_idx)[..., 0]
+    input_bin_widths = widths.gather(-1, bin_idx)[..., 0]
+
+    input_cumheights = cumheights.gather(-1, bin_idx)[..., 0]
+    delta = heights / widths
+    input_delta = delta.gather(-1, bin_idx)[..., 0]
+
+    input_derivatives = derivatives.gather(-1, bin_idx)[..., 0]
+    input_derivatives_plus_one = derivatives[..., 1:].gather(-1, bin_idx)[..., 0]
+
+    input_heights = heights.gather(-1, bin_idx)[..., 0]
+
+    if inverse:
+        a = (inputs - input_cumheights) * (
+            input_derivatives + input_derivatives_plus_one - 2 * input_delta
+        ) + input_heights * (input_delta - input_derivatives)
+        b = input_heights * input_derivatives - (inputs - input_cumheights) * (
+            input_derivatives + input_derivatives_plus_one - 2 * input_delta
+        )
+        c = -input_delta * (inputs - input_cumheights)
+
+        discriminant = b.pow(2) - 4 * a * c
+        assert (discriminant >= 0).all()
+
+        root = (2 * c) / (-b - torch.sqrt(discriminant))
+        outputs = root * input_bin_widths + input_cumwidths
+
+        theta_one_minus_theta = root * (1 - root)
+        denominator = input_delta + (
+            (input_derivatives + input_derivatives_plus_one - 2 * input_delta) * theta_one_minus_theta
+        )
+        derivative_numerator = input_delta.pow(2) * (
+            input_derivatives_plus_one * root.pow(2)
+            + 2 * input_delta * theta_one_minus_theta
+            + input_derivatives * (1 - root).pow(2)
+        )
+        logabsdet = torch.log(derivative_numerator) - 2 * torch.log(denominator)
+
+        return outputs, -logabsdet
+    else:
+        theta = (inputs - input_cumwidths) / input_bin_widths
+        theta_one_minus_theta = theta * (1 - theta)
+
+        numerator = input_heights * (input_delta * theta.pow(2) + input_derivatives * theta_one_minus_theta)
+        denominator = input_delta + (
+            (input_derivatives + input_derivatives_plus_one - 2 * input_delta) * theta_one_minus_theta
+        )
+        outputs = input_cumheights + numerator / denominator
+
+        derivative_numerator = input_delta.pow(2) * (
+            input_derivatives_plus_one * theta.pow(2)
+            + 2 * input_delta * theta_one_minus_theta
+            + input_derivatives * (1 - theta).pow(2)
+        )
+        logabsdet = torch.log(derivative_numerator) - 2 * torch.log(denominator)
+
+        return outputs, logabsdet
+
+def get_free_port():
+    s = socket.socket()
+    s.bind(("", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+def stratified_group_split(df, label_col='tb_status', group_col='participant', test_size=0.2, random_state=42):
+    sgkf = StratifiedGroupKFold(n_splits=int(1/test_size), shuffle=True, random_state=random_state)
+    for train_idx, val_idx in sgkf.split(df, df[label_col], df[group_col]):
+        df_train = df.iloc[train_idx].reset_index(drop=True)
+        df_val = df.iloc[val_idx].reset_index(drop=True)
+        return df_train, df_val
 
 def CCC_loss(pred, lab, m_lab=None, v_lab=None, is_numpy=False):
     """
@@ -77,63 +277,6 @@ def CE_weight_category(pred, lab, weights, test=False):
       f1_macro = f1_score(lab, pred_labels, average='macro')
       accuracy = accuracy_score(lab, pred_labels)
       return f1_micro, f1_macro, accuracy
-
-def warm_start_model(checkpoint_path, model, ignore_layers):
-    assert os.path.isfile(checkpoint_path)
-    print("Warm starting model from checkpoint '{}'".format(checkpoint_path))
-    checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
-    model_dict = checkpoint_dict['model']
-
-    random_weight_layer = []
-    mismatched_layers = []
-    unfound_layers = []
-    
-    for key, value in model_dict.items(): # model_dict warmstart weight
-        if hasattr(model, 'module'): # model is current model
-            if key in model.module.state_dict() and value.size() != model.module.state_dict()[key].size():
-                try:
-                    model_dict[key] = transfer_weight(model_dict[key], model.module.state_dict()[key].size())
-                    if model_dict[key].size() != model.module.state_dict()[key].size():
-                      mismatched_layers.append(key)
-                    else:
-                      random_weight_layer.append(key)
-                except:
-                    mismatched_layers.append(key)
-        else:
-            if key in model.state_dict() and value.size() != model.state_dict()[key].size():
-                try:
-                    model_dict[key] = transfer_weight(model_dict[key], model.state_dict()[key].size())
-                    if model_dict[key].size() != model.state_dict()[key].size():
-                      mismatched_layers.append(key)
-                    else:
-                      random_weight_layer.append(key)
-                except:
-                    mismatched_layers.append(key)
-        
-    print("Mismatched")
-    print(mismatched_layers)
-
-    print("random_weight_layer")
-    print(random_weight_layer)
-    
-    ignore_layers = ignore_layers + mismatched_layers
-    if len(ignore_layers) > 0:
-        model_dict = {k: v for k, v in model_dict.items()
-                      if k not in ignore_layers}
-        if hasattr(model, 'module'):
-          dummy_dict = model.module.state_dict()
-          dummy_dict.update(model_dict)
-        else:
-          dummy_dict = model.state_dict()
-          dummy_dict.update(model_dict)
-        model_dict = dummy_dict
-
-    if hasattr(model, 'module'):
-      model.module.load_state_dict(model_dict, strict=False)
-    else:
-      model.load_state_dict(model_dict, strict=False)
-
-    return model
 
 def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None):
   assert os.path.isfile(checkpoint_path)
@@ -300,7 +443,9 @@ def cut_pad_sample_torchaudio(data, sample_rate, desired_length, pad_types='zero
     current_length = data.shape[-1]
 
     if data.shape[-1] > target_duration:
-        data = data[..., :target_duration]
+        max_start = data.shape[-1] - target_duration
+        start = np.random.randint(0, max_start + 1)  # random start index
+        data = data[..., start:start + target_duration]
     else:
         if pad_types == 'zero':
             total_pad = target_duration - current_length
@@ -317,21 +462,17 @@ def cut_pad_sample_torchaudio(data, sample_rate, desired_length, pad_types='zero
     
     return data
 
-def load_audio_sample(file_path, db_sample_rate, wav_stats, desired_length, fade_samples_ratio=6, pad_types='zero'):
-    data, sample_rate = librosa.load(file_path, sr=None)
+def load_audio_sample(file_path, db_sample_rate, is_saming_length, desired_length, fade_samples_ratio=6, pad_types='zero'):
+    data, sample_rate = librosa.load(file_path, sr=db_sample_rate)
     if sample_rate != db_sample_rate:
-        raise ValueError("{} {} SR doesn't match target {} SR".format(sample_rate, db_sample_rate))
+        raise ValueError("{} SR doesn't match target {} SR".format(sample_rate, db_sample_rate))
     
-    #data = data / 32768.0
-    # max_val = np.max(np.abs(data))
-    # data = data / max_val if max_val != 0 else data
-
     data = torch.from_numpy(data).unsqueeze(0)
-
-    fade_samples = int(sample_rate / fade_samples_ratio)
-    fade = T.Fade(fade_in_len=fade_samples, fade_out_len=fade_samples, fade_shape='linear')
-    data = fade(data)
-    data = cut_pad_sample_torchaudio(data, sample_rate, desired_length, pad_types=pad_types)
+    if is_saming_length:
+      fade_samples = int(sample_rate / fade_samples_ratio)
+      fade = T.Fade(fade_in_len=fade_samples, fade_out_len=fade_samples, fade_shape='linear')
+      data = fade(data)
+      data = cut_pad_sample_torchaudio(data, sample_rate, desired_length, pad_types=pad_types)
     return data
 
 def smoothing_tensorboard(values, weight=0.9):
@@ -386,6 +527,14 @@ def plot_loss_from_tensorboard(best_lost, train_log_dir, val_log_dir, tag='loss/
     plt.savefig(save_path)
     plt.close()
 
+def orthogonality_loss(d_emb, s_emb):
+    # penalize correlation between disease and speaker embedding per-sample
+    # normalize to remove scale effect
+    d = F.normalize(d_emb, p=2, dim=1)
+    s = F.normalize(s_emb, p=2, dim=1)
+    # dot product per sample then squared mean
+    dots = torch.sum(d * s, dim=1)  # (B,)
+    return torch.mean(dots * dots)
 
 def many_loss_category(pred, lab, loss_type="CE", test=False, weights=None, gate_weights=None, model=None):
     if test == True:

@@ -2,6 +2,7 @@ import torch, math
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.wavlm.modeling_wavlm import WavLMGroupNormConvLayer, WavLMNoLayerNormConvLayer, WavLMLayerNormConvLayer
+import modules
 
 class WavLMFeatureEncoder(nn.Module):
     """Construct the features from raw audio waveform"""
@@ -32,8 +33,8 @@ class WavLMFeatureEncoder(nn.Module):
         hidden_states = input_values[:, None]
 
         # make sure hidden_states require grad for gradient_checkpointing
-        if self._requires_grad and self.training:
-            hidden_states.requires_grad = True
+        # if self._requires_grad and self.training:
+        #     hidden_states.requires_grad = True
 
         for conv_layer in self.conv_layers:
             hidden_states = conv_layer(hidden_states)
@@ -98,3 +99,110 @@ class WhisperFeatureEncoder(nn.Module):
         hidden_states = inputs_embeds + self.embed_positions(all_positions)
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         return hidden_states
+
+class AttentiveStatisticsPooling(nn.Module):
+    """Attentive Statistics Pooling layer that computes weighted mean and std"""
+    def __init__(self, input_dim, attention_dim=128):
+        super(AttentiveStatisticsPooling, self).__init__()
+        self.input_dim = input_dim
+        self.attention_dim = attention_dim
+        
+        # Attention mechanism
+        self.attention_layer = nn.Sequential(
+            nn.Linear(input_dim, attention_dim),
+            nn.Tanh(),
+            nn.Linear(attention_dim, 1, bias=False)
+        )
+        
+    def forward(self, x, lengths=None):
+        """
+        Args:
+            x: Input tensor of shape [B, T, D] where B=batch, D=features, T=time
+            lengths: Optional tensor of actual sequence lengths for masking
+        Returns:
+            pooled: Concatenated mean and std of shape [B, 2*D]
+        """
+        batch_size, time_steps, feature_dim = x.shape
+        
+        # Compute attention weights
+        attention_weights = self.attention_layer(x)  # [B, T, 1]
+        
+        # Apply length masking if provided
+        if lengths is not None:
+            mask = torch.arange(time_steps, device=x.device).unsqueeze(0) < lengths.unsqueeze(1)
+            mask = mask.unsqueeze(-1).float()  # [B, T, 1]
+            attention_weights = attention_weights.masked_fill(mask == 0, float('-inf'))
+        
+        # Softmax to get normalized attention weights
+        attention_weights = F.softmax(attention_weights, dim=1)  # [B, T, 1]
+        
+        # Compute weighted statistics
+        # Weighted mean
+        weighted_mean = torch.sum(attention_weights * x, dim=1)  # [B, D]
+        
+        # Weighted standard deviation
+        diff = x - weighted_mean.unsqueeze(1)  # [B, T, D]
+        weighted_var = torch.sum(attention_weights * diff**2, dim=1)  # [B, D]
+        weighted_std = torch.sqrt(weighted_var + 1e-8)  # [B, D]
+        
+        # Concatenate mean and std
+        pooled = torch.cat([weighted_mean, weighted_std], dim=1)  # [B, 2*D]
+        
+        return pooled  
+
+class SEBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        """
+        param in_channels: the number of input channels
+        param out_channels: the number of out channels
+        """
+        super(SEBlock, self).__init__()
+
+        self.conv1 = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=(3, 3),
+            stride=(1, 1),
+            padding=(1, 1),
+            bias=False,
+        )
+
+        self.conv2 = nn.Conv2d(
+            in_channels=out_channels,
+            out_channels=out_channels,
+            kernel_size=(3, 3),
+            stride=(1, 1),
+            padding=(1, 1),
+            bias=False,
+        )
+
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.se1 = modules.SELayer(out_channels)
+        self.se2 = modules.SELayer(out_channels)
+
+        self.init_weight()
+
+    def init_weight(self):
+        modules.init_layer(self.conv1)
+        modules.init_layer(self.conv2)
+        modules.init_bn(self.bn1)
+        modules.init_bn(self.bn2)
+
+    def forward(self, input, pool_size=(2, 2), pool_type="avg"):
+        x = input
+        x = F.relu_(self.se1(self.bn1(self.conv1(x))))
+        x = F.relu_(self.se2(self.bn2(self.conv2(x))))
+        if pool_type == "max":
+            x = F.max_pool2d(x, kernel_size=pool_size)
+        elif pool_type == "avg":
+            x = F.avg_pool2d(x, kernel_size=pool_size)
+        elif pool_type == "avg+max":
+            x1 = F.avg_pool2d(x, kernel_size=pool_size)
+            x2 = F.max_pool2d(x, kernel_size=pool_size)
+            x = x1 + x2
+        else:
+            raise Exception("Incorrect argument!")
+
+        return x

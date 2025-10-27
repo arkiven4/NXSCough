@@ -1,6 +1,7 @@
 __pycache__
 output/*/
 logs/
+logs_old/
 *.zip
 data/TB_resample/
 test.ipynb

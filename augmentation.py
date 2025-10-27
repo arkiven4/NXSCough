@@ -28,7 +28,6 @@ logger.addHandler(logger_stream_handler)
 #endregion
 
 class DataAugmentator:
-
     def __init__(
         self,
         augmentation_noises_directory,
@@ -48,7 +47,8 @@ class DataAugmentator:
         self.create_rir_list(augmentation_rirs_labels_path) 
 
         # TODO move to settings
-        #self.EFFECTS = ["apply_speed_perturbation", "apply_reverb", "add_background_noise"]           
+        #self.EFFECTS = ["apply_speed_perturbation", "apply_reverb", "add_background_noise"]    
+        self.PITCH_SHIFTS = [-2, -1, 1, 2]         
         self.SPEEDS = ["0.9", "1.1"] # If 1 is an option, no augmentation is done!
         self.SNR_NOISE_RANGE = [15, 25]
         self.SNR_SPEECH_RANGE = [15, 25]
@@ -115,7 +115,12 @@ class DataAugmentator:
         # TODO first loading the audio and then cropping is unefficient
         # Clean up the RIR,  extract the main impulse, normalize the signal power
         normalized_rir = rir_wav[:, int(rir_sample_rate * 0.01) : int(rir_sample_rate * 1.3)]
-        normalized_rir = normalized_rir / torch.norm(normalized_rir, p=2)
+        rir_norm = torch.norm(normalized_rir, p=2)
+        if rir_norm > 0:
+            normalized_rir = normalized_rir / rir_norm
+        else:
+            logger.warning("RIR norm is zero, skipping reverb")
+            return audio
         
         logger.debug(f"fftconvolve on going...")
         logger.debug(f"The audio shape is: {audio.shape}")
@@ -129,7 +134,27 @@ class DataAugmentator:
         logger.debug(f"fftconvolve ok")
 
         return augmented_waveform
+
+    def apply_pitch_shift(self, audio, sample_rate):
+            """
+            Apply pitch shift augmentation to the audio.
+            """
+            pitch_shift_semitones = random.choice(self.PITCH_SHIFTS)
             
+            augmented_audio_waveform, augmented_sample_rate = torchaudio.sox_effects.apply_effects_tensor(
+                audio, sample_rate, [["pitch", str(pitch_shift_semitones)]]
+            )
+            
+            # Pitch shift typically doesn't change sample rate, but let's be safe
+            if augmented_sample_rate != sample_rate:
+                resampled_waveform = torchaudio.functional.resample(
+                    waveform = augmented_audio_waveform,
+                    orig_freq = augmented_sample_rate, 
+                    new_freq = sample_rate, 
+                )
+                return resampled_waveform
+            
+            return augmented_audio_waveform
     
     def get_SNR_bounds(self, background_audio_type):
 
@@ -206,7 +231,13 @@ class DataAugmentator:
         )
 
         padded_cropped_noise = self.pad_noise(cropped_noise, audio)
-
+        
+        audio_power = torch.mean(audio ** 2)
+        noise_power = torch.mean(padded_cropped_noise ** 2)
+        if audio_power == 0 or noise_power == 0:
+            logger.warning("Zero power detected in audio or noise, skipping noise addition")
+            return audio
+        
         audio_SNR = torch.tensor(
             self.sample_random_SNR(background_audio_type)
         ).unsqueeze(0)
@@ -222,28 +253,120 @@ class DataAugmentator:
 
         The output shape is [1, len(waveform)]
         """
+        if torch.isnan(audio).any():
+            logger.warning("Input audio contains NaN values")
+            return audio
         
         effect = random.choice(self.augmentation_effects)
 
         logger.debug(f"Data augmentation {effect} is going to be applied...")
         
         # getattr(self, effect) is equivalent to apply self.effect(audio, sample_rate)
-
         augmented_waveform = getattr(self, effect)(audio, sample_rate)
-        
+        if torch.isnan(augmented_waveform).any():
+            logger.warning(f"Augmentation {effect} produced NaN values, returning original audio")
+            return audio
         return augmented_waveform
 
-    
     def __call__(self, audio, sample_rate):
-        
         return self.augment(audio, sample_rate)
 
-        
     def __len__(self):
-
         return len(self.augmentation_list)
 
-        
+
+#########################################
+#
+# RAWBOOST
+#
+########################################
+
+import numpy as np
+from scipy import signal
+import copy
+
+def randRange(x1, x2, integer):
+    y = np.random.uniform(low=x1, high=x2, size=(1,))
+    if integer:
+        y = int(y)
+    return y
+
+def normWav(x,always):
+    if always:
+        x = x/np.amax(abs(x))
+    elif np.amax(abs(x)) > 1:
+            x = x/np.amax(abs(x))
+    return x
+
+def genNotchCoeffs(nBands,minF,maxF,minBW,maxBW,minCoeff,maxCoeff,minG,maxG,fs):
+    b = 1
+    for i in range(0, nBands):
+        fc = randRange(minF,maxF,0);
+        bw = randRange(minBW,maxBW,0);
+        c = randRange(minCoeff,maxCoeff,1);
+          
+        if c/2 == int(c/2):
+            c = c + 1
+        f1 = fc - bw/2
+        f2 = fc + bw/2
+        if f1 <= 0:
+            f1 = 1/1000
+        if f2 >= fs/2:
+            f2 =  fs/2-1/1000
+        b = np.convolve(signal.firwin(c, [float(f1), float(f2)], window='hamming', fs=fs),b)
+
+    G = randRange(minG,maxG,0); 
+    _, h = signal.freqz(b, 1, fs=fs)    
+    b = pow(10, G/20)*b/np.amax(abs(h))   
+    return b
+
+
+def filterFIR(x,b):
+    N = b.shape[0] + 1
+    xpad = np.pad(x, (0, N), 'constant')
+    y = signal.lfilter(b, 1, xpad)
+    y = y[int(N/2):int(y.shape[0]-N/2)]
+    return y
+
+# Linear and non-linear convolutive noise
+def LnL_convolutive_noise(x,N_f,nBands,minF,maxF,minBW,maxBW,minCoeff,maxCoeff,minG,maxG,minBiasLinNonLin,maxBiasLinNonLin,fs):
+    y = [0] * x.shape[0]
+    for i in range(0, N_f):
+        if i == 1:
+            minG = minG-minBiasLinNonLin;
+            maxG = maxG-maxBiasLinNonLin;
+        b = genNotchCoeffs(nBands,minF,maxF,minBW,maxBW,minCoeff,maxCoeff,minG,maxG,fs)
+        y = y + filterFIR(np.power(x, (i+1)),  b)     
+    y = y - np.mean(y)
+    y = normWav(y,0)
+    return y
+
+
+# Impulsive signal dependent noise
+def ISD_additive_noise(x, P, g_sd):
+    beta = randRange(0, P, 0)
+    
+    y = copy.deepcopy(x)
+    x_len = x.shape[0]
+    n = int(x_len*(beta/100))
+    p = np.random.permutation(x_len)[:n]
+    f_r= np.multiply(((2*np.random.rand(p.shape[0]))-1),((2*np.random.rand(p.shape[0]))-1))
+    r = g_sd * x[p] * f_r
+    y[p] = x[p] + r
+    y = normWav(y,0)
+    return y
+
+
+# Stationary signal independent noise
+def SSI_additive_noise(x,SNRmin,SNRmax,nBands,minF,maxF,minBW,maxBW,minCoeff,maxCoeff,minG,maxG,fs):
+    noise = np.random.normal(0, 1, x.shape[0])
+    b = genNotchCoeffs(nBands,minF,maxF,minBW,maxBW,minCoeff,maxCoeff,minG,maxG,fs)
+    noise = filterFIR(noise, b)
+    noise = normWav(noise,1)
+    SNR = randRange(SNRmin, SNRmax, 0)
+    noise = noise / np.linalg.norm(noise,2) * np.linalg.norm(x,2) / 10.0**(0.05 * SNR)
+    x = x + noise
+    return x
 
         
 

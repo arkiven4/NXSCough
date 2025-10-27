@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.hub import load_state_dict_from_url
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
+from efficientnet_pytorch import EfficientNet
 
 import torchvision
 from transformers import AutoConfig, AutoFeatureExtractor
@@ -14,721 +15,1587 @@ from typing import Any, Callable, Optional
 from collections import OrderedDict
 
 import modules, commons, layers
+from torch.autograd import Function
 
-def classifier_network(embed_dim, dropout, out_dim):
-    return nn.Sequential(
-        nn.ReLU(),
-        nn.Dropout(dropout),
-        nn.Linear(embed_dim, out_dim)
-    )
+class GradReverse(Function):
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = lambd
+        return x.view_as(x)
 
-class LSTMAudioClassifier1(nn.Module):
-    def __init__(self, input_size, regress_hidden_dim, output_dim, **kwargs):
-        super(LSTMAudioClassifier1, self).__init__()
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.lambd, None
+
+def grad_reverse(x, lambd=1.0):
+    return GradReverse.apply(x, lambd)
+
+#################################################################################################
+class PEFTWavlm_MyOwnGradeReversal(nn.Module):
+    def __init__(self, input_size, regress_hidden_dim, num_transformer_layers, output_dim, spk_dim, **kwargs):
+        super(PEFTWavlm_MyOwnGradeReversal, self).__init__()
+
+        self.pooling = layers.AttentiveStatisticsPooling(input_size, attention_dim=128)
+        embed_dim = input_size * 2  # Since ASP outputs 2*input_size
+        dropout = 0.1
+
+        # Projection layers for multi-task learning
+        self.disease_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),  # Use GELU like WavLM
+            nn.LayerNorm(embed_dim // 2, eps=1e-5),
+            nn.Dropout(dropout)
+        )
+        self.speaker_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.LayerNorm(embed_dim // 2, eps=1e-5),
+            nn.Dropout(dropout)
+        )
+
+        # Classifiers
+        self.disease_clf = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, output_dim)
+        )
+
+        self.speaker_clf = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, spk_dim)
+        )
         
-        self.batch_norm1 = nn.BatchNorm1d(input_size)
-        self.lstm1 = nn.LSTM(input_size, regress_hidden_dim, batch_first=True)
+        self.gender_clf = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, 2)
+        )
+
+
+    def forward(self, x, attention_mask=None, grl_lambda=0.0):
+        feature_embedding = self.pooling(x)
         
-        self.batch_norm2 = nn.BatchNorm1d(regress_hidden_dim)
-        self.lstm2 = nn.LSTM(regress_hidden_dim, regress_hidden_dim, batch_first=True)
-        
-        #self.attention = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=8, batch_first=True)
+        d_emb = self.disease_proj(feature_embedding)    
+        s_emb = self.speaker_proj(feature_embedding) 
 
-        self.flatten = nn.Flatten()
-        self.dropout = nn.Dropout(0.1)
-        self.fc = nn.Linear(regress_hidden_dim, output_dim)
+        disease_logits = self.disease_clf(d_emb)
 
-    def forward(self, x, lengths=None):
-        x = x.permute(0, 2, 1)
-        x = self.batch_norm1(x.transpose(1, 2)).transpose(1, 2)
-        x, _ = self.lstm1(x)
-        
-        x = self.batch_norm2(x.transpose(1, 2)).transpose(1, 2)
-        x, _ = self.lstm2(x)
-        
-        # attn_output, _ = self.attention(x, x, x)
-        # x = torch.mean(attn_output, dim=1)
+        s_in = grad_reverse(s_emb, grl_lambda) if self.training and grl_lambda > 0 else s_emb
+        speaker_logits = self.speaker_clf(s_in)
+        gender_logits = self.gender_clf(s_in)
 
-        x = self.flatten(x[:, -1, :])
-        x = self.dropout(x)
+        return {
+            "disease_logits": disease_logits,
+            "speaker_logits": speaker_logits,
+            "gender_logits": gender_logits,
+            "d_emb": d_emb,
+            "s_emb": s_emb,
+        }
 
-        embedding = x.clone()
-        x = self.fc(x)
-
-        loss_internal = 0.0
-        return [x, embedding, loss_internal]
-
-class LSTMClassifierMT(nn.Module):
-    def __init__(self, input_size, regress_hidden_dim, output_dim, **kwargs):
-        super(LSTMAudioClassifier1, self).__init__()
-        
-        self.batch_norm1 = nn.BatchNorm1d(input_size)
-        self.lstm1 = nn.LSTM(input_size, regress_hidden_dim, batch_first=True)
-        
-        self.batch_norm2 = nn.BatchNorm1d(regress_hidden_dim)
-        self.lstm2 = nn.LSTM(regress_hidden_dim, regress_hidden_dim, batch_first=True)
-        
-        self.flatten = nn.Flatten()
-        #self.dropout = nn.Dropout(0.1)
-
-        self.dse_cls = classifier_network(input_size, 0.1, output_dim)
-        self.binary_classifiers = nn.ModuleList([])
-        self.binary_classifiers.append(classifier_network(input_size, 0.1, 1150))
-        for i in range(3):
-            self.binary_classifiers.append(classifier_network(input_size, 0.1,1))
-        self.binary_classifiers.append(classifier_network(input_size, 0.1, 10))
-
-    def forward(self, x, lengths=None):
-        x = x.permute(0, 2, 1)
-        x = self.batch_norm1(x.transpose(1, 2)).transpose(1, 2)
-        x, _ = self.lstm1(x)
-        
-        x = self.batch_norm2(x.transpose(1, 2)).transpose(1, 2)
-        x, _ = self.lstm2(x)
-        
-        # attn_output, _ = self.attention(x, x, x)
-        # x = torch.mean(attn_output, dim=1)
-        hidden_states = self.flatten(x[:, -1, :])
-
-        output = []
-        output.append(self.dse_cls(hidden_states))
-        for i, head in enumerate(self.binary_classifiers):
-            output.append(head(hidden_states))
-
-        return [output, hidden_states]
-
-class ResNet101(torchvision.models.resnet.ResNet):
-    def __init__(self, dummy, output_dim, track_bn=True, **kwargs):
-        def norm_layer(*args, **kwargs):
-            return nn.BatchNorm2d(*args, **kwargs, track_running_stats=track_bn)
-        super().__init__(torchvision.models.resnet.Bottleneck, [3, 4, 23, 3], norm_layer=norm_layer, num_classes=output_dim)
-        #del self.fc
-        self.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.final_feat_dim = 2048
-        self.grad_cam = False
-         # TODO : Coba tambah Rezize and Normalization
-        # self.preprocess = torchvision.transforms.Compose([
-        #     torchvision.transforms.Resize((224, 224))
-        # ])
-
-    def load_sl_official_weights(self, progress=True):
-        state_dict = load_state_dict_from_url(torchvision.models.resnet.ResNet101_Weights.IMAGENET1K_V2.url,
-                                              progress=progress)
-
-        del state_dict['conv1.weight']
-        missing, unexpected = self.load_state_dict(state_dict, strict=False)
-        # if len(missing) > 0:
-            # raise AssertionError('Model code may be incorrect')
-
-    def load_ssl_official_weights(self, progress=True):
-        raise NotImplemented
-
-    def _forward_impl(self, x: Tensor, lengths=None) -> Tensor:
-        # See note [TorchScript super()]
-        if self.grad_cam == True:
-            x = x
-        else:
-            x = x.unsqueeze(1)
-            #x = self.preprocess(x)
-
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-
-        return [x, 0.0, 0.0]
-
-class WavLM_MyOwn1(nn.Module):
-    def __init__(self, input_size, regress_hidden_dim, output_dim, **kwargs):
-        super(WavLM_MyOwn1, self).__init__()
+class WavLMEncoder_MyOwnGradeReversal(nn.Module):
+    def __init__(self, input_size, regress_hidden_dim, num_transformer_layers, output_dim, spk_dim, **kwargs):
+        super(WavLMEncoder_MyOwnGradeReversal, self).__init__()
 
         config = AutoConfig.from_pretrained("microsoft/wavlm-large")
         self.feature_extractor = layers.WavLMFeatureEncoder(config)
         self.feature_projection = layers.WavLMFeatureProjection(config)
 
-        embed_dim=1024
-        num_heads=8
-        dropout=0.1
+        embed_dim = 1024
+        num_heads = 16
+        dropout = 0.1
 
-        self.attention = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=embed_dim * 4,
-            dropout=dropout,
-            activation='relu',
-            batch_first=True  # [B, T, E]
+        self.pos_conv_embed = nn.Conv1d(
+            embed_dim, embed_dim, kernel_size=128, padding=64, groups=16
         )
-        self.encoder = nn.TransformerEncoder(self.attention, num_layers=1)
-        self.pooling = nn.AdaptiveAvgPool1d(1)  # or use mean over time dimension
+        self.layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+
+        self.attention_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=embed_dim,
+                nhead=num_heads,
+                dim_feedforward=embed_dim * 4,  # 4096 for WavLM-large
+                dropout=dropout,
+                activation='gelu',  # WavLM uses GELU
+                layer_norm_eps=1e-5,
+                batch_first=True,
+                norm_first=True  # Pre-norm like WavLM
+            ) for _ in range(num_transformer_layers)
+        ])
+        self.final_layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+        self.layer_weights = nn.Parameter(torch.ones(num_transformer_layers + 1))
+        self.pooling = nn.AdaptiveAvgPool1d(1)
+
+        # Projection layers for multi-task learning
+        self.disease_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),  # Use GELU like WavLM
+            nn.LayerNorm(embed_dim // 2, eps=1e-5),
+            nn.Dropout(dropout)
+        )
+        self.speaker_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.LayerNorm(embed_dim // 2, eps=1e-5),
+            nn.Dropout(dropout)
+        )
+
+        # Classifiers
+        self.disease_clf = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, output_dim)
+        )
+
+        self.speaker_clf = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, spk_dim)
+        )
         
-        self.dse_cls = classifier_network(input_size, 0.1, output_dim) # CrossEntrop
-        self.binary_classifiers = nn.ModuleList([])
-        #self.reg_classifiers = nn.ModuleList([])
+        self.gender_clf = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, 2)
+        )
 
-        self.binary_classifiers.append(classifier_network(input_size, 0.1, 1150))
-        for i in range(3):
-            self.binary_classifiers.append(classifier_network(input_size, 0.1,1))
-        self.binary_classifiers.append(classifier_network(input_size, 0.1, 10))
 
-    def forward(self, x, lengths=None):
+    def forward(self, x, attention_mask=None, grl_lambda=0.0):
         extract_features = self.feature_extractor(x)
         extract_features = extract_features.transpose(1, 2)
         hidden_states, extract_features = self.feature_projection(extract_features) # B, T, D
 
-        hidden_states = self.encoder(hidden_states)  # Self-attention over time → same shape [64, 74, 1024]
-        hidden_states = hidden_states.transpose(1, 2)  # [64, 1024, 74] for pooling over time
-        hidden_states = self.pooling(hidden_states).squeeze(-1)  # [64, 1024]
+        pos_conv_output = self.pos_conv_embed(hidden_states.transpose(1, 2))
+        pos_conv_output = pos_conv_output.transpose(1, 2)
+        min_seq_len = min(hidden_states.size(1), pos_conv_output.size(1))
+        hidden_states = hidden_states[:, :min_seq_len, :]
+        pos_conv_output = pos_conv_output[:, :min_seq_len, :]
+
+        hidden_states = hidden_states + pos_conv_output
+        hidden_states = self.layer_norm(hidden_states)
+
+        layer_outputs = [hidden_states]
+
+        for layer in self.attention_layers:
+            hidden_states = layer(hidden_states)
+            layer_outputs.append(hidden_states)
         
-        output = []
-        output.append(self.dse_cls(hidden_states))
-        for i, head in enumerate(self.binary_classifiers):
-            output.append(head(hidden_states))
-        return [output, hidden_states]
+        hidden_states = self.final_layer_norm(hidden_states)
+        layer_outputs[-1] = hidden_states
+        layer_weights_normalized = torch.softmax(self.layer_weights, dim=0)
+        weighted_hidden_states = torch.zeros_like(hidden_states)
+        for i, layer_output in enumerate(layer_outputs):
+            weighted_hidden_states += layer_weights_normalized[i] * layer_output
+        
+        hidden_states = weighted_hidden_states.transpose(1, 2)  # [B, embed_dim, T]
+        feature_embedding = self.pooling(hidden_states).squeeze(-1)  # [B, embed_dim]
+        
+        d_emb = self.disease_proj(feature_embedding)    
+        s_emb = self.speaker_proj(feature_embedding) 
+
+        disease_logits = self.disease_clf(d_emb)
+
+        s_in = grad_reverse(s_emb, grl_lambda) if self.training and grl_lambda > 0 else s_emb
+        speaker_logits = self.speaker_clf(s_in)
+        gender_logits = self.gender_clf(s_in)
+
+        return {
+            "disease_logits": disease_logits,
+            "speaker_logits": speaker_logits,
+            "gender_logits": gender_logits,
+            "d_emb": d_emb,
+            "s_emb": s_emb,
+        }
+
+class SE_Trans(nn.Module):
+    def __init__(
+        self, input_size, output_dim, spk_dim, **kwargs
+    ):#input_size, regress_hidden_dim, num_transformer_layers, output_dim, spk_dim
+        """
+        :param enable_multimodal: enable multimodal ASC
+        :param num_locations: number of city
+        :param location_embedding_dim: city embedding dim
+        :param time_feature_dim: time feature dim
+        :param time_mapping_dim: time embedding dim
+        """
+        super(SE_Trans, self).__init__()
+
+        nhead = 8
+        dim_feedforward = 32
+        n_layers = 1
+        dropout = 0.1
+        embed_dim = 128
+        
+        self.SE_block1 = layers.SEBlock(in_channels=1, out_channels=64)
+        self.SE_block2 = layers.SEBlock(in_channels=64, out_channels=embed_dim)
+        self.global_pool = nn.AdaptiveAvgPool2d((16, 1))
+        
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            embed_dim, nhead, dim_feedforward, dropout
+        )
+        self.encoder = nn.TransformerEncoder(self.encoder_layer, n_layers)
+        
+        self.fc = nn.Linear(embed_dim, output_dim, bias=True)
+        
+        self.bn0 = nn.BatchNorm2d(input_size)
+        self.init_weights()
+
+        # Projection layers for multi-task learning
+        self.disease_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),  # Use GELU like WavLM
+            nn.LayerNorm(embed_dim // 2, eps=1e-5),
+            nn.Dropout(dropout)
+        )
+        self.speaker_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.LayerNorm(embed_dim // 2, eps=1e-5),
+            nn.Dropout(dropout)
+        )
+
+        # Classifiers
+        self.disease_clf = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, output_dim)
+        )
+
+        self.speaker_clf = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, spk_dim)
+        )
+        
+        self.gender_clf = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, 2)
+        )
+
+    def init_weights(self):
+        modules.init_bn(self.bn0)
+        modules.init_layer(self.fc)
+
+    def forward(self, x, attention_mask=None, grl_lambda=0.0):
+        """
+        :param x: audio features [batch, frames, bins, 1]
+        :param locations: city [batch]
+        :param time_features: time feature [batch, 8]
+        """
+        x = x.unsqueeze(-1)
+        #print(x.shape)
+        #x = x.transpose(1, 3)  # x = [batch, bins, frames, in_chs]
+        x = self.bn0(x)  # BN is done over the bins dimension
+        x = x.transpose(1, 3)  # x = [batch, in_chs, frames, bins]
+
+        x = self.SE_block1(x, pool_size=(2, 2), pool_type="avg")
+        x = self.SE_block2(x, pool_size=(2, 2), pool_type="avg")
+
+        x = self.global_pool(x)
+        x = x.view(x.size(0), -1, x.size(2))  # x = [batch, in_chs, frames]
+        x = x.permute(2, 0, 1)  # x = [frames, batch, in_chs]
+        x = self.encoder(x)  # x = [frames, batch, in_chs]
+        x = x.permute(1, 0, 2)  # x = [batch, frames, in_chs]
+        (x, _) = torch.max(x, dim=1)  # (batch_size, in_chs=128)
+
+        d_emb = self.disease_proj(x)    
+        s_emb = self.speaker_proj(x) 
+
+        disease_logits = self.disease_clf(d_emb)
+        s_in = grad_reverse(s_emb, grl_lambda) if self.training and grl_lambda > 0 else s_emb
+        speaker_logits = self.speaker_clf(s_in)
+        gender_logits = self.gender_clf(s_in)
+
+        return {
+            "disease_logits": disease_logits,
+            "speaker_logits": speaker_logits,
+            "gender_logits": gender_logits,
+            "d_emb": d_emb,
+            "s_emb": s_emb,
+        }
+
+
+#################################################################################################
+#################################################################################################
+#################################################################################################
+#################################################################################################
+#################################################################################################
+#################################################################################################
+#################################################################################################
+#################################################################################################
+
+# class LSTMAudioClassifier1(nn.Module):
+#     def __init__(self, input_size, regress_hidden_dim, output_dim, **kwargs):
+#         super(LSTMAudioClassifier1, self).__init__()
+        
+#         self.batch_norm1 = nn.BatchNorm1d(input_size)
+#         self.lstm1 = nn.LSTM(input_size, regress_hidden_dim, batch_first=True)
+        
+#         self.batch_norm2 = nn.BatchNorm1d(regress_hidden_dim)
+#         self.lstm2 = nn.LSTM(regress_hidden_dim, regress_hidden_dim, batch_first=True)
+        
+#         #self.attention = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=8, batch_first=True)
+
+#         self.flatten = nn.Flatten()
+#         self.dropout = nn.Dropout(0.1)
+#         self.fc = nn.Linear(regress_hidden_dim, output_dim)
+
+#     def forward(self, x, lengths=None):
+#         x = x.permute(0, 2, 1)
+#         x = self.batch_norm1(x.transpose(1, 2)).transpose(1, 2)
+#         x, _ = self.lstm1(x)
+        
+#         x = self.batch_norm2(x.transpose(1, 2)).transpose(1, 2)
+#         x, _ = self.lstm2(x)
+        
+#         # attn_output, _ = self.attention(x, x, x)
+#         # x = torch.mean(attn_output, dim=1)
+
+#         x = self.flatten(x[:, -1, :])
+#         x = self.dropout(x)
+
+#         x = self.fc(x)
+
+#         loss_internal = 0.0
+#         return x #[x, embedding, loss_internal]
+
+
+
+# class LSTMClassifierMT(nn.Module):
+#     def __init__(self, input_size, regress_hidden_dim, output_dim, spk_dim, **kwargs):
+#         super(LSTMClassifierMT, self).__init__()
+        
+#         self.batch_norm1 = nn.BatchNorm1d(input_size)
+#         self.lstm1 = nn.LSTM(input_size, regress_hidden_dim, batch_first=True)
+        
+#         self.batch_norm2 = nn.BatchNorm1d(regress_hidden_dim)
+#         self.lstm2 = nn.LSTM(regress_hidden_dim, regress_hidden_dim, batch_first=True)
+        
+#         self.flatten = nn.Flatten()
+
+#         self.disease_proj = nn.Sequential(
+#             nn.Linear(regress_hidden_dim, regress_hidden_dim // 2),
+#             nn.ReLU(),
+#             nn.LayerNorm(regress_hidden_dim // 2)
+#         )
+#         self.speaker_proj = nn.Sequential(
+#             nn.Linear(regress_hidden_dim, regress_hidden_dim // 2),
+#             nn.ReLU(),
+#             nn.LayerNorm(regress_hidden_dim // 2)
+#         )
+
+#         self.disease_clf = nn.Sequential(
+#             nn.Linear(regress_hidden_dim // 2, regress_hidden_dim // 4),
+#             nn.ReLU(),
+#             nn.Dropout(0.2),
+#             nn.Linear(regress_hidden_dim // 4, output_dim)
+#         )
+
+#         # speaker classifier receives GRL-wrapped features during training
+#         self.speaker_clf = nn.Sequential(
+#             nn.Linear(regress_hidden_dim // 2, regress_hidden_dim // 4),
+#             nn.ReLU(),
+#             nn.Dropout(0.2),
+#             nn.Linear(regress_hidden_dim // 4, spk_dim)
+#         )
+#         self.gender_clf = nn.Sequential(
+#             nn.Linear(regress_hidden_dim // 2, regress_hidden_dim // 4),
+#             nn.ReLU(),
+#             nn.Dropout(0.2),
+#             nn.Linear(regress_hidden_dim // 4, 2)
+#         )
+
+#     def forward(self, x, lengths=None, grl_lambda=0.0):
+#         x = x.permute(0, 2, 1)
+#         x = self.batch_norm1(x.transpose(1, 2)).transpose(1, 2)
+#         x, _ = self.lstm1(x)
+        
+#         # x = self.batch_norm2(x.transpose(1, 2)).transpose(1, 2)
+#         # x, _ = self.lstm2(x)
+#         hidden_states = self.flatten(x[:, -1, :])
+
+#         d_emb = self.disease_proj(hidden_states)    # disease embedding
+#         s_emb = self.speaker_proj(hidden_states)    # speaker embedding
+
+#         disease_logits = self.disease_clf(d_emb)
+
+#         # adversarial path: reverse gradients on the speaker classifier's input
+#         s_in = grad_reverse(s_emb, grl_lambda) if self.training and grl_lambda > 0 else s_emb
+#         speaker_logits = self.speaker_clf(s_in)
+        
+#         return {
+#             "disease_logits": disease_logits,
+#             "speaker_logits": speaker_logits,
+#             "d_emb": d_emb,
+#             "s_emb": s_emb
+#         }
+
+# class MyOwnCNNGradReversal(nn.Module):
+#     def __init__(self, input_size, regress_hidden_dim, num_transformer_layers, output_dim, spk_dim, **kwargs):
+#         super(MyOwnCNNGradReversal, self).__init__()
+
+#         self.feature_cnn = nn.Sequential(
+#             nn.Conv1d(input_size, 128, kernel_size=5, padding=2),
+#             nn.ReLU(),
+#             nn.BatchNorm1d(128),
+#             nn.Conv1d(128, 256, kernel_size=3, padding=1),
+#             nn.ReLU(),
+#             nn.BatchNorm1d(256),
+#             nn.Conv1d(256, 256, kernel_size=3, padding=1),
+#             nn.ReLU(),
+#             nn.BatchNorm1d(256)
+#         )
+
+#         embed_dim = 1024
+#         num_heads = 16
+#         dropout = 0.1
+
+#         self.layer_norm = nn.LayerNorm(256, eps=1e-05)  # 256 is the output of feature_cnn
+#         self.projection = nn.Linear(256, embed_dim)  # Project to WavLM hidden size (1024)
+#         self.dropout = nn.Dropout(dropout)
+
+#         self.pos_conv_embed = nn.Conv1d(
+#             embed_dim, embed_dim, kernel_size=128, padding=64, groups=16
+#         )
+#         self.transformer_layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+
+#         self.attention_layers = nn.ModuleList([
+#             nn.TransformerEncoderLayer(
+#                 d_model=embed_dim,
+#                 nhead=num_heads,
+#                 dim_feedforward=embed_dim * 4,  # 4096 for WavLM-large
+#                 dropout=dropout,
+#                 activation='gelu',  # WavLM uses GELU
+#                 layer_norm_eps=1e-5,
+#                 batch_first=True,
+#                 norm_first=True  # Pre-norm like WavLM
+#             ) for _ in range(num_transformer_layers)
+#         ])
+#         self.final_layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+#         self.layer_weights = nn.Parameter(torch.ones(num_transformer_layers + 1))
+#         self.pooling = nn.AdaptiveAvgPool1d(1)
+
+#         # Projection layers for multi-task learning
+#         self.disease_proj = nn.Sequential(
+#             nn.Linear(embed_dim, embed_dim // 2),
+#             nn.GELU(),  # Use GELU like WavLM
+#             nn.LayerNorm(embed_dim // 2, eps=1e-5),
+#             nn.Dropout(dropout)
+#         )
+#         self.speaker_proj = nn.Sequential(
+#             nn.Linear(embed_dim, embed_dim // 2),
+#             nn.GELU(),
+#             nn.LayerNorm(embed_dim // 2, eps=1e-5),
+#             nn.Dropout(dropout)
+#         )
+
+#         # Classifiers
+#         self.disease_clf = nn.Sequential(
+#             nn.Linear(embed_dim // 2, embed_dim // 4),
+#             nn.GELU(),
+#             nn.Dropout(dropout),
+#             nn.Linear(embed_dim // 4, output_dim)
+#         )
+
+#         self.speaker_clf = nn.Sequential(
+#             nn.Linear(embed_dim // 2, embed_dim // 4),
+#             nn.GELU(),
+#             nn.Dropout(dropout),
+#             nn.Linear(embed_dim // 4, spk_dim)
+#         )
+        
+#         self.gender_clf = nn.Sequential(
+#             nn.Linear(embed_dim // 2, embed_dim // 4),
+#             nn.GELU(),
+#             nn.Dropout(dropout),
+#             nn.Linear(embed_dim // 4, 2)
+#         )
+
+
+#     def forward(self, x, lengths=None, grl_lambda=0.0):
+#         x = self.feature_cnn(x)  # torch.Size([128, 256, 32])
+
+#         x = x.transpose(1, 2)  # [B, T, C] for layer norm
+#         x = self.layer_norm(x)  # Apply layer norm
+#         x = self.projection(x)   # Project to hidden size
+#         x = self.dropout(x)      # Apply dropout
+#         hidden_states = x        # Now has shape [B, T, hidden_size]
+
+#         pos_conv_output = self.pos_conv_embed(hidden_states.transpose(1, 2))
+#         pos_conv_output = pos_conv_output.transpose(1, 2)
+#         min_seq_len = min(hidden_states.size(1), pos_conv_output.size(1))
+#         hidden_states = hidden_states[:, :min_seq_len, :]
+#         pos_conv_output = pos_conv_output[:, :min_seq_len, :]
+
+#         hidden_states = hidden_states + pos_conv_output
+#         hidden_states = self.transformer_layer_norm(hidden_states)
+
+#         layer_outputs = [hidden_states]
+
+#         for layer in self.attention_layers:
+#             hidden_states = layer(hidden_states)
+#             layer_outputs.append(hidden_states)
+        
+#         hidden_states = self.final_layer_norm(hidden_states)
+#         layer_outputs[-1] = hidden_states
+#         layer_weights_normalized = torch.softmax(self.layer_weights, dim=0)
+#         weighted_hidden_states = torch.zeros_like(hidden_states)
+#         for i, layer_output in enumerate(layer_outputs):
+#             weighted_hidden_states += layer_weights_normalized[i] * layer_output
+        
+#         hidden_states = weighted_hidden_states.transpose(1, 2)  # [B, embed_dim, T]
+#         feature_embedding = self.pooling(hidden_states).squeeze(-1)  # [B, embed_dim]
+        
+#         d_emb = self.disease_proj(feature_embedding)    
+#         s_emb = self.speaker_proj(feature_embedding) 
+
+#         disease_logits = self.disease_clf(d_emb)
+
+#         s_in = grad_reverse(s_emb, grl_lambda) if self.training and grl_lambda > 0 else s_emb
+#         speaker_logits = self.speaker_clf(s_in)
+#         gender_logits = self.gender_clf(s_in)
+
+#         return {
+#             "disease_logits": disease_logits,
+#             "speaker_logits": speaker_logits,
+#             "gender_logits": gender_logits,
+#             "d_emb": d_emb,
+#             "s_emb": s_emb,
+#         }
+
+# class MyOwnResNet101(torchvision.models.resnet.ResNet):
+#     def __init__(self, dummy, output_dim, spk_dim, track_bn=True, **kwargs):
+#         def norm_layer(*args, **kwargs):
+#             return nn.BatchNorm2d(*args, **kwargs, track_running_stats=track_bn)
+#         super().__init__(torchvision.models.resnet.Bottleneck, [3, 4, 23, 3], norm_layer=norm_layer, num_classes=output_dim)
+#         #del self.fc
+#         #self.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+#         self.final_feat_dim = 2048
+#         self.grad_cam = False
+        
+#         self.preprocess = torchvision.transforms.Compose([
+#             torchvision.transforms.Resize((224, 224)),
+#             torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+#         ])
+
+#         # Projection layers for multi-task learning
+#         self.disease_proj = nn.Sequential(
+#             nn.Linear(self.final_feat_dim, self.final_feat_dim // 2),
+#             nn.GELU(),  # Use GELU like WavLM
+#             nn.LayerNorm(self.final_feat_dim // 2, eps=1e-5),
+#             nn.Dropout(0.1)
+#         )
+#         self.speaker_proj = nn.Sequential(
+#             nn.Linear(self.final_feat_dim, self.final_feat_dim // 2),
+#             nn.GELU(),
+#             nn.LayerNorm(self.final_feat_dim // 2, eps=1e-5),
+#             nn.Dropout(0.1)
+#         )
+
+#         # Classifiers
+#         self.disease_clf = nn.Sequential(
+#             nn.Linear(self.final_feat_dim // 2, self.final_feat_dim // 4),
+#             nn.GELU(),
+#             nn.Dropout(0.1),
+#             nn.Linear(self.final_feat_dim // 4, output_dim)
+#         )
+
+#         self.speaker_clf = nn.Sequential(
+#             nn.Linear(self.final_feat_dim // 2, self.final_feat_dim // 4),
+#             nn.GELU(),
+#             nn.Dropout(0.1),
+#             nn.Linear(self.final_feat_dim // 4, spk_dim)
+#         )
+        
+#         self.gender_clf = nn.Sequential(
+#             nn.Linear(self.final_feat_dim // 2, self.final_feat_dim // 4),
+#             nn.GELU(),
+#             nn.Dropout(0.1),
+#             nn.Linear(self.final_feat_dim // 4, 2)
+#         )
+
+#     def load_sl_official_weights(self, progress=True):
+#         state_dict = load_state_dict_from_url(torchvision.models.resnet.ResNet101_Weights.IMAGENET1K_V2.url,
+#                                               progress=progress)
+
+#         #del state_dict['conv1.weight']
+#         missing, unexpected = self.load_state_dict(state_dict, strict=False)
+#         # if len(missing) > 0:
+#             # raise AssertionError('Model code may be incorrect')
+
+#     def load_ssl_official_weights(self, progress=True):
+#         raise NotImplemented
+
+#     def _forward_impl(self, x: Tensor, lengths=None) -> Tensor:
+#         # See note [TorchScript super()]
+#         if self.grad_cam == True:
+#             x = x
+#         else:
+#             x = x.unsqueeze(1)
+#             x = x.repeat(1, 3, 1, 1)
+#             x = self.preprocess(x)
+
+#         x = self.conv1(x)
+#         x = self.bn1(x)
+#         x = self.relu(x)
+#         x = self.maxpool(x)
+
+#         x = self.layer1(x)
+#         x = self.layer2(x)
+#         x = self.layer3(x)
+#         x = self.layer4(x)
+
+#         x = self.avgpool(x)
+#         x = torch.flatten(x, 1)
+
+#         return x
     
-class DownstreamMT(nn.Module):
-    def __init__(self, input_size, output_dim, **kwargs):
-        super(DownstreamMT, self).__init__()
+#     def forward(self, x: Tensor, lengths=None, grl_lambda=0.0) -> Tensor:
+#         feature_embedding = self._forward_impl(x, lengths)
+
+#         d_emb = self.disease_proj(feature_embedding)    
+#         s_emb = self.speaker_proj(feature_embedding) 
+
+#         disease_logits = self.disease_clf(d_emb)
+
+#         s_in = grad_reverse(s_emb, grl_lambda) if self.training and grl_lambda > 0 else s_emb
+#         speaker_logits = self.speaker_clf(s_in)
+#         gender_logits = self.gender_clf(s_in)
+
+#         return {
+#             "disease_logits": disease_logits,
+#             "speaker_logits": speaker_logits,
+#             "gender_logits": gender_logits,
+#             "d_emb": d_emb,
+#             "s_emb": s_emb,
+#         } 
+
+# class ResNet101(torchvision.models.resnet.ResNet):
+#     def __init__(self, dummy, output_dim, track_bn=True, **kwargs):
+#         def norm_layer(*args, **kwargs):
+#             return nn.BatchNorm2d(*args, **kwargs, track_running_stats=track_bn)
+#         super().__init__(torchvision.models.resnet.Bottleneck, [3, 4, 23, 3], norm_layer=norm_layer, num_classes=output_dim)
+#         #del self.fc
+#         self.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+#         self.final_feat_dim = 2048
+#         self.grad_cam = False
+#          # TODO : Coba tambah Rezize and Normalization
+#         # self.preprocess = torchvision.transforms.Compose([
+#         #     torchvision.transforms.Resize((224, 224))
+#         # ])
+
+#     def load_sl_official_weights(self, progress=True):
+#         state_dict = load_state_dict_from_url(torchvision.models.resnet.ResNet101_Weights.IMAGENET1K_V2.url,
+#                                               progress=progress)
+
+#         del state_dict['conv1.weight']
+#         missing, unexpected = self.load_state_dict(state_dict, strict=False)
+#         # if len(missing) > 0:
+#             # raise AssertionError('Model code may be incorrect')
+
+#     def load_ssl_official_weights(self, progress=True):
+#         raise NotImplemented
+
+#     def _forward_impl(self, x: Tensor, lengths=None) -> Tensor:
+#         # See note [TorchScript super()]
+#         if self.grad_cam == True:
+#             x = x
+#         else:
+#             x = x.unsqueeze(1)
+#             #x = self.preprocess(x)
+
+#         x = self.conv1(x)
+#         x = self.bn1(x)
+#         x = self.relu(x)
+#         x = self.maxpool(x)
+
+#         x = self.layer1(x)
+#         x = self.layer2(x)
+#         x = self.layer3(x)
+#         x = self.layer4(x)
+
+#         x = self.avgpool(x)
+#         x = torch.flatten(x, 1)
+#         x = self.fc(x)
+
+#         return [x, 0.0, 0.0]
+
+
+# class Eff_MyOwn1(nn.Module):
+#     def __init__(self, input_size, regress_hidden_dim, output_dim, **kwargs):
+#         super(Eff_MyOwn1, self).__init__()
+
+#         self.target_size = (240, 240)
+#         self.cnn1 = torch.nn.Conv2d(1, 3, kernel_size=3)
+#         self.efficientnet = EfficientNet.from_pretrained('efficientnet-b5') #
+#         # self.efficientnet = EfficientNet.from_name("efficientnet-b0", include_top=False, drop_connect_rate=0.1) # [128, 1280, 1, 1]
+
+#         self.dense = nn.Linear(1000, 1000)
+#         self.dropout = nn.Dropout(0.1)
+#         self.out_proj = nn.Linear(1000, output_dim)
+
+
+#     def forward(self, x):
+#         x = x.permute(0, 2, 1).unsqueeze(1) # [128, 1, 94, 64]
+#         x = F.interpolate(x, size=self.target_size, mode="bilinear", align_corners=False)
+#         x = self.cnn1(x) # [128, 3, 92, 62]
+#         x = self.efficientnet(x) # 
+#         x = self.dropout(x)
+#         x = self.dense(x)
+#         x = torch.tanh(x)
+#         x = self.dropout(x)
+#         x = self.out_proj(x)
         
-        #self.weights = nn.Parameter(torch.rand(25, 1))
-        self.pooling = nn.AdaptiveAvgPool1d(1) 
+#         return x
 
-        # Classification
-        self.dse_cls = classifier_network(input_size, 0.1, output_dim)       # CrossEntrop
-        self.binary_classifiers = nn.ModuleList([])
-        #self.reg_classifiers = nn.ModuleList([])
+# class WavLM_MyOwn1(nn.Module):
+#     def __init__(self, input_size, regress_hidden_dim, output_dim, **kwargs):
+#         super(WavLM_MyOwn1, self).__init__()
 
-        self.binary_classifiers.append(classifier_network(input_size, 0.1, 1150))
-        for i in range(3):
-            self.binary_classifiers.append(classifier_network(input_size, 0.1,1))
-        self.binary_classifiers.append(classifier_network(input_size, 0.1, 10))
-        # for i in range(2):
-        #     self.reg_classifiers.append(classifier_network(1))
+#         config = AutoConfig.from_pretrained("microsoft/wavlm-large")
+#         self.feature_extractor = layers.WavLMFeatureEncoder(config)
+#         self.feature_projection = layers.WavLMFeatureProjection(config)
 
-    def forward(self, x, lengths=None):
-        # layer_reps = x.hidden_states  # torch.Size([25, 8, 547, 1024])
-        # x = torch.stack(layer_reps).permute(1, 3, 2, 0)
-        # weights_normalized = nn.functional.softmax(self.weights, dim=0)
-        # feats_final = torch.matmul(x, weights_normalized.squeeze())
-        hidden_states = self.pooling(x.permute(0, 2, 1)).squeeze(-1)  # [64, 1024]
+#         embed_dim=1024
+#         num_heads=8
+#         dropout=0.1
 
-        output = []
-        output.append(self.dse_cls(hidden_states))
-        for i, head in enumerate(self.binary_classifiers):
-            output.append(head(hidden_states))
-
-        # for i, head in enumerate(self.reg_classifiers):
-        #     output.append(head(hidden_states))
-
-        return [output, hidden_states]
-
-class Whisper_MyOwn1(nn.Module):
-    def __init__(self, input_size, regress_hidden_dim, output_dim, **kwargs):
-        super(Whisper_MyOwn1, self).__init__()
+#         self.attention = nn.TransformerEncoderLayer(
+#             d_model=embed_dim,
+#             nhead=num_heads,
+#             dim_feedforward=embed_dim * 4,
+#             dropout=dropout,
+#             activation='relu',
+#             batch_first=True  # [B, T, E]
+#         )
+#         self.encoder = nn.TransformerEncoder(self.attention, num_layers=1)
+#         self.pooling = nn.AdaptiveAvgPool1d(1)  # or use mean over time dimension
         
-        self.max_audio_len = 3
-        self.mel_extractor = AutoFeatureExtractor.from_pretrained("openai/whisper-large-v3", chunk_length=self.max_audio_len)
-        config = AutoConfig.from_pretrained("openai/whisper-large-v3")
-        config.max_source_positions = 150
-        self.feature_extractor = layers.WhisperFeatureEncoder(config)
+#         #self.dse_cls = classifier_network(embed_dim, 0.1, output_dim) # CrossEntrop
+#         #self.binary_classifiers = nn.ModuleList([])
+#         #self.reg_classifiers = nn.ModuleList([])
 
-        embed_dim=1280
-        num_heads=8
-        dropout=0.1
-
-        self.attention = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=embed_dim * 4,
-            dropout=dropout,
-            activation='relu',
-            batch_first=True  # [B, T, E]
-        )
-        self.encoder = nn.TransformerEncoder(self.attention, num_layers=1)
-        self.pooling = nn.AdaptiveAvgPool1d(1)  # or use mean over time dimension
-        self.classifier = nn.Linear(embed_dim, output_dim)
-
-    def forward(self, x, lengths=None):
-        x = self.mel_extractor(x.detach().cpu().tolist(), return_tensors="pt", sampling_rate=16000, max_length=self.max_audio_len * 16000).input_features.cuda()
-        extract_features = self.feature_extractor(x) # torch.Size([64, 150, 1280])
-
-        hidden_states = self.encoder(extract_features)  # Self-attention over time → same shape [64, 74, 1024]
-        hidden_states = hidden_states.transpose(1, 2)  # [64, 1024, 74] for pooling over time
-        hidden_states = self.pooling(hidden_states).squeeze(-1)  # [64, 1024]
-        out = self.classifier(hidden_states)  # [64,0 2]
-
-        loss_internal = 0.0
-        return [out, hidden_states, loss_internal]
+#         # self.binary_classifiers.append(classifier_network(input_size, 0.1, 1150))
+#         # for i in range(3):
+#         #     self.binary_classifiers.append(classifier_network(input_size, 0.1,1))
+#         # self.binary_classifiers.append(classifier_network(input_size, 0.1, 10))
+#         self.dense = nn.Linear(embed_dim, embed_dim)
+#         self.dropout = nn.Dropout(0.1)
+#         self.out_proj = nn.Linear(embed_dim, output_dim)
 
 
-class SinusoidalPositionalEmbedding(nn.Module):
-    def __init__(self, dim, max_len=150):
-        super().__init__()
-        pe = torch.zeros(max_len, dim)
-        position = torch.arange(0, max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, dim, 2) * (-math.log(10000.0) / dim))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # Shape: [1, max_len, dim]
-        self.register_buffer('pe', pe)
+#     def forward(self, x, lengths=None):
+#         extract_features = self.feature_extractor(x)
+#         extract_features = extract_features.transpose(1, 2)
+#         hidden_states, extract_features = self.feature_projection(extract_features) # B, T, D
 
-    def forward(self, x):
-        # x: (batch, seq_len, dim)
-        return self.pe[:, :x.size(1)].clone().detach()
-
-class MyOwn2(nn.Module):
-    def __init__(self, input_size, regress_hidden_dim, output_dim, **kwargs):
-        super(MyOwn2, self).__init__()
+#         hidden_states = self.encoder(hidden_states)  # Self-attention over time → same shape [64, 74, 1024]
+#         hidden_states = hidden_states.transpose(1, 2)  # [64, 1024, 74] for pooling over time
+#         hidden_states = self.pooling(hidden_states).squeeze(-1)  # [64, 1024]
         
-        config = AutoConfig.from_pretrained("microsoft/wavlm-large")
-        self.feature_extractor = layers.WavLMFeatureEncoder(config)
-        self.feature_projection = layers.WavLMFeatureProjection(config)
+#         hidden_states = self.dropout(hidden_states)
+#         hidden_states = self.dense(hidden_states)
+#         hidden_states = torch.tanh(hidden_states)
+#         hidden_states = self.dropout(hidden_states)
+#         output = self.out_proj(hidden_states)
+#         return output
+    
+# class WavLM_MyOwnGradeReversal(nn.Module):
+#     def __init__(self, input_size, regress_hidden_dim, num_transformer_layers, output_dim, spk_dim, **kwargs):
+#         super(WavLM_MyOwnGradeReversal, self).__init__()
 
-        embed_dim=1024
-        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
-        self.pos_embed = SinusoidalPositionalEmbedding(embed_dim) # torch.Size([1, 50, 1024])
-        self.dropout = nn.Dropout(0.1)
+#         config = AutoConfig.from_pretrained("microsoft/wavlm-large")
+#         self.feature_extractor = layers.WavLMFeatureEncoder(config)
+#         self.feature_projection = layers.WavLMFeatureProjection(config)
 
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=1, dim_feedforward=512)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
+#         embed_dim = 1024
+#         num_heads = 16
+#         dropout = 0.1
 
-        self.classifier = nn.Linear(embed_dim, output_dim)
+#         self.pos_conv_embed = nn.Conv1d(
+#             embed_dim, embed_dim, kernel_size=128, padding=64, groups=16
+#         )
+#         self.layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
 
-    def forward(self, x, lengths=None):
-        extract_features = self.feature_extractor(x)
-        extract_features = extract_features.transpose(1, 2)
-        hidden_states, extract_features = self.feature_projection(extract_features) # B, T, D
+#         self.attention_layers = nn.ModuleList([
+#             nn.TransformerEncoderLayer(
+#                 d_model=embed_dim,
+#                 nhead=num_heads,
+#                 dim_feedforward=embed_dim * 4,  # 4096 for WavLM-large
+#                 dropout=dropout,
+#                 activation='gelu',  # WavLM uses GELU
+#                 layer_norm_eps=1e-5,
+#                 batch_first=True,
+#                 norm_first=True  # Pre-norm like WavLM
+#             ) for _ in range(num_transformer_layers)
+#         ])
+#         self.final_layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+#         self.layer_weights = nn.Parameter(torch.ones(num_transformer_layers + 1))
+#         self.pooling = nn.AdaptiveAvgPool1d(1)
 
-        b, n, _ = hidden_states.shape
-        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b) # B, 1, D
-        hidden_states = torch.cat((cls_tokens, hidden_states), dim=1) 
-        hidden_states = hidden_states + self.pos_embed(hidden_states)
-        hidden_states = self.dropout(hidden_states)
+#         # Projection layers for multi-task learning
+#         self.disease_proj = nn.Sequential(
+#             nn.Linear(embed_dim, embed_dim // 2),
+#             nn.GELU(),  # Use GELU like WavLM
+#             nn.LayerNorm(embed_dim // 2, eps=1e-5),
+#             nn.Dropout(dropout)
+#         )
+#         self.speaker_proj = nn.Sequential(
+#             nn.Linear(embed_dim, embed_dim // 2),
+#             nn.GELU(),
+#             nn.LayerNorm(embed_dim // 2, eps=1e-5),
+#             nn.Dropout(dropout)
+#         )
 
-        hidden_states = self.transformer(hidden_states)
-        cls_output = hidden_states[:, 0]
-        output = self.classifier(cls_output)
+#         # Classifiers
+#         self.disease_clf = nn.Sequential(
+#             nn.Linear(embed_dim // 2, embed_dim // 4),
+#             nn.GELU(),
+#             nn.Dropout(dropout),
+#             nn.Linear(embed_dim // 4, output_dim)
+#         )
+
+#         self.speaker_clf = nn.Sequential(
+#             nn.Linear(embed_dim // 2, embed_dim // 4),
+#             nn.GELU(),
+#             nn.Dropout(dropout),
+#             nn.Linear(embed_dim // 4, spk_dim)
+#         )
         
-        loss_internal = 0.0
-        return [output, hidden_states, loss_internal]
+#         self.gender_clf = nn.Sequential(
+#             nn.Linear(embed_dim // 2, embed_dim // 4),
+#             nn.GELU(),
+#             nn.Dropout(dropout),
+#             nn.Linear(embed_dim // 4, 2)
+#         )
 
-class VisionTransformerCoba(torchvision.models.vision_transformer.VisionTransformer):
-    def __init__(self, dummy, output_dim, track_bn=True, **kwargs):
-        def norm_layer(*args, **kwargs):
-            return nn.LayerNorm(*args, **kwargs, eps=1e-6)
-        super().__init__(image_size=518, patch_size=14, num_layers=32, num_heads=16, hidden_dim=1280, mlp_dim=5120, norm_layer=norm_layer, num_classes=output_dim)
+
+#     def forward(self, x, lengths=None, grl_lambda=0.0):
+#         extract_features = self.feature_extractor(x)
+#         extract_features = extract_features.transpose(1, 2)
+#         hidden_states, extract_features = self.feature_projection(extract_features) # B, T, D
+
+#         pos_conv_output = self.pos_conv_embed(hidden_states.transpose(1, 2))
+#         pos_conv_output = pos_conv_output.transpose(1, 2)
+#         min_seq_len = min(hidden_states.size(1), pos_conv_output.size(1))
+#         hidden_states = hidden_states[:, :min_seq_len, :]
+#         pos_conv_output = pos_conv_output[:, :min_seq_len, :]
+
+#         hidden_states = hidden_states + pos_conv_output
+#         hidden_states = self.layer_norm(hidden_states)
+
+#         layer_outputs = [hidden_states]
+
+#         for layer in self.attention_layers:
+#             hidden_states = layer(hidden_states)
+#             layer_outputs.append(hidden_states)
         
-        del self.heads
-        self.grad_cam = False
+#         hidden_states = self.final_layer_norm(hidden_states)
+#         layer_outputs[-1] = hidden_states
+#         layer_weights_normalized = torch.softmax(self.layer_weights, dim=0)
+#         weighted_hidden_states = torch.zeros_like(hidden_states)
+#         for i, layer_output in enumerate(layer_outputs):
+#             weighted_hidden_states += layer_weights_normalized[i] * layer_output
+        
+#         hidden_states = weighted_hidden_states.transpose(1, 2)  # [B, embed_dim, T]
+#         feature_embedding = self.pooling(hidden_states).squeeze(-1)  # [B, embed_dim]
+        
+#         d_emb = self.disease_proj(feature_embedding)    
+#         s_emb = self.speaker_proj(feature_embedding) 
 
-        heads_layers: OrderedDict[str, nn.Module] = OrderedDict()
-        heads_layers["head"] = nn.Linear(1280, output_dim)
-        self.heads = nn.Sequential(heads_layers)
-        self.preprocess = torchvision.transforms.Compose([
-            torchvision.transforms.Resize((518,518))
-        ])
+#         disease_logits = self.disease_clf(d_emb)
 
-    def load_sl_official_weights(self, progress=True):
-        state_dict = load_state_dict_from_url(torchvision.models.vision_transformer.ViT_H_14_Weights.IMAGENET1K_SWAG_E2E_V1.url,
-                                              progress=progress)
+#         s_in = grad_reverse(s_emb, grl_lambda) if self.training and grl_lambda > 0 else s_emb
+#         speaker_logits = self.speaker_clf(s_in)
+#         gender_logits = self.gender_clf(s_in)
 
-        #del state_dict['conv1.weight']
-        missing, unexpected = self.load_state_dict(state_dict, strict=False)
-        # if len(missing) > 0:
-            # raise AssertionError('Model code may be incorrect')
+#         return {
+#             "disease_logits": disease_logits,
+#             "speaker_logits": speaker_logits,
+#             "gender_logits": gender_logits,
+#             "d_emb": d_emb,
+#             "s_emb": s_emb,
+#         }
+    
+# class DownstreamMT(nn.Module):
+#     def __init__(self, input_size, output_dim, **kwargs):
+#         super(DownstreamMT, self).__init__()
+        
+#         #self.weights = nn.Parameter(torch.rand(25, 1))
+#         self.pooling = nn.AdaptiveAvgPool1d(1) 
 
-    def load_ssl_official_weights(self, progress=True):
-        raise NotImplemented
+#         # Classification
+#         self.dse_cls = classifier_network(input_size, 0.1, output_dim)       # CrossEntrop
+#         self.binary_classifiers = nn.ModuleList([])
+#         #self.reg_classifiers = nn.ModuleList([])
 
-    def _process_input(self, x: torch.Tensor) -> torch.Tensor:
-        n, c, h, w = x.shape
-        p = self.patch_size
-        torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
-        torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
-        n_h = h // p
-        n_w = w // p
+#         self.binary_classifiers.append(classifier_network(input_size, 0.1, 1150))
+#         for i in range(3):
+#             self.binary_classifiers.append(classifier_network(input_size, 0.1,1))
+#         self.binary_classifiers.append(classifier_network(input_size, 0.1, 10))
+#         # for i in range(2):
+#         #     self.reg_classifiers.append(classifier_network(1))
 
-        # (n, c, h, w) -> (n, hidden_dim, n_h, n_w)
-        x = x.repeat(1, 3, 1, 1)
-        x = self.conv_proj(x)
-        # (n, hidden_dim, n_h, n_w) -> (n, hidden_dim, (n_h * n_w))
-        x = x.reshape(n, self.hidden_dim, n_h * n_w)
+#     def forward(self, x, lengths=None):
+#         # layer_reps = x.hidden_states  # torch.Size([25, 8, 547, 1024])
+#         # x = torch.stack(layer_reps).permute(1, 3, 2, 0)
+#         # weights_normalized = nn.functional.softmax(self.weights, dim=0)
+#         # feats_final = torch.matmul(x, weights_normalized.squeeze())
+#         hidden_states = self.pooling(x.permute(0, 2, 1)).squeeze(-1)  # [64, 1024]
 
-        # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
-        # The self attention layer expects inputs in the format (N, S, E)
-        # where S is the source sequence length, N is the batch size, E is the
-        # embedding dimension
-        x = x.permute(0, 2, 1)
+#         output = []
+#         output.append(self.dse_cls(hidden_states))
+#         for i, head in enumerate(self.binary_classifiers):
+#             output.append(head(hidden_states))
 
-        return x
+#         # for i, head in enumerate(self.reg_classifiers):
+#         #     output.append(head(hidden_states))
 
-    def forward(self, x: torch.Tensor, lengths=None):
-        if self.grad_cam == True:
-            x = x
-        else:
-            x = x.unsqueeze(1)
+#         return [output, hidden_states]
 
-        # Reshape and permute the input tensor
-        x = self.preprocess(x)
-        x = self._process_input(x)
-        n = x.shape[0]
+# class Whisper_MyOwn1(nn.Module):
+#     def __init__(self, input_size, regress_hidden_dim, output_dim, **kwargs):
+#         super(Whisper_MyOwn1, self).__init__()
+        
+#         self.max_audio_len = 3
+#         self.mel_extractor = AutoFeatureExtractor.from_pretrained("openai/whisper-large-v3", chunk_length=self.max_audio_len)
+#         config = AutoConfig.from_pretrained("openai/whisper-large-v3")
+#         config.max_source_positions = 150
+#         self.feature_extractor = layers.WhisperFeatureEncoder(config)
 
-        # Expand the class token to the full batch
-        batch_class_token = self.class_token.expand(n, -1, -1)
-        x = torch.cat([batch_class_token, x], dim=1)
+#         embed_dim=1280
+#         num_heads=8
+#         dropout=0.1
 
-        x = self.encoder(x)
+#         self.attention = nn.TransformerEncoderLayer(
+#             d_model=embed_dim,
+#             nhead=num_heads,
+#             dim_feedforward=embed_dim * 4,
+#             dropout=dropout,
+#             activation='relu',
+#             batch_first=True  # [B, T, E]
+#         )
+#         self.encoder = nn.TransformerEncoder(self.attention, num_layers=1)
+#         self.pooling = nn.AdaptiveAvgPool1d(1)  # or use mean over time dimension
+#         self.classifier = nn.Linear(embed_dim, output_dim)
 
-        # Classifier "token" as used by standard language architectures
-        x = x[:, 0]
+#     def forward(self, x, lengths=None):
+#         x = self.mel_extractor(x.detach().cpu().tolist(), return_tensors="pt", sampling_rate=16000, max_length=self.max_audio_len * 16000).input_features.cuda()
+#         extract_features = self.feature_extractor(x) # torch.Size([64, 150, 1280])
 
-        x = self.heads(x)
+#         hidden_states = self.encoder(extract_features)  # Self-attention over time → same shape [64, 74, 1024]
+#         hidden_states = hidden_states.transpose(1, 2)  # [64, 1024, 74] for pooling over time
+#         hidden_states = self.pooling(hidden_states).squeeze(-1)  # [64, 1024]
+#         out = self.classifier(hidden_states)  # [64,0 2]
 
-        return [x, 0.0, 0.0]
+#         loss_internal = 0.0
+#         return [out, hidden_states, loss_internal]
 
-class InceptionV3(torchvision.models.inception.Inception3):
-    def __init__(self, dummy, output_dim, track_bn=True, **kwargs):
-        super().__init__(num_classes=output_dim, aux_logits=False)
-        #del self.fc
-        self.Conv2d_1a_3x3 = torchvision.models.inception.BasicConv2d(1, 32, kernel_size=3, stride=2)
-        self.final_feat_dim = 2048
-        self.preprocess = torchvision.transforms.Compose([
-            torchvision.transforms.Resize((299, 299)),
-        ])
+
+# class SinusoidalPositionalEmbedding(nn.Module):
+#     def __init__(self, dim, max_len=150):
+#         super().__init__()
+#         pe = torch.zeros(max_len, dim)
+#         position = torch.arange(0, max_len).unsqueeze(1)
+#         div_term = torch.exp(torch.arange(0, dim, 2) * (-math.log(10000.0) / dim))
+#         pe[:, 0::2] = torch.sin(position * div_term)
+#         pe[:, 1::2] = torch.cos(position * div_term)
+#         pe = pe.unsqueeze(0)  # Shape: [1, max_len, dim]
+#         self.register_buffer('pe', pe)
+
+#     def forward(self, x):
+#         # x: (batch, seq_len, dim)
+#         return self.pe[:, :x.size(1)].clone().detach()
+
+# class MyOwn2(nn.Module):
+#     def __init__(self, input_size, regress_hidden_dim, output_dim, **kwargs):
+#         super(MyOwn2, self).__init__()
+        
+#         config = AutoConfig.from_pretrained("microsoft/wavlm-large")
+#         self.feature_extractor = layers.WavLMFeatureEncoder(config)
+#         self.feature_projection = layers.WavLMFeatureProjection(config)
+
+#         embed_dim=1024
+#         self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+#         self.pos_embed = SinusoidalPositionalEmbedding(embed_dim) # torch.Size([1, 50, 1024])
+#         self.dropout = nn.Dropout(0.1)
+
+#         encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=1, dim_feedforward=512)
+#         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
+
+#         self.classifier = nn.Linear(embed_dim, output_dim)
+
+#     def forward(self, x, lengths=None):
+#         extract_features = self.feature_extractor(x)
+#         extract_features = extract_features.transpose(1, 2)
+#         hidden_states, extract_features = self.feature_projection(extract_features) # B, T, D
+
+#         b, n, _ = hidden_states.shape
+#         cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b) # B, 1, D
+#         hidden_states = torch.cat((cls_tokens, hidden_states), dim=1) 
+#         hidden_states = hidden_states + self.pos_embed(hidden_states)
+#         hidden_states = self.dropout(hidden_states)
+
+#         hidden_states = self.transformer(hidden_states)
+#         cls_output = hidden_states[:, 0]
+#         output = self.classifier(cls_output)
+        
+#         loss_internal = 0.0
+#         return [output, hidden_states, loss_internal]
+
+# class VisionTransformerCoba(torchvision.models.vision_transformer.VisionTransformer):
+#     def __init__(self, dummy, output_dim, track_bn=True, **kwargs):
+#         def norm_layer(*args, **kwargs):
+#             return nn.LayerNorm(*args, **kwargs, eps=1e-6)
+#         super().__init__(image_size=518, patch_size=14, num_layers=32, num_heads=16, hidden_dim=1280, mlp_dim=5120, norm_layer=norm_layer, num_classes=output_dim)
+        
+#         del self.heads
+#         self.grad_cam = False
+
+#         heads_layers: OrderedDict[str, nn.Module] = OrderedDict()
+#         heads_layers["head"] = nn.Linear(1280, output_dim)
+#         self.heads = nn.Sequential(heads_layers)
+#         self.preprocess = torchvision.transforms.Compose([
+#             torchvision.transforms.Resize((518,518))
+#         ])
+
+#     def load_sl_official_weights(self, progress=True):
+#         state_dict = load_state_dict_from_url(torchvision.models.vision_transformer.ViT_H_14_Weights.IMAGENET1K_SWAG_E2E_V1.url,
+#                                               progress=progress)
+
+#         #del state_dict['conv1.weight']
+#         missing, unexpected = self.load_state_dict(state_dict, strict=False)
+#         # if len(missing) > 0:
+#             # raise AssertionError('Model code may be incorrect')
+
+#     def load_ssl_official_weights(self, progress=True):
+#         raise NotImplemented
+
+#     def _process_input(self, x: torch.Tensor) -> torch.Tensor:
+#         n, c, h, w = x.shape
+#         p = self.patch_size
+#         torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
+#         torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
+#         n_h = h // p
+#         n_w = w // p
+
+#         # (n, c, h, w) -> (n, hidden_dim, n_h, n_w)
+#         x = x.repeat(1, 3, 1, 1)
+#         x = self.conv_proj(x)
+#         # (n, hidden_dim, n_h, n_w) -> (n, hidden_dim, (n_h * n_w))
+#         x = x.reshape(n, self.hidden_dim, n_h * n_w)
+
+#         # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
+#         # The self attention layer expects inputs in the format (N, S, E)
+#         # where S is the source sequence length, N is the batch size, E is the
+#         # embedding dimension
+#         x = x.permute(0, 2, 1)
+
+#         return x
+
+#     def forward(self, x: torch.Tensor, lengths=None):
+#         if self.grad_cam == True:
+#             x = x
+#         else:
+#             x = x.unsqueeze(1)
+
+#         # Reshape and permute the input tensor
+#         x = self.preprocess(x)
+#         x = self._process_input(x)
+#         n = x.shape[0]
+
+#         # Expand the class token to the full batch
+#         batch_class_token = self.class_token.expand(n, -1, -1)
+#         x = torch.cat([batch_class_token, x], dim=1)
+
+#         x = self.encoder(x)
+
+#         # Classifier "token" as used by standard language architectures
+#         x = x[:, 0]
+
+#         x = self.heads(x)
+
+#         return [x, 0.0, 0.0]
+
+# class InceptionV3(torchvision.models.inception.Inception3):
+#     def __init__(self, dummy, output_dim, track_bn=True, **kwargs):
+#         super().__init__(num_classes=output_dim, aux_logits=False)
+#         #del self.fc
+#         self.Conv2d_1a_3x3 = torchvision.models.inception.BasicConv2d(1, 32, kernel_size=3, stride=2)
+#         self.final_feat_dim = 2048
+#         self.preprocess = torchvision.transforms.Compose([
+#             torchvision.transforms.Resize((299, 299)),
+#         ])
        
 
-    def load_sl_official_weights(self, progress=True):
-        state_dict = load_state_dict_from_url(torchvision.models.inception.Inception_V3_Weights.IMAGENET1K_V1.url,
-                                              progress=progress)
+#     def load_sl_official_weights(self, progress=True):
+#         state_dict = load_state_dict_from_url(torchvision.models.inception.Inception_V3_Weights.IMAGENET1K_V1.url,
+#                                               progress=progress)
 
-        del state_dict['Conv2d_1a_3x3.weight']
-        missing, unexpected = self.load_state_dict(state_dict, strict=False)
-        # if len(missing) > 0:
-            # raise AssertionError('Model code may be incorrect')
+#         del state_dict['Conv2d_1a_3x3.weight']
+#         missing, unexpected = self.load_state_dict(state_dict, strict=False)
+#         # if len(missing) > 0:
+#             # raise AssertionError('Model code may be incorrect')
 
-    def load_ssl_official_weights(self, progress=True):
-        raise NotImplemented
+#     def load_ssl_official_weights(self, progress=True):
+#         raise NotImplemented
 
-    def _forward(self, x: Tensor) -> Tensor:
-        x = x.unsqueeze(1)
-        x = self.preprocess(x)
-        # N x 3 x 299 x 299
-        x = self.Conv2d_1a_3x3(x)
-        # N x 32 x 149 x 149
-        x = self.Conv2d_2a_3x3(x)
-        # N x 32 x 147 x 147
-        x = self.Conv2d_2b_3x3(x)
-        # N x 64 x 147 x 147
-        x = self.maxpool1(x)
-        # N x 64 x 73 x 73
-        x = self.Conv2d_3b_1x1(x)
-        # N x 80 x 73 x 73
-        x = self.Conv2d_4a_3x3(x)
-        # N x 192 x 71 x 71
-        x = self.maxpool2(x)
-        # N x 192 x 35 x 35
-        x = self.Mixed_5b(x)
-        # N x 256 x 35 x 35
-        x = self.Mixed_5c(x)
-        # N x 288 x 35 x 35
-        x = self.Mixed_5d(x)
-        # N x 288 x 35 x 35
-        x = self.Mixed_6a(x)
-        # N x 768 x 17 x 17
-        x = self.Mixed_6b(x)
-        # N x 768 x 17 x 17
-        x = self.Mixed_6c(x)
-        # N x 768 x 17 x 17
-        x = self.Mixed_6d(x)
-        # N x 768 x 17 x 17
-        x = self.Mixed_6e(x)
-        # N x 768 x 17 x 17
-        aux: Optional[Tensor] = None
-        if self.AuxLogits is not None:
-            if self.training:
-                aux = self.AuxLogits(x)
-        # N x 768 x 17 x 17
-        x = self.Mixed_7a(x)
-        # N x 1280 x 8 x 8
-        x = self.Mixed_7b(x)
-        # N x 2048 x 8 x 8
-        x = self.Mixed_7c(x)
-        # N x 2048 x 8 x 8
-        # Adaptive average pooling
-        x = self.avgpool(x)
-        # N x 2048 x 1 x 1
-        x = self.dropout(x)
-        # N x 2048 x 1 x 1
-        x = torch.flatten(x, 1)
-        # N x 2048
-        x = self.fc(x)
-        # N x 1000 (num_classes)
-        return x, aux
+#     def _forward(self, x: Tensor) -> Tensor:
+#         x = x.unsqueeze(1)
+#         x = self.preprocess(x)
+#         # N x 3 x 299 x 299
+#         x = self.Conv2d_1a_3x3(x)
+#         # N x 32 x 149 x 149
+#         x = self.Conv2d_2a_3x3(x)
+#         # N x 32 x 147 x 147
+#         x = self.Conv2d_2b_3x3(x)
+#         # N x 64 x 147 x 147
+#         x = self.maxpool1(x)
+#         # N x 64 x 73 x 73
+#         x = self.Conv2d_3b_1x1(x)
+#         # N x 80 x 73 x 73
+#         x = self.Conv2d_4a_3x3(x)
+#         # N x 192 x 71 x 71
+#         x = self.maxpool2(x)
+#         # N x 192 x 35 x 35
+#         x = self.Mixed_5b(x)
+#         # N x 256 x 35 x 35
+#         x = self.Mixed_5c(x)
+#         # N x 288 x 35 x 35
+#         x = self.Mixed_5d(x)
+#         # N x 288 x 35 x 35
+#         x = self.Mixed_6a(x)
+#         # N x 768 x 17 x 17
+#         x = self.Mixed_6b(x)
+#         # N x 768 x 17 x 17
+#         x = self.Mixed_6c(x)
+#         # N x 768 x 17 x 17
+#         x = self.Mixed_6d(x)
+#         # N x 768 x 17 x 17
+#         x = self.Mixed_6e(x)
+#         # N x 768 x 17 x 17
+#         aux: Optional[Tensor] = None
+#         if self.AuxLogits is not None:
+#             if self.training:
+#                 aux = self.AuxLogits(x)
+#         # N x 768 x 17 x 17
+#         x = self.Mixed_7a(x)
+#         # N x 1280 x 8 x 8
+#         x = self.Mixed_7b(x)
+#         # N x 2048 x 8 x 8
+#         x = self.Mixed_7c(x)
+#         # N x 2048 x 8 x 8
+#         # Adaptive average pooling
+#         x = self.avgpool(x)
+#         # N x 2048 x 1 x 1
+#         x = self.dropout(x)
+#         # N x 2048 x 1 x 1
+#         x = torch.flatten(x, 1)
+#         # N x 2048
+#         x = self.fc(x)
+#         # N x 1000 (num_classes)
+#         return x, aux
     
-class LSTMModel1(nn.Module):
-    def __init__(self, input_size, pooling_hidden, p_dropout, output_dim, **kwargs):
-        super(LSTMModel1, self).__init__()
+# class LSTMModel1(nn.Module):
+#     def __init__(self, input_size, pooling_hidden, p_dropout, output_dim, **kwargs):
+#         super(LSTMModel1, self).__init__()
         
-        self.batch_norm1 = nn.BatchNorm1d(input_size)
-        self.lstm1 = nn.LSTM(input_size, pooling_hidden, batch_first=True)
+#         self.batch_norm1 = nn.BatchNorm1d(input_size)
+#         self.lstm1 = nn.LSTM(input_size, pooling_hidden, batch_first=True)
         
-        self.batch_norm2 = nn.BatchNorm1d(pooling_hidden)
-        self.lstm2 = nn.LSTM(pooling_hidden, pooling_hidden, batch_first=True)
+#         self.batch_norm2 = nn.BatchNorm1d(pooling_hidden)
+#         self.lstm2 = nn.LSTM(pooling_hidden, pooling_hidden, batch_first=True)
         
-        #self.attention = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=8, batch_first=True)
+#         #self.attention = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=8, batch_first=True)
 
-        self.flatten = nn.Flatten()
-        self.dropout = nn.Dropout(p_dropout)
-        self.fc = nn.Linear(pooling_hidden, output_dim)
+#         self.flatten = nn.Flatten()
+#         self.dropout = nn.Dropout(p_dropout)
+#         self.fc = nn.Linear(pooling_hidden, output_dim)
 
-    def forward(self, x, lengths=None):
-        # x -> [10, 13, 125]
-        x = x.permute(0, 2, 1)
-        x = self.batch_norm1(x.transpose(1, 2)).transpose(1, 2)
-        x, _ = self.lstm1(x)
+#     def forward(self, x, lengths=None):
+#         # x -> [10, 13, 125]
+#         x = x.permute(0, 2, 1)
+#         x = self.batch_norm1(x.transpose(1, 2)).transpose(1, 2)
+#         x, _ = self.lstm1(x)
         
-        x = self.batch_norm2(x.transpose(1, 2)).transpose(1, 2)
-        x, _ = self.lstm2(x)
+#         x = self.batch_norm2(x.transpose(1, 2)).transpose(1, 2)
+#         x, _ = self.lstm2(x)
         
-        # attn_output, _ = self.attention(x, x, x)
-        # x = torch.mean(attn_output, dim=1)
+#         # attn_output, _ = self.attention(x, x, x)
+#         # x = torch.mean(attn_output, dim=1)
 
-        x = self.flatten(x[:, -1, :])
-        x = self.dropout(x)
-        x = self.fc(x)
-        return x
+#         x = self.flatten(x[:, -1, :])
+#         x = self.dropout(x)
+#         x = self.fc(x)
+#         return x
 
-class CNNClassifier(nn.Module):
-    def __init__(self, dummy, output_dim, **kwargs):
-        super(CNNClassifier, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=(3, 3), padding=1)
-        self.bn1 = nn.BatchNorm2d(16)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=(3, 3), padding=1)
-        self.bn2 = nn.BatchNorm2d(32)
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))  # Global average pooling
-        self.fc = nn.Linear(32, output_dim)
+# class CNNClassifier(nn.Module):
+#     def __init__(self, dummy, output_dim, **kwargs):
+#         super(CNNClassifier, self).__init__()
+#         self.conv1 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=(3, 3), padding=1)
+#         self.bn1 = nn.BatchNorm2d(16)
+#         self.conv2 = nn.Conv2d(16, 32, kernel_size=(3, 3), padding=1)
+#         self.bn2 = nn.BatchNorm2d(32)
+#         self.pool = nn.AdaptiveAvgPool2d((1, 1))  # Global average pooling
+#         self.fc = nn.Linear(32, output_dim)
 
-    def forward(self, x, lengths=None):
-        # x shape: [B, Feat_Dim, T]
-        x = x.unsqueeze(1)  # shape becomes [B, 1, Feat_Dim, T]
-        x = F.relu(self.bn1(self.conv1(x)))  # [B, 16, Feat_Dim, T]
-        x = F.relu(self.bn2(self.conv2(x)))  # [B, 32, Feat_Dim, T]
-        x = self.pool(x)  # [B, 32, 1, 1]
-        x = x.view(x.size(0), -1)  # Flatten to [B, 32]
-        x = self.fc(x)  # [B, num_classes]
-        return x
+#     def forward(self, x, lengths=None):
+#         # x shape: [B, Feat_Dim, T]
+#         x = x.unsqueeze(1)  # shape becomes [B, 1, Feat_Dim, T]
+#         x = F.relu(self.bn1(self.conv1(x)))  # [B, 16, Feat_Dim, T]
+#         x = F.relu(self.bn2(self.conv2(x)))  # [B, 32, Feat_Dim, T]
+#         x = self.pool(x)  # [B, 32, 1, 1]
+#         x = x.view(x.size(0), -1)  # Flatten to [B, 32]
+#         x = self.fc(x)  # [B, num_classes]
+#         return x
 
-##### VIT
-class ViT(nn.Module):
-    def __init__(self, dummmy, output_dim, image_size=256, patch_size=32, dim=1024, depth=6, heads=8, mlp_dim=2048, pool = 'cls', channels = 1, dim_head = 64, dropout = 0., emb_dropout = 0., **kwargs):
-        super().__init__()
-        image_height, image_width = commons.pair(image_size)
-        patch_height, patch_width = commons.pair(patch_size)
+# ##### VIT
+# class ViT(nn.Module):
+#     def __init__(self, dummmy, output_dim, image_size=256, patch_size=32, dim=1024, depth=6, heads=8, mlp_dim=2048, pool = 'cls', channels = 1, dim_head = 64, dropout = 0., emb_dropout = 0., **kwargs):
+#         super().__init__()
+#         image_height, image_width = commons.pair(image_size)
+#         patch_height, patch_width = commons.pair(patch_size)
 
-        assert image_height % patch_height == 0 and image_width % patch_width == 0, 'Image dimensions must be divisible by the patch size.'
+#         assert image_height % patch_height == 0 and image_width % patch_width == 0, 'Image dimensions must be divisible by the patch size.'
 
-        num_patches = (image_height // patch_height) * (image_width // patch_width)
-        patch_dim = channels * patch_height * patch_width
-        assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
+#         num_patches = (image_height // patch_height) * (image_width // patch_width)
+#         patch_dim = channels * patch_height * patch_width
+#         assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
 
-        self.pretrain = False
-        self.preprocess = torchvision.transforms.Compose([
-            torchvision.transforms.Resize((256,256))
-        ])
+#         self.pretrain = False
+#         self.preprocess = torchvision.transforms.Compose([
+#             torchvision.transforms.Resize((256,256))
+#         ])
 
-        self.to_patch_embedding = nn.Sequential(
-            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width),
-            nn.LayerNorm(patch_dim),
-            nn.Linear(patch_dim, dim),
-            nn.LayerNorm(dim),
-        )
+#         self.to_patch_embedding = nn.Sequential(
+#             Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width),
+#             nn.LayerNorm(patch_dim),
+#             nn.Linear(patch_dim, dim),
+#             nn.LayerNorm(dim),
+#         )
 
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
-        self.dropout = nn.Dropout(emb_dropout)
+#         self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+#         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+#         self.dropout = nn.Dropout(emb_dropout)
 
-        self.transformer = modules.TransformerVIT(dim, depth, heads, dim_head, mlp_dim, dropout)
+#         self.transformer = modules.TransformerVIT(dim, depth, heads, dim_head, mlp_dim, dropout)
 
-        self.pool = pool
-        self.to_latent = nn.Identity()
+#         self.pool = pool
+#         self.to_latent = nn.Identity()
 
-        self.mlp_head = nn.Linear(dim, output_dim)
+#         self.mlp_head = nn.Linear(dim, output_dim)
 
-    def forward(self, img):
-        if self.pretrain == False:
-            img = img.unsqueeze(1)
-            img = self.preprocess(img)
+#     def forward(self, img):
+#         if self.pretrain == False:
+#             img = img.unsqueeze(1)
+#             img = self.preprocess(img)
 
-        x = self.to_patch_embedding(img)
-        b, n, _ = x.shape
+#         x = self.to_patch_embedding(img)
+#         b, n, _ = x.shape
 
-        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x += self.pos_embedding[:, :(n + 1)]
-        x = self.dropout(x)
+#         cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b)
+#         x = torch.cat((cls_tokens, x), dim=1)
+#         x += self.pos_embedding[:, :(n + 1)]
+#         x = self.dropout(x)
 
-        x = self.transformer(x)
+#         x = self.transformer(x)
 
-        x = x.mean(dim = 1) if self.pool == 'mean' else x[:, 0]
+#         x = x.mean(dim = 1) if self.pool == 'mean' else x[:, 0]
 
-        x = self.to_latent(x)
-        return self.mlp_head(x)
+#         x = self.to_latent(x)
+#         return self.mlp_head(x)
 
-class SimMIM(nn.Module):
-    def __init__(
-        self,
-        *,
-        encoder,
-        masking_ratio = 0.5
-    ):
-        super().__init__()
-        assert masking_ratio > 0 and masking_ratio < 1, 'masking ratio must be kept between 0 and 1'
-        self.masking_ratio = masking_ratio
+# class SimMIM(nn.Module):
+#     def __init__(
+#         self,
+#         *,
+#         encoder,
+#         masking_ratio = 0.5
+#     ):
+#         super().__init__()
+#         assert masking_ratio > 0 and masking_ratio < 1, 'masking ratio must be kept between 0 and 1'
+#         self.masking_ratio = masking_ratio
 
-        # extract some hyperparameters and functions from encoder (vision transformer to be trained)
+#         # extract some hyperparameters and functions from encoder (vision transformer to be trained)
 
-        self.encoder = encoder
-        num_patches, encoder_dim = encoder.pos_embedding.shape[-2:]
+#         self.encoder = encoder
+#         num_patches, encoder_dim = encoder.pos_embedding.shape[-2:]
 
-        self.to_patch = encoder.to_patch_embedding[0]
-        self.patch_to_emb = nn.Sequential(*encoder.to_patch_embedding[1:])
+#         self.to_patch = encoder.to_patch_embedding[0]
+#         self.patch_to_emb = nn.Sequential(*encoder.to_patch_embedding[1:])
 
-        pixel_values_per_patch = encoder.to_patch_embedding[2].weight.shape[-1]
+#         pixel_values_per_patch = encoder.to_patch_embedding[2].weight.shape[-1]
 
-        # simple linear head
+#         # simple linear head
 
-        self.mask_token = nn.Parameter(torch.randn(encoder_dim))
-        self.to_pixels = nn.Linear(encoder_dim, pixel_values_per_patch)
+#         self.mask_token = nn.Parameter(torch.randn(encoder_dim))
+#         self.to_pixels = nn.Linear(encoder_dim, pixel_values_per_patch)
 
-    def forward(self, img):
-        device = img.device
+#     def forward(self, img):
+#         device = img.device
 
-        # get patches
+#         # get patches
 
-        patches = self.to_patch(img)
-        batch, num_patches, *_ = patches.shape
+#         patches = self.to_patch(img)
+#         batch, num_patches, *_ = patches.shape
 
-        # for indexing purposes
+#         # for indexing purposes
 
-        batch_range = torch.arange(batch, device = device)[:, None]
+#         batch_range = torch.arange(batch, device = device)[:, None]
 
-        # get positions
+#         # get positions
 
-        pos_emb = self.encoder.pos_embedding[:, 1:(num_patches + 1)]
+#         pos_emb = self.encoder.pos_embedding[:, 1:(num_patches + 1)]
 
-        # patch to encoder tokens and add positions
+#         # patch to encoder tokens and add positions
 
-        tokens = self.patch_to_emb(patches)
-        tokens = tokens + pos_emb
+#         tokens = self.patch_to_emb(patches)
+#         tokens = tokens + pos_emb
 
-        # prepare mask tokens
+#         # prepare mask tokens
 
-        mask_tokens = repeat(self.mask_token, 'd -> b n d', b = batch, n = num_patches)
-        mask_tokens = mask_tokens + pos_emb
+#         mask_tokens = repeat(self.mask_token, 'd -> b n d', b = batch, n = num_patches)
+#         mask_tokens = mask_tokens + pos_emb
 
-        # calculate of patches needed to be masked, and get positions (indices) to be masked
+#         # calculate of patches needed to be masked, and get positions (indices) to be masked
 
-        num_masked = int(self.masking_ratio * num_patches)
-        masked_indices = torch.rand(batch, num_patches, device = device).topk(k = num_masked, dim = -1).indices
-        masked_bool_mask = torch.zeros((batch, num_patches), device = device).scatter_(-1, masked_indices, 1).bool()
+#         num_masked = int(self.masking_ratio * num_patches)
+#         masked_indices = torch.rand(batch, num_patches, device = device).topk(k = num_masked, dim = -1).indices
+#         masked_bool_mask = torch.zeros((batch, num_patches), device = device).scatter_(-1, masked_indices, 1).bool()
 
-        # mask tokens
+#         # mask tokens
 
-        tokens = torch.where(masked_bool_mask[..., None], mask_tokens, tokens)
+#         tokens = torch.where(masked_bool_mask[..., None], mask_tokens, tokens)
 
-        # attend with vision transformer
+#         # attend with vision transformer
 
-        encoded = self.encoder.transformer(tokens)
+#         encoded = self.encoder.transformer(tokens)
 
-        # get the masked tokens
+#         # get the masked tokens
 
-        encoded_mask_tokens = encoded[batch_range, masked_indices]
+#         encoded_mask_tokens = encoded[batch_range, masked_indices]
 
-        # small linear projection for predicted pixel values
+#         # small linear projection for predicted pixel values
 
-        pred_pixel_values = self.to_pixels(encoded_mask_tokens)
+#         pred_pixel_values = self.to_pixels(encoded_mask_tokens)
 
-        # get the masked patches for the final reconstruction loss
+#         # get the masked patches for the final reconstruction loss
 
-        masked_patches = patches[batch_range, masked_indices]
+#         masked_patches = patches[batch_range, masked_indices]
 
-        # calculate reconstruction loss
+#         # calculate reconstruction loss
 
-        recon_loss = F.l1_loss(pred_pixel_values, masked_patches) / num_masked
-        return recon_loss
+#         recon_loss = F.l1_loss(pred_pixel_values, masked_patches) / num_masked
+#         return recon_loss
 
-class SimpleMaskedModel(nn.Module):
-    def __init__(self, dummy, output_dim, **kwargs):
-        super(SimpleMaskedModel, self).__init__()
+# class SimpleMaskedModel(nn.Module):
+#     def __init__(self, dummy, output_dim, **kwargs):
+#         super(SimpleMaskedModel, self).__init__()
 
-        self.preprocess = torchvision.transforms.Compose([
-            torchvision.transforms.Resize((256,256))
-        ])
+#         self.preprocess = torchvision.transforms.Compose([
+#             torchvision.transforms.Resize((256,256))
+#         ])
 
-        self.v = ViT(
-            image_size = 256,
-            patch_size = 32,
-            num_classes = output_dim,
-            dim = 1024,
-            depth = 6,
-            heads = 8,
-            mlp_dim = 2048,
-            channels=1
-        )
+#         self.v = ViT(
+#             image_size = 256,
+#             patch_size = 32,
+#             num_classes = output_dim,
+#             dim = 1024,
+#             depth = 6,
+#             heads = 8,
+#             mlp_dim = 2048,
+#             channels=1
+#         )
 
-        self.mim = SimMIM(
-            encoder = self.v,
-            masking_ratio = 0.5  # they found 50% to yield the best results
-        )
+#         self.mim = SimMIM(
+#             encoder = self.v,
+#             masking_ratio = 0.5  # they found 50% to yield the best results
+#         )
 
-    def forward(self, x):
-        # x shape: [128, 80, 32]
-        x = x.unsqueeze(1)
-        x = self.preprocess(x)
-        loss = self.mim(x)
-        return loss
+#     def forward(self, x):
+#         # x shape: [128, 80, 32]
+#         x = x.unsqueeze(1)
+#         x = self.preprocess(x)
+#         loss = self.mim(x)
+#         return loss
 
-#################### REG SSL ###########################
-class HeadCatPrediction(nn.Module):
-    def __init__(self, pooling_hidden, regress_hidden_dim, regress_dropout, regress_layers, output_dim, **kwargs):
-        super(HeadCatPrediction, self).__init__()
+# #################### REG SSL ###########################
+# class HeadCatPrediction(nn.Module):
+#     def __init__(self, pooling_hidden, regress_hidden_dim, regress_dropout, regress_layers, output_dim, **kwargs):
+#         super(HeadCatPrediction, self).__init__()
 
-        self.inp_drop = nn.Dropout(regress_dropout)
-        self.fc=nn.ModuleList([nn.Sequential(
-                nn.Linear(pooling_hidden, regress_hidden_dim), 
-                nn.LayerNorm(regress_hidden_dim), nn.ReLU(), nn.Dropout(regress_dropout))])
+#         self.inp_drop = nn.Dropout(regress_dropout)
+#         self.fc=nn.ModuleList([nn.Sequential(
+#                 nn.Linear(pooling_hidden, regress_hidden_dim), 
+#                 nn.LayerNorm(regress_hidden_dim), nn.ReLU(), nn.Dropout(regress_dropout))])
 
-        for lidx in range(regress_layers-1):
-            self.fc.append(nn.Sequential(
-                    nn.Linear(regress_hidden_dim, regress_hidden_dim), 
-                    nn.LayerNorm(regress_hidden_dim), nn.ReLU(), nn.Dropout(regress_dropout)))
+#         for lidx in range(regress_layers-1):
+#             self.fc.append(nn.Sequential(
+#                     nn.Linear(regress_hidden_dim, regress_hidden_dim), 
+#                     nn.LayerNorm(regress_hidden_dim), nn.ReLU(), nn.Dropout(regress_dropout)))
 
-        self.out = nn.Sequential(nn.Linear(regress_hidden_dim, output_dim))
+#         self.out = nn.Sequential(nn.Linear(regress_hidden_dim, output_dim))
 
-        self.dense = nn.Linear(pooling_hidden, regress_hidden_dim)
-        self.dropout = nn.Dropout(regress_dropout)
-        self.out_proj = nn.Linear(regress_hidden_dim, output_dim)
+#         self.dense = nn.Linear(pooling_hidden, regress_hidden_dim)
+#         self.dropout = nn.Dropout(regress_dropout)
+#         self.out_proj = nn.Linear(regress_hidden_dim, output_dim)
 
-    # def get_repr(self, x):
-    #     h = self.inp_drop(x)
-    #     for lidx, fc in enumerate(self.fc):
-    #         h=fc(h)
-    #     return h
+#     # def get_repr(self, x):
+#     #     h = self.inp_drop(x)
+#     #     for lidx, fc in enumerate(self.fc):
+#     #         h=fc(h)
+#     #     return h
 
-    def forward(self, x):
-        x = self.dropout(x)
-        x = self.dense(x)
-        x = torch.tanh(x)
-        x = self.dropout(x)
-        out_dim = self.out_proj(x)
-        # h = self.get_repr(x)
-        # out_dim = self.out(h)
-        return out_dim
+#     def forward(self, x):
+#         x = self.dropout(x)
+#         x = self.dense(x)
+#         x = torch.tanh(x)
+#         x = self.dropout(x)
+#         out_dim = self.out_proj(x)
+#         # h = self.get_repr(x)
+#         # out_dim = self.out(h)
+#         return out_dim
+
+# import numpy as np
+# class SELDModel(nn.Module):
+#     """
+#     SELD (Sound Event Localization and Detection) model combining ConvBlock, recurrent, and attention-based layers.
+#     Supports audio-only and audio_visual input.
+#     """
+#     def __init__(self, params, **kwargs):
+#         super().__init__()
+
+#         self.nb_conv_blocks = 3
+#         self.nb_conv_filters= 64
+#         self.f_pool_size= [4, 4, 2]
+#         self.t_pool_size= [5, 1, 1]
+#         self.dropout= 0.05
+
+#         self.rnn_size= 128
+#         self.nb_rnn_layers= 2
+#         self.nb_self_attn_layers= 2
+#         self.nb_attn_heads= 8
+#         self.nb_transformer_layers= 2
+
+#         self.params = params
+#         # Conv layers
+#         self.conv_blocks = nn.ModuleList()
+#         for conv_cnt in range(self.nb_conv_blocks):
+#             self.conv_blocks.append(modules.ConvBlock(in_channels=self.nb_conv_filters if conv_cnt else 2,  # stereo
+#                                               out_channels=self.nb_conv_filters,
+#                                               pool_size=(self.t_pool_size[conv_cnt], self.f_pool_size[conv_cnt]),
+#                                               dropout=self.dropout))
+
+#         # GRU layers
+#         self.gru_input_dim = self.nb_conv_filters * int(np.floor(80 / np.prod(self.f_pool_size)))
+#         self.gru = torch.nn.GRU(input_size=self.gru_input_dim, hidden_size=self.rnn_size, num_layers=self.nb_rnn_layers,
+#                                 batch_first=True, dropout=self.dropout, bidirectional=True)
+
+#         # Self attention layers
+#         self.mhsa_layers = nn.ModuleList([nn.MultiheadAttention(embed_dim=self.rnn_size, num_heads=self.nb_attn_heads,
+#                                   dropout=self.dropout, batch_first=True) for _ in range(self.nb_self_attn_layers)])
+#         self.layer_norms = nn.ModuleList([nn.LayerNorm(self.rnn_size) for _ in range(self.nb_self_attn_layers)])
+
+#         # # Fusion layers
+#         # if params['modality'] == 'audio_visual':
+#         #     self.visual_embed_to_d_model = nn.Linear(in_features=params['resnet_feature_size'], out_features=params['rnn_size'])
+#         #     self.transformer_decoder_layer = nn.TransformerDecoderLayer(d_model=params['rnn_size'], nhead=params['nb_attn_heads'], batch_first=True)
+#         #     self.transformer_decoder = nn.TransformerDecoder(self.transformer_decoder_layer, num_layers=params['nb_transformer_layers'])
+
+#         self.fnn_list = torch.nn.ModuleList()
+#         for fc_cnt in range(1):
+#             self.fnn_list.append(nn.Linear(128 if fc_cnt else 128, 128, bias=True))
+
+#         # if params['multiACCDOA']:
+#         #     if params['modality'] == 'audio_visual':
+#         #         self.output_dim = params['max_polyphony'] * 4 * params['nb_classes']  # 4 => (x,y), distance, on/off
+#         #     else:
+#         #         self.output_dim = params['max_polyphony'] * 3 * params['nb_classes']  # 3 => (x,y), distance
+#         # else:
+#         #     if params['modality'] == 'audio_visual':
+#         #         self.output_dim = 4 * params['nb_classes']  # 4 => (x,y), distance, on/off
+#         #     else:
+#         #         self.output_dim = 3 * params['nb_classes']  # 3 => (x,y), distance
+#         self.output_dim = 2
+#         self.fnn_list.append(nn.Linear(128 if 1 else 128, self.output_dim, bias=True))
+
+#         # self.doa_act = nn.Tanh()
+#         # self.dist_act = nn.ReLU()
+#         # if params['modality'] == 'audio_visual':
+#         #     self.onscreen_act = nn.Sigmoid()
+
+#     def forward(self, audio_feat, vid_feat=None):
+#         """
+#         Forward pass for the SELD model.
+#         audio_feat: Tensor of shape (batch_size, 2, 251, 64) (stereo spectrogram input).
+#         vid_feat: Optional tensor of shape (batch_size, 50, 7, 7) (visual feature map).
+#         Returns:  Tensor of shape
+#                   (batch_size, 50, 117) - audio - multiACCDOA.
+#                   (batch_size, 50, 39)  - audio - singleACCDOA.
+#                   (batch_size, 50, 156) - audio_visual - multiACCDOA.
+#                   (batch_size, 50, 52) - audio_visual - singleACCDOA.
+
+#         """
+#         # audio feat - B x 2 x 251 x 64 -> 251 to 63
+#         #print(audio_feat.permute(0, 2, 1).unsqueeze(1).shape)
+#         audio_feat = audio_feat.permute(0, 2, 1).unsqueeze(1).repeat(1, 2, 1, 1)
+#         for conv_block in self.conv_blocks:
+#             audio_feat = conv_block(audio_feat)  # B x 64 x 50 x 2
+
+#         audio_feat = audio_feat.transpose(1, 2).contiguous()  # B x 50 x 64 x 2
+#         audio_feat = audio_feat.view(audio_feat.shape[0], audio_feat.shape[1], -1).contiguous()  # B x 50 x 128
+
+#         (audio_feat, _) = self.gru(audio_feat)
+#         audio_feat = torch.tanh(audio_feat)
+#         audio_feat = audio_feat[:, :, audio_feat.shape[-1] // 2:] * audio_feat[:, :, :audio_feat.shape[-1] // 2]
+
+#         for mhsa, ln in zip(self.mhsa_layers, self.layer_norms):
+#             audio_feat_in = audio_feat
+#             audio_feat, _ = mhsa(audio_feat_in, audio_feat_in, audio_feat_in)
+#             audio_feat = audio_feat + audio_feat_in  # Residual connection
+#             audio_feat = ln(audio_feat)
+
+#         # if vid_feat is not None:
+#         #     vid_feat = vid_feat.view(vid_feat.shape[0], vid_feat.shape[1], -1)  # b x 50 x 49
+#         #     vid_feat = self.visual_embed_to_d_model(vid_feat)
+#         #     fused_feat = self.transformer_decoder(audio_feat, vid_feat)
+#         # else:
+#         fused_feat = audio_feat
+
+        
+#         for fnn_cnt in range(len(self.fnn_list) - 1):
+#             fused_feat = self.fnn_list[fnn_cnt](fused_feat)
+#         pred = self.fnn_list[-1](fused_feat)
+#         pred = pred.mean(dim=1)
+
+#         # if self.params['modality'] == 'audio':
+#         #     if self.params['multiACCDOA']:
+#         #         # pred shape is batch,50,117 - 117 is 3 tracks x 3 (doa-x, doa-y, dist) x 13 classes
+#         #         pred = pred.reshape(pred.size(0), pred.size(1), 3, 3, 13)
+#         #         doa_pred = pred[:, :, :, 0:2, :]
+#         #         dist_pred = pred[:, :, :, 2:3, :]
+#         #         doa_pred = self.doa_act(doa_pred)
+#         #         dist_pred = self.dist_act(dist_pred)
+#         #         pred = torch.cat((doa_pred, dist_pred), dim=3)
+#         #         pred = pred.reshape(pred.size(0), pred.size(1), -1)
+#         #     else:
+#         #         # pred shape is batch,50,39 - 39 is 3 (doa-x, doa-y, dist) x 13 classes
+#         #         pred = pred.reshape(pred.size(0), pred.size(1), 3, 13)
+#         #         doa_pred = pred[:, :,  0:2, :]
+#         #         dist_pred = pred[:, :, 2:3, :]
+#         #         doa_pred = self.doa_act(doa_pred)
+#         #         dist_pred = self.dist_act(dist_pred)
+#         #         pred = torch.cat((doa_pred, dist_pred), dim=2)
+#         #         pred = pred.reshape(pred.size(0), pred.size(1), -1)
+
+#         return pred
