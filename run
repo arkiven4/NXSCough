@@ -29,4 +29,11 @@ done
     --fraction 1.0
 
 
-python train.py --init --model_name disen_senet --config_path configs/general.json
+python train.py --init --model_name nonstatify_augmentmany_resnet_spectogram --config_path configs/general.json
+
+python evaluate.py --model_name nonstatify_disen_resnet
+
+for d in logs/*nonstatify*/; do
+    model_name=$(basename "$d")
+    python evaluate.py --model_name "$model_name"
+done

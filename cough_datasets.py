@@ -21,6 +21,7 @@ class CoughDatasets(torch.utils.data.Dataset):
         self.audiopaths_and_text = shuffle(data_numpy, random_state=20)
         self.hop_length = hparams.hop_length
         self.max_wav_value = hparams.max_wav_value
+        self.mean_std_norm = hparams.mean_std_norm
         self.sampling_rate = hparams.sampling_rate
         self.saming_length = hparams.saming_length
         self.desired_length = hparams.desired_length
@@ -34,6 +35,9 @@ class CoughDatasets(torch.utils.data.Dataset):
         self.augment_data = hparams.augment_data
         self.augment_rawboost = hparams.augment_rawboost
         self.multimask_augment = hparams.multimask_augment
+        self.tau = getattr(hparams, "tau", 0.0)
+        self.nu = getattr(hparams, "nu", 0.0)
+        self.num_masks = getattr(hparams, "num_masks", 0)
         self.mix_audio = hparams.mix_audio
         self.nClasses = hparams.many_class
         print(self.train)
@@ -42,7 +46,13 @@ class CoughDatasets(torch.utils.data.Dataset):
             print("Use Data Augmentation")
             self.data_augmentator = DataAugmentator(None, "/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_noises_labels.tsv",
                 None, "/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_rirs_labels.tsv",
-                5.5, ["apply_reverb", "add_background_noise"]) # "apply_pitch_shift"
+                5.5, ["apply_speed_perturbation", "apply_reverb", "add_background_noise", "apply_pitch_shift", "apply_random_gain"]) # "" apply_reverb add_background_noise
+
+        if self.mean_std_norm:
+            with open(f"wav_stats.pickle", 'rb') as f:
+                stats = pickle.load(f)
+                self.wav_mean, self.wav_std = stats["mean_db"], stats["std_db"]
+                print(self.wav_mean)
 
         self.wav_transform = None
         if hparams.acoustic_feature:
@@ -55,13 +65,18 @@ class CoughDatasets(torch.utils.data.Dataset):
                                 hparams.n_mel_channels, hparams.sampling_rate, hparams.mel_fmin,
                                 hparams.mel_fmax)
             elif hparams.feature_type == "spectogram":
-                self.wav_transform = T.Spectrogram(
-                    n_fft=hparams.win_length,
-                    hop_length=hparams.hop_length,
-                    power=2.0,
-                    window_fn=torch.hann_window,
-                    center=True,
-                    normalized=False
+                self.wav_transform = lambda wav: torch.tensor(
+                    librosa.amplitude_to_db(
+                        np.abs(
+                            librosa.stft(
+                                y=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
+                                n_fft=hparams.filter_length,
+                                hop_length=hparams.hop_length
+                            )
+                        ),
+                        ref=np.max
+                    ),
+                    dtype=torch.float32
                 )
         
         if self.mix_audio == True:
@@ -121,9 +136,13 @@ class CoughDatasets(torch.utils.data.Dataset):
             eye = np.eye(self.nClasses)
             dse_id = (eye[dse_id]).astype(np.float32)
             dse_id = torch.from_numpy(dse_id).unsqueeze(0)
-        
-        max_val = torch.max(torch.abs(wav)) # Does It need again?
-        wav = wav / max_val if max_val != 0 else wav
+ 
+        if self.max_wav_value:
+            max_val = torch.max(torch.abs(wav)) # Does It need again?
+            wav = wav / max_val if max_val != 0 else wav
+        if self.mean_std_norm:
+            wav = (wav - self.wav_mean) / (self.wav_std + 1e-6)
+
         wav = wav.unsqueeze(0)
 
         if self.wav_transform != None:
@@ -133,7 +152,7 @@ class CoughDatasets(torch.utils.data.Dataset):
             #wav = torch.cat([wav, delta, delta2], dim=0)
             
             if self.multimask_augment == True and self.train == True:
-                wav = audio_processing.multi_mask_spectrogram(wav, tau=24, nu=15, num_masks=2)
+                wav = audio_processing.multi_mask_spectrogram(wav, tau=int(wav.shape[1] * self.tau), nu=int(wav.shape[0] * self.nu), num_masks=self.num_masks) # T, F
             wav = wav.unsqueeze(0)
 
         return (wavname, wav, dse_id, int(spk_id), int(gndr_id))
@@ -144,11 +163,9 @@ class CoughDatasets(torch.utils.data.Dataset):
                                        pad_types=self.pad_types) # repeat zero
         audio = audio.squeeze(0)
         if self.augment_data and self.train:
-            if random.uniform(0, 0.999) > 1 - 0.6:
+            if random.uniform(0, 0.999) > 1 - 0.8:
                 try:
                     audio = self.data_augmentator(audio.unsqueeze(0), self.sampling_rate).squeeze(0)
-                    max_val = torch.max(torch.abs(audio))
-                    audio = audio / max_val if max_val != 0 else audio
                 except:
                     audio = audio
 
@@ -242,7 +259,7 @@ class MTCoughDatasets(torch.utils.data.Dataset):
         if self.augment_data:
             self.data_augmentator = DataAugmentator(None, "/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_noises_labels.tsv",
                 None, "/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_rirs_labels.tsv",
-                5.5, ["apply_reverb", "add_background_noise"])
+                5.5, ["apply_speed_perturbation"])  # Using safer method
 
         self.wav_transform = None
         if hparams.acoustic_feature:

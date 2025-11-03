@@ -9,3 +9,7 @@ test.ipynb
 *.csv
 *.png
 *.npy
+*.onnx
+*.pth
+*.pkl
+*.pickle

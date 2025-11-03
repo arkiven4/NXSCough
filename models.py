@@ -30,6 +30,13 @@ class GradReverse(Function):
 def grad_reverse(x, lambd=1.0):
     return GradReverse.apply(x, lambd)
 
+class GRL(nn.Module):
+    def __init__(self, λ=1.0):
+        super().__init__()
+        self.λ = λ
+
+    def forward(self, x):
+        return GradReverse.apply(x, self.λ)
 #################################################################################################
 class PEFTWavlm_MyOwnGradeReversal(nn.Module):
     def __init__(self, input_size, regress_hidden_dim, num_transformer_layers, output_dim, spk_dim, **kwargs):
@@ -216,7 +223,7 @@ class WavLMEncoder_MyOwnGradeReversal(nn.Module):
 class SE_Trans(nn.Module):
     def __init__(
         self, input_size, output_dim, spk_dim, **kwargs
-    ):#input_size, regress_hidden_dim, num_transformer_layers, output_dim, spk_dim
+    ):
         """
         :param enable_multimodal: enable multimodal ASC
         :param num_locations: number of city
@@ -324,7 +331,319 @@ class SE_Trans(nn.Module):
             "s_emb": s_emb,
         }
 
+from torchvision.models import resnet50
+class ResNet50MelAdversarial(nn.Module):
+    def __init__(self,
+        input_size,
+        output_dim,
+        spk_dim,
+        embed_dim=2048,
+        dropout=0.3,
+        grl_lambda=1.0,
+        **kwargs): 
+        super().__init__()
+        
+        base = resnet50(pretrained=True)
 
+        # Replace first conv to handle 1-channel input (mel)
+        base.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.backbone = nn.Sequential(
+            base.conv1,
+            base.bn1,
+            base.relu,
+            base.maxpool,
+            base.layer1,
+            base.layer2,
+            base.layer3,
+            base.layer4,
+        )
+
+        # Global pooling handles variable time dimension
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        #self.global_pool = layers.AttentiveStatisticsPooling(embed_dim, attention_dim=1024)
+        #embed_dim = embed_dim * 2
+
+        # Shared projection
+        self.disease_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),  # Use GELU like WavLM
+            nn.LayerNorm(embed_dim // 2, eps=1e-5),
+            nn.Dropout(dropout)
+        )
+        # self.speaker_proj = nn.Sequential(
+        #     nn.Linear(embed_dim, embed_dim // 2),
+        #     nn.GELU(),
+        #     nn.LayerNorm(embed_dim // 2, eps=1e-5),
+        #     nn.Dropout(dropout)
+        # )
+
+        # Disease head (normal)
+        self.disease_head = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, output_dim),
+        )
+
+        # Speaker head (adversarial)
+        # self.speaker_head = nn.Sequential(
+        #     nn.Linear(embed_dim // 2, embed_dim // 4),
+        #     nn.GELU(),
+        #     nn.Dropout(0.7),
+        #     nn.Linear(embed_dim // 4, spk_dim),
+        # )
+        # self.gender_head = nn.Sequential(
+        #     nn.Linear(embed_dim // 2, embed_dim // 4),
+        #     nn.GELU(),
+        #     nn.Dropout(0.7),
+        #     nn.Linear(embed_dim // 4, 2),
+        # )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x, attention_mask=None, grl_lambda=0.0):
+        """
+        x: [B, 1, F, T], T can vary per batch element
+        """
+        x = x.unsqueeze(1)
+        feat = self.backbone(x)                # [B, 2048, F', T']
+        feat = F.adaptive_avg_pool2d(feat, (feat.size(2), 1))
+        pooled = self.global_pool(feat).flatten(1)
+
+        # Attentive
+        #feat = feat.squeeze(-1).permute(0, 2, 1)
+        #pooled = self.global_pool(feat)#.flatten(1)  # [B, 2048]
+
+        d_emb = self.disease_proj(pooled)    
+        disease_logits = self.disease_head(d_emb)
+
+        # rev_feat = grad_reverse(pooled, grl_lambda) if self.training and grl_lambda > 0 else pooled
+        # s_emb = self.speaker_proj(rev_feat)
+        # speaker_logits = self.speaker_head(s_emb)
+        # gender_logits = self.gender_head(s_emb)
+
+        return {
+            "disease_logits": disease_logits,
+            # "speaker_logits": speaker_logits,
+            # "gender_logits": gender_logits,
+            # "d_emb": d_emb,
+            # "s_emb": s_emb,
+        }
+
+from torchvision.models.vision_transformer import VisionTransformer, vit_b_16
+import torch.nn.functional as F
+class ViTMelAdversarial(nn.Module):
+    def __init__(
+        self,
+        input_size,
+        output_dim,
+        spk_dim,
+        embed_dim: int = 768,
+        patch_size: int = 16,
+        grl_lambda: float = 1.0,
+        dropout: float = 0.3,
+        **kwargs
+    ):
+        super().__init__()
+
+        # Use torchvision's ViT backbone (requires fixed-size patch, but variable time is fine with padding)
+        self.vit = vit_b_16(pretrained=True)
+        # Modify first conv layer for 1-channel input
+        self.vit.conv_proj = nn.Conv2d(1, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+        # Shared bottleneck
+        self.bottleneck = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.LayerNorm(embed_dim // 2),
+            nn.Dropout(dropout),
+        )
+
+        # Disease head (normal)
+        self.disease_head = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, output_dim),
+        )
+
+        # Speaker head (adversarial)
+        self.grl = GRL(λ=grl_lambda)
+        self.speaker_head = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, spk_dim),
+        )
+        self.gender_head = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, 2),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x, attention_mask=None, grl_lambda=0.0):
+        """
+        x: [B, 1, F, T] (mel-spectrogram, variable T)
+        """
+        x = x.unsqueeze(1)
+        _, _, _, T = x.shape
+        pad_T = (16 - (T % 16)) % 16
+        if pad_T > 0:
+            x = nn.functional.pad(x, (0, pad_T))
+
+        x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+        vit_out = self.vit._process_input(x)
+
+        # Extract tokens and class embedding
+        n = vit_out.shape[0]
+        cls_token = self.vit.class_token.expand(n, -1, -1)
+        vit_out = torch.cat((cls_token, vit_out), dim=1)
+        vit_out = self.vit.encoder(vit_out)
+        pooled = vit_out[:, 0]  # CLS token as global embedding
+
+        embed = self.bottleneck(pooled)
+
+        disease_logits = self.disease_head(embed)
+        adv_embed = self.grl(embed)
+        speaker_logits = self.speaker_head(adv_embed)
+        gender_logits = self.gender_head(adv_embed)
+
+        return {
+            "disease_logits": disease_logits,
+            "speaker_logits": speaker_logits,
+            "gender_logits": gender_logits
+        }
+
+from s3prl.upstream.mockingjay.builder import PretrainedTransformer
+class TERA_TryDownstream(nn.Module):
+    def __init__(self, input_size, output_dim, spk_dim, **kwargs):
+        super(TERA_TryDownstream, self).__init__()
+
+        options = {
+            "load_pretrain": "True",
+            "no_grad": "True",
+            "dropout": "default",
+            "spec_aug": "False",
+            "spec_aug_prev": "False",
+            "output_hidden_states": "True",
+            "permute_input": "False",
+        }
+        options["ckpt_file"] = "pretrained/tera_pretrained.pth"
+        options["select_layer"] = -1
+
+        pretrained_dict = torch.load("pretrained/tera_pretrained.pth", weights_only=False)
+        transformer_state = pretrained_dict['Transformer']
+
+        self.tera_model = PretrainedTransformer(options, inp_dim=-1)
+        self.tera_model.model.load_state_dict(transformer_state, strict=True)
+        self.tera_model.eval()
+
+        dropout = 0.1
+        embed_dim = 768 * 2
+
+        self.pooling = layers.AttentiveStatisticsPooling(embed_dim // 2, attention_dim=embed_dim // 4)
+
+        # Projection layers for multi-task learning
+        self.disease_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),  # Use GELU like WavLM
+            nn.LayerNorm(embed_dim // 2, eps=1e-5),
+            nn.Dropout(dropout)
+        )
+        self.speaker_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.LayerNorm(embed_dim // 2, eps=1e-5),
+            nn.Dropout(dropout)
+        )
+
+        # Classifiers
+        self.disease_clf = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, output_dim)
+        )
+
+        self.speaker_clf = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, spk_dim)
+        )
+        
+        self.gender_clf = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, 2)
+        )
+
+    def forward(self, x, attention_mask=None, grl_lambda=0.0):
+        with torch.no_grad():
+            x = self.tera_model(x)[0] # torch.Size([128, 51, 768])
+        
+        x = torch.nan_to_num(x, nan=0.0)
+        feature_embedding = self.pooling(x)
+
+        d_emb = self.disease_proj(feature_embedding)    
+        s_emb = self.speaker_proj(feature_embedding) 
+
+        disease_logits = self.disease_clf(d_emb)
+        s_in = grad_reverse(s_emb, grl_lambda) if self.training and grl_lambda > 0 else s_emb
+        speaker_logits = self.speaker_clf(s_in)
+        gender_logits = self.gender_clf(s_in)
+
+        return {
+            "disease_logits": disease_logits,
+            "speaker_logits": speaker_logits,
+            "gender_logits": gender_logits,
+            "d_emb": d_emb,
+            "s_emb": s_emb,
+        }
+# class Eff_MyOwn1(nn.Module):
+#     def __init__(self, input_size, regress_hidden_dim, output_dim, **kwargs):
+#         super(Eff_MyOwn1, self).__init__()
+
+#         self.target_size = (240, 240)
+#         self.cnn1 = torch.nn.Conv2d(1, 3, kernel_size=3)
+#         self.efficientnet = EfficientNet.from_pretrained('efficientnet-b5') #
+#         # self.efficientnet = EfficientNet.from_name("efficientnet-b0", include_top=False, drop_connect_rate=0.1) # [128, 1280, 1, 1]
+
+#         self.dense = nn.Linear(1000, 1000)
+#         self.dropout = nn.Dropout(0.1)
+#         self.out_proj = nn.Linear(1000, output_dim)
+
+
+#     def forward(self, x):
+#         x = x.permute(0, 2, 1).unsqueeze(1) # [128, 1, 94, 64]
+#         x = F.interpolate(x, size=self.target_size, mode="bilinear", align_corners=False)
+#         x = self.cnn1(x) # [128, 3, 92, 62]
+#         x = self.efficientnet(x) # 
+#         x = self.dropout(x)
+#         x = self.dense(x)
+#         x = torch.tanh(x)
+#         x = self.dropout(x)
+#         x = self.out_proj(x)
+        
+#         return x
 #################################################################################################
 #################################################################################################
 #################################################################################################

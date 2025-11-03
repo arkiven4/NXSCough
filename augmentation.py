@@ -1,31 +1,11 @@
 import random
 import torch
-import torchaudio
 import os
 import logging
-
-#region logging
-# ---------------------------------------------------------------------
-# Logging
-
-# Set logging config
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-logger_formatter = logging.Formatter(
-    fmt = '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt = '%y-%m-%d %H:%M:%S',
-    )
-
-# Set a logging stream handler
-logger_stream_handler = logging.StreamHandler()
-logger_stream_handler.setLevel(logging.INFO)
-logger_stream_handler.setFormatter(logger_formatter)
-
-# Add handlers
-logger.addHandler(logger_stream_handler)
-# ---------------------------------------------------------------------
-#endregion
+import numpy as np
+from scipy import signal
+import librosa
+import soundfile as sf
 
 class DataAugmentator:
     def __init__(
@@ -48,11 +28,17 @@ class DataAugmentator:
 
         # TODO move to settings
         #self.EFFECTS = ["apply_speed_perturbation", "apply_reverb", "add_background_noise"]    
-        self.PITCH_SHIFTS = [-2, -1, 1, 2]         
+        self.PITCH_SHIFTS = [-3, -2, -1, 1, 2, 3]          
         self.SPEEDS = ["0.9", "1.1"] # If 1 is an option, no augmentation is done!
-        self.SNR_NOISE_RANGE = [15, 25]
-        self.SNR_SPEECH_RANGE = [15, 25]
-        self.SNR_MUSIC_RANGE = [15, 20]
+        self.SNR_NOISE_RANGE = [15, 35]
+        self.SNR_SPEECH_RANGE = [15, 35]
+        self.SNR_MUSIC_RANGE = [15, 35]
+        self.GAIN_DB = [
+            (-18.0, -6.0),  # strong attenuation
+            (-12.0, -3.0),  # strong attenuation
+            (-6.0, 6.0),    # mild variation
+            (3.0, 12.0)     # strong amplification
+        ]
         self.number_of_misses = 0
         
     
@@ -68,93 +54,109 @@ class DataAugmentator:
             self.rirs_list = handle.readlines()
     
 
+    def load_audio_safe(self, path):
+        """
+        Load audio safely and return as torch tensor.
+        """
+        data, sample_rate = sf.read(path, dtype='float32')  # always float32
+        # If stereo, convert to mono by averaging channels
+        if len(data.shape) > 1:
+            data = data.mean(axis=1)
+        audio_tensor = torch.from_numpy(data)
+        return audio_tensor, sample_rate
+
     def apply_speed_perturbation(self, audio, sample_rate):
-            
-        speed = random.choice(self.SPEEDS)
-
-        augmented_audio_waveform, augmented_sample_rate = torchaudio.sox_effects.apply_effects_tensor(
-            audio, sample_rate, [["speed", speed]]
-        )
-
-        # Speed perturbation changes only the sampling rate, so we need to resample to the original sample rate
-        resampled_waveform = torchaudio.functional.resample(
-            waveform = augmented_audio_waveform,
-            orig_freq = augmented_sample_rate, 
-            new_freq = sample_rate, 
-        )
-        
-        # We return the resampled waveform, the sample rate remains the original
-        return resampled_waveform
+        speed = float(random.choice(self.SPEEDS))
+        audio_np = audio.squeeze().numpy() if torch.is_tensor(audio) else audio
+        perturbed = librosa.effects.time_stretch(audio_np, rate=speed)
+        return torch.tensor(perturbed, dtype=torch.float32).unsqueeze(0) if torch.is_tensor(audio) else perturbed
     
     
     def apply_reverb(self, audio, sample_rate):
-            
         if self.rirs_directory is not None:
             path = os.path.join(self.rirs_directory, random.choice(self.rirs_list).strip())
         else:
             path = random.choice(self.rirs_list).strip()
-        logger.debug(f"path: {path}")
         try: 
-            rir_wav, rir_sample_rate = torchaudio.load(path)
+            rir_wav, rir_sample_rate = self.load_audio_safe(path)
         except RuntimeError as e:
             self.number_of_misses += 1
             #logger.info(f"The number of misses that we have is {self.number_of_misses}")
             #logger.error(f"Error loading RIR from path: {path}. Error: {str(e)}")
             return audio
 
-        logger.debug(f"first load ok")
         if rir_sample_rate != sample_rate:
-            rir_wav = torchaudio.functional.resample(
-                waveform = rir_wav,
-                orig_freq = rir_sample_rate, 
-                new_freq = sample_rate, 
-            )
+            # Convert to numpy for librosa resampling
+            if isinstance(rir_wav, torch.Tensor):
+                rir_np = rir_wav.squeeze().cpu().numpy()
+            else:
+                rir_np = rir_wav
+            resampled_rir = librosa.resample(rir_np, orig_sr=rir_sample_rate, target_sr=sample_rate)
+            rir_wav = torch.from_numpy(resampled_rir).float().unsqueeze(0)
             rir_sample_rate = sample_rate
-        logger.debug(f"resampling ok")
 
         # TODO first loading the audio and then cropping is unefficient
         # Clean up the RIR,  extract the main impulse, normalize the signal power
         normalized_rir = rir_wav[:, int(rir_sample_rate * 0.01) : int(rir_sample_rate * 1.3)]
-        rir_norm = torch.norm(normalized_rir, p=2)
-        if rir_norm > 0:
-            normalized_rir = normalized_rir / rir_norm
-        else:
-            logger.warning("RIR norm is zero, skipping reverb")
-            return audio
-        
-        logger.debug(f"fftconvolve on going...")
-        logger.debug(f"The audio shape is: {audio.shape}")
-        logger.debug(f"The normalized_rir shape:{normalized_rir.shape}")
+        normalized_rir = normalized_rir / torch.norm(normalized_rir, p=2)
+    
 
         # there is an speciefic file that is causing trouble bc it is of shape [8, 56889]
         normalized_rir = torch.mean(normalized_rir, dim=0)
         normalized_rir = normalized_rir.view(1, -1)
 
-        augmented_waveform = torch.mean(torchaudio.functional.fftconvolve(audio, normalized_rir), dim=0).unsqueeze(0)
-        logger.debug(f"fftconvolve ok")
+        # Convert to numpy for scipy fftconvolve
+        audio_np = audio.squeeze().cpu().numpy() if isinstance(audio, torch.Tensor) else audio.squeeze()
+        rir_np = normalized_rir.squeeze().cpu().numpy() if isinstance(normalized_rir, torch.Tensor) else normalized_rir.squeeze()
+        
+        # Apply convolution using scipy
+        convolved = signal.fftconvolve(audio_np, rir_np, mode='full')
+        
+        # Convert back to torch tensor
+        augmented_waveform = torch.from_numpy(convolved).float().unsqueeze(0)
 
         return augmented_waveform
 
     def apply_pitch_shift(self, audio, sample_rate):
+        """
+        Apply a random pitch shift to the input audio.
+
+        Args:
+            audio (np.ndarray or torch.Tensor): 1D audio array
+            sample_rate (int): Sample rate of the audio
+
+        Returns:
+            np.ndarray: Pitch-shifted audio
+        """
+        if isinstance(audio, np.ndarray):
+            audio_np = audio.astype(float)  # librosa requires float
+        else:
+            audio_np = audio.cpu().numpy().astype(float)
+
+        # Choose a random pitch shift
+        n_steps = random.choice(self.PITCH_SHIFTS)
+
+        # Apply pitch shift
+        shifted_audio = librosa.effects.pitch_shift(audio_np, sr=sample_rate, n_steps=n_steps)
+
+        return torch.from_numpy(shifted_audio).float()
+    
+    def apply_random_gain(self, audio):
             """
-            Apply pitch shift augmentation to the audio.
+            Apply random gain to waveform.
+
+            Args:
+                audio (torch.Tensor): waveform tensor of shape [1, N] or [C, N]
+                gain_db_range (tuple): min and max gain in decibels
+
+            Returns:
+                torch.Tensor: waveform with random gain applied
             """
-            pitch_shift_semitones = random.choice(self.PITCH_SHIFTS)
-            
-            augmented_audio_waveform, augmented_sample_rate = torchaudio.sox_effects.apply_effects_tensor(
-                audio, sample_rate, [["pitch", str(pitch_shift_semitones)]]
-            )
-            
-            # Pitch shift typically doesn't change sample rate, but let's be safe
-            if augmented_sample_rate != sample_rate:
-                resampled_waveform = torchaudio.functional.resample(
-                    waveform = augmented_audio_waveform,
-                    orig_freq = augmented_sample_rate, 
-                    new_freq = sample_rate, 
-                )
-                return resampled_waveform
-            
-            return augmented_audio_waveform
+            gain_db_range = random.choice(self.GAIN_DB)
+            gain_db = random.uniform(*gain_db_range)
+            gain = 10 ** (gain_db / 20)
+            augmented_audio = torch.clamp(audio * gain, -1.0, 1.0)
+            return augmented_audio
     
     def get_SNR_bounds(self, background_audio_type):
 
@@ -211,17 +213,16 @@ class DataAugmentator:
             path = os.path.join(self.augmentation_directory, background_audio_name)
         else:
             path = background_audio_name
-        logger.debug(f"path: {path}")
-        noise, noise_sample_rate = torchaudio.load(path)
-        logger.debug(f"first load ok")
+        noise, noise_sample_rate = self.load_audio_safe(path)
         if noise_sample_rate != sample_rate:
-            noise = torchaudio.functional.resample(
-                waveform = noise,
-                orig_freq = noise_sample_rate, 
-                new_freq = sample_rate, 
-            )
+            # Convert to numpy for librosa resampling
+            if isinstance(noise, torch.Tensor):
+                noise_np = noise.squeeze().cpu().numpy()
+            else:
+                noise_np = noise
+            resampled_noise = librosa.resample(noise_np, orig_sr=noise_sample_rate, target_sr=sample_rate)
+            noise = torch.from_numpy(resampled_noise).float().unsqueeze(0)
             noise_sample_rate = sample_rate
-        logger.debug(f"resampling ok")
 
         # TODO first loading the audio and then cropping is unefficient
         cropped_noise = self.crop_noise(
@@ -231,18 +232,20 @@ class DataAugmentator:
         )
 
         padded_cropped_noise = self.pad_noise(cropped_noise, audio)
-        
-        audio_power = torch.mean(audio ** 2)
-        noise_power = torch.mean(padded_cropped_noise ** 2)
-        if audio_power == 0 or noise_power == 0:
-            logger.warning("Zero power detected in audio or noise, skipping noise addition")
-            return audio
-        
-        audio_SNR = torch.tensor(
-            self.sample_random_SNR(background_audio_type)
-        ).unsqueeze(0)
 
-        noisy_audio = torchaudio.functional.add_noise(audio, padded_cropped_noise, audio_SNR)
+        audio_SNR_db = self.sample_random_SNR(background_audio_type)
+        
+        # Manual implementation of add_noise functionality
+        # Calculate signal and noise power
+        signal_power = torch.mean(audio ** 2)
+        noise_power = torch.mean(padded_cropped_noise ** 2)
+        
+        # Calculate scaling factor based on desired SNR
+        snr_linear = 10 ** (audio_SNR_db / 10.0)
+        scaling_factor = torch.sqrt(signal_power / (noise_power * snr_linear))
+        
+        # Add scaled noise to signal
+        noisy_audio = audio + padded_cropped_noise * scaling_factor
 
         return noisy_audio
         
@@ -253,19 +256,13 @@ class DataAugmentator:
 
         The output shape is [1, len(waveform)]
         """
-        if torch.isnan(audio).any():
-            logger.warning("Input audio contains NaN values")
-            return audio
         
         effect = random.choice(self.augmentation_effects)
-
-        logger.debug(f"Data augmentation {effect} is going to be applied...")
         
         # getattr(self, effect) is equivalent to apply self.effect(audio, sample_rate)
+
         augmented_waveform = getattr(self, effect)(audio, sample_rate)
-        if torch.isnan(augmented_waveform).any():
-            logger.warning(f"Augmentation {effect} produced NaN values, returning original audio")
-            return audio
+        
         return augmented_waveform
 
     def __call__(self, audio, sample_rate):
