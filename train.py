@@ -78,21 +78,32 @@ cur_bs = BATCH_SIZE // ACCUMULATION_STEP
 # =============================================================
 # SECTION: Loading Data
 # =============================================================
+df_tbscreen = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/TBscreen_Dataset/metadata_longitudinal.csv')
+df_train_tbscreen = df_tbscreen[df_tbscreen['split'] == 'train'].reset_index(drop=True)
+df_test_tbscreen   = df_tbscreen[df_tbscreen['split'] == 'val'].reset_index(drop=True)
+
+df_train_ukcovid = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/ukcovid19/metadata.csv.train')
+df_test_ukcovid = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/ukcovid19/metadata.csv.val')
+df_train_ukcovid = df_train_ukcovid.rename(columns={"file_path": "path_file", 'covid_test_result': 'disease_status', 'gender': 'sex', 'participant_identifier': 'participant'})
+df_test_ukcovid = df_test_ukcovid.rename(columns={"file_path": "path_file", 'covid_test_result': 'disease_status', 'gender': 'sex', 'participant_identifier': 'participant'})
 
 df_longi = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/coda/longitudinal_original.csv')
+df_longi = df_longi.sample(n=75000, random_state=42)
+
 #df_solic = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/coda/solicited_original.csv')
 
-participant_mapping_longi = {participant: idx for idx, participant in enumerate(set(np.concatenate([df_longi['participant'].unique()])))} # df_solic['participant'].unique()
-df_longi['participant'] = df_longi['participant'].map(participant_mapping_longi)
-#df_solic['participant'] = df_solic['participant'].map(participant_mapping_longi)
+# participant_mapping_longi = {participant: idx for idx, participant in enumerate(set(np.concatenate([df_longi['participant'].unique()])))} # df_solic['participant'].unique()
+# df_longi['participant'] = df_longi['participant'].map(participant_mapping_longi)
+# #df_solic['participant'] = df_solic['participant'].map(participant_mapping_longi)
 
-gender_mapping_longi = {gender: idx for idx, gender in enumerate(df_longi['sex'].unique())}
-df_longi['sex'] = df_longi['sex'].map(gender_mapping_longi)
-#df_solic['sex'] = df_solic['sex'].map(gender_mapping_longi)
+# gender_mapping_longi = {gender: idx for idx, gender in enumerate(df_longi['sex'].unique())}
+# df_longi['sex'] = df_longi['sex'].map(gender_mapping_longi)
+# #df_solic['sex'] = df_solic['sex'].map(gender_mapping_longi)
 
-#df_longi_train, df_longi_val = utils.stratified_group_split(df_longi)
-#df_solic_train, df_solic_val = utils.stratified_group_split(df_solic)
+# #df_longi_train, df_longi_val = utils.stratified_group_split(df_longi)
+# #df_solic_train, df_solic_val = utils.stratified_group_split(df_solic)
 
+df_longi = df_longi.rename(columns={"tb_status": "disease_status"})
 df_train, df_test = train_test_split(
     df_longi,
     test_size=0.2,
@@ -107,17 +118,37 @@ if hps.data.reorder_target:
     df_train = df_train[cols]
     df_test = df_test[cols]
 
+    df_train_tbscreen = df_train_tbscreen[["path_file", "disease_status", "sex", "participant"]]
+    df_test_tbscreen = df_test_tbscreen[["path_file", "disease_status", "sex", "participant"]]
+
+    df_train_ukcovid = df_train_ukcovid[["path_file", "disease_status", "sex", "participant"]]
+    df_test_ukcovid = df_test_ukcovid[["path_file", "disease_status", "sex", "participant"]]
+    
+    df_train = pd.concat([df_train, df_train_tbscreen, df_train_ukcovid], ignore_index=True)
+    df_test  = pd.concat([df_test, df_test_tbscreen, df_test_ukcovid], ignore_index=True)
+
+df_train['sex'] = df_train['sex'].replace({'Male': 0, 'Female': 1})
+df_test['sex']  = df_test['sex'].replace({'Male': 0, 'Female': 1})
+
+participant_mapping_longi = {participant: idx for idx, participant in enumerate(set(np.concatenate([df_train['participant'].unique(), df_test['participant'].unique()])))}
+df_train['participant'] = df_train['participant'].map(participant_mapping_longi)
+df_test['participant'] = df_test['participant'].map(participant_mapping_longi)
+
+df_train['disease_status'] = df_train['disease_status'].replace(4, 0)
+df_test['disease_status'] = df_test['disease_status'].replace(4, 0)
+
 disease_codes = df_train[hps.data.target_column].unique().tolist()
 class_frequencies = df_train[hps.data.target_column].value_counts().to_dict()
 total_samples = len(df_train)
 class_weights = {cls: total_samples / (len(disease_codes) * freq) if freq != 0 else 0 for cls, freq in class_frequencies.items()}
 weights_list = [class_weights[cls] for cls in disease_codes]
 class_weights_tensor = torch.tensor(weights_list, device='cuda', dtype=torch.float)
+print(class_weights_tensor)
 
 pickle_path = 'wav_stats.pickle'
 if not os.path.exists(pickle_path):
     means, stds = [], []
-    paths = df_longi['path_file'].dropna().tolist()
+    paths = df_train['path_file'].dropna().tolist()
 
     for path in tqdm(paths, desc="Processing WAV files", unit="file"):
         if not os.path.isfile(path):
@@ -168,8 +199,8 @@ logger.info(f"======================================")
 
 epoch_str = 1
 global_step = 0
-num_training_steps = len(train_loader) * 20
-num_warmup_steps = int(0.01 * num_training_steps)  # 5% warmup
+num_training_steps = len(train_loader) * 400
+num_warmup_steps = len(train_loader) * 2 #int(0.05 * num_training_steps)  # 5% warmup
 
 ssl_model_type = hps.model.ssl_model_type.lower()
 ssl_model = None
@@ -258,7 +289,8 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
 
         x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True)
         with torch.amp.autocast("cuda", enabled=True):
-            out_model = pool_model(audio, attention_mask=attention_masks, grl_lambda=grl_lambda_schedule(global_step, len(train_loader) * 20 , hps.model.grl_lambda))
+            grl_lambda = getattr(hps.model, "grl_lambda", 0.0)
+            out_model = pool_model(audio, attention_mask=attention_masks, grl_lambda=grl_lambda_schedule(global_step, len(train_loader) * 20 , grl_lambda))
         
             ld = utils.many_loss_category(out_model["disease_logits"], dse_ids, loss_type=hps.train.loss_function, weights=class_weights_tensor, model=pool_model)
             logit_keys = [k for k in out_model.keys() if k.endswith("_logits") and k != "disease_logits"]
@@ -274,13 +306,13 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
             l_ortho = utils.orthogonality_loss(out_model["d_emb"], out_model["s_emb"]) if {"d_emb", "s_emb"} <= out_model.keys() else 0
             l_internal = out_model.get("internal_loss", 0)
 
-            if 'x_rec' in out_model:
-                recon_loss = F.mse_loss(out_model['x_rec'], audio, reduction='mean')
-                kl = (-0.5 * torch.sum(1 + out_model['logvar']  - out_model['mu'].pow(2) - out_model['logvar'].exp(), dim=1)).mean() * 1.0
+            # if 'x_rec' in out_model:
+            #     recon_loss = F.mse_loss(out_model['x_rec'], audio, reduction='mean')
+            #     kl = (-0.5 * torch.sum(1 + out_model['logvar']  - out_model['mu'].pow(2) - out_model['logvar'].exp(), dim=1)).mean() * 1.0
                 
             # Backprog
             total_aux_loss = sum(aux_losses.values()) if aux_losses else 0
-            loss_g = sum(ld + [total_aux_loss] + [l_ortho] + [l_internal]) / ACCUMULATION_STEP #  + 
+            loss_g = sum([ld[0] * 0.01] + [total_aux_loss] + [l_ortho] + [l_internal]) / ACCUMULATION_STEP #  + 
 
         # Logging
         aux_losses = [v.item() for v in aux_losses.values()]
@@ -301,7 +333,7 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
                 "loss/g/total": loss_g,
                 "info/learning_rate": scheduler_p.get_last_lr()[0],
                 "info/grad_norm": grad_norm,
-                "info/grl_lambda": grl_lambda_schedule(global_step, len(train_loader) * 20 , hps.model.grl_lambda),
+                "info/grl_lambda": grl_lambda_schedule(global_step, len(train_loader) * 20 , grl_lambda),
             }
 
             scalar_dict.update(
@@ -343,10 +375,11 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
             x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True).long()
             out_model = pool_model(audio, attention_mask=attention_masks)
 
-            if 'x_rec' in out_model:
-                recon_loss = F.mse_loss(out_model['x_rec'], audio, reduction='mean')
-                kl = (-0.5 * torch.sum(1 + out_model['logvar']  - out_model['mu'].pow(2) - out_model['logvar'].exp(), dim=1)).mean() * 1.0
-            loss_gs = utils.many_loss_category(out_model["disease_logits"], dse_ids, loss_type=hps.train.loss_function, weights=class_weights_tensor, model=pool_model)
+            # if 'x_rec' in out_model:
+            #     recon_loss = F.mse_loss(out_model['x_rec'], audio, reduction='mean')
+            #     kl = (-0.5 * torch.sum(1 + out_model['logvar']  - out_model['mu'].pow(2) - out_model['logvar'].exp(), dim=1)).mean() * 1.0
+            #loss_gs = utils.many_loss_category(out_model["disease_logits"], dse_ids, loss_type=hps.train.loss_function, weights=class_weights_tensor, model=pool_model)
+            loss_gs = [out_model.get("internal_loss", 0)]
 
             loss_g = sum(loss_gs)
             if batch_idx == 0:
@@ -376,6 +409,11 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
     else:
         patience_val.append(1)
         logger.info(f"Patience: {len(patience_val)}")
+        if epoch > 3 and len(patience_val) >= 4:
+            new_lr = hps.train.learning_rate * (0.9 ** ((epoch - 3) // 1))
+            for param_group in optimizer_p.param_groups:
+                param_group['lr'] = new_lr
+
         if len(patience_val) > 4:
             break
 
@@ -466,6 +504,7 @@ with open(f"{model_dir}/result_summary.txt", "w") as f:
 # TBCoda Solicited
 # =============================================================
 df_solic = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/coda/solicited_original.csv')
+df_solic = df_solic.rename(columns={"tb_status": "disease_status"})
 
 participant_mapping_longi = {participant: idx for idx, participant in enumerate(set(np.concatenate([df_solic['participant'].unique()])))} # df_solic['participant'].unique()
 df_solic['participant'] = df_solic['participant'].map(participant_mapping_longi)
@@ -537,28 +576,6 @@ cirdz_metrics = evaluate_model(val_loader, "tbscreen_solicited")
 with open(f"{model_dir}/result_summary.txt", "a") as f:
     f.write(
         f"==================================== TBScreen Solicited =====================================\n"
-    )
-    f.write(
-        f"Val - Acc {cirdz_metrics[0]:.2f} | BalAcc {cirdz_metrics[1]:.2f} | "
-        f"Sens {cirdz_metrics[2]:.2f} | Spec {cirdz_metrics[3]:.2f}\n\n"
-    )
-
-df = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/TBscreen_Dataset/metadata_longitudinal.csv')
-participant_mapping_longi = {participant: idx for idx, participant in enumerate(set(np.concatenate([df['participant'].unique()])))}
-df['participant'] = df['participant'].map(participant_mapping_longi)
-gender_mapping_longi = {gender: idx for idx, gender in enumerate(df['sex'].unique())}
-df['sex'] = df['sex'].map(gender_mapping_longi)
-df_test = df[hps.data.column_order]
-
-collate_fn = CoughDatasetsCollate(hps.data.many_class)
-val_dataset = CoughDatasets(df_test.values, hps.data, train=False)
-val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size, pin_memory=True, drop_last=True, collate_fn=collate_fn)
-
-cirdz_metrics = evaluate_model(val_loader, "tbscreen_longitudinal")
-
-with open(f"{model_dir}/result_summary.txt", "a") as f:
-    f.write(
-        f"==================================== TBScreen Longitudinal =====================================\n"
     )
     f.write(
         f"Val - Acc {cirdz_metrics[0]:.2f} | BalAcc {cirdz_metrics[1]:.2f} | "

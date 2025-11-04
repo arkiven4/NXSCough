@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchaudio import transforms as T
+import torch.nn.functional as F
+import torchvision.transforms as transforms
 
 import librosa
 from sklearn.utils import shuffle 
@@ -21,7 +23,7 @@ class CoughDatasets(torch.utils.data.Dataset):
         self.audiopaths_and_text = shuffle(data_numpy, random_state=20)
         self.hop_length = hparams.hop_length
         self.max_wav_value = hparams.max_wav_value
-        self.mean_std_norm = hparams.mean_std_norm
+        self.mean_std_norm = getattr(hparams, "mean_std_norm", False)
         self.sampling_rate = hparams.sampling_rate
         self.saming_length = hparams.saming_length
         self.desired_length = hparams.desired_length
@@ -38,6 +40,7 @@ class CoughDatasets(torch.utils.data.Dataset):
         self.tau = getattr(hparams, "tau", 0.0)
         self.nu = getattr(hparams, "nu", 0.0)
         self.num_masks = getattr(hparams, "num_masks", 0)
+        self.mae_training = getattr(hparams, "mae_training", False)
         self.mix_audio = hparams.mix_audio
         self.nClasses = hparams.many_class
         print(self.train)
@@ -54,6 +57,12 @@ class CoughDatasets(torch.utils.data.Dataset):
                 self.wav_mean, self.wav_std = stats["mean_db"], stats["std_db"]
                 print(self.wav_mean)
 
+        if self.mae_training:
+            self.transform_train = transforms.Compose([
+                            transforms.Resize((256, 256)),
+                            #transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                            ])
+            
         self.wav_transform = None
         if hparams.acoustic_feature:
             if hparams.feature_type == "mfcc":
@@ -155,6 +164,11 @@ class CoughDatasets(torch.utils.data.Dataset):
                 wav = audio_processing.multi_mask_spectrogram(wav, tau=int(wav.shape[1] * self.tau), nu=int(wav.shape[0] * self.nu), num_masks=self.num_masks) # T, F
             wav = wav.unsqueeze(0)
 
+        if self.mae_training == True:
+            wav = wav.unsqueeze(0)
+            wav = self.transform_train(wav)
+            wav = wav.squeeze(0)
+            
         return (wavname, wav, dse_id, int(spk_id), int(gndr_id))
 
     def get_audio(self, filename): # random.randint(1, 6)
