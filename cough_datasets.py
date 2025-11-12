@@ -59,9 +59,9 @@ class CoughDatasets(torch.utils.data.Dataset):
 
         if self.mae_training:
             self.transform_train = transforms.Compose([
-                            transforms.Resize((256, 256)),
+                transforms.Resize((224, 224)),
                             #transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-                            ])
+                ])
             
         self.wav_transform = None
         if hparams.acoustic_feature:

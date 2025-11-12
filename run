@@ -29,8 +29,8 @@ done
     --fraction 1.0
 
 
-python train.py --init --model_name nonstatify_augmentmany_resnet_spectogram --config_path configs/general.json
-python train.py --init --model_name nonstatify_trymae --config_path configs/mae.json
+python train.py --init --model_name combined3db_augment_restnet_melspec --config_path configs/general.json
+python train.py --init --model_name combined3db_augment_swintrans_melspec --config_path configs/mae.json
 
 python evaluate.py --model_name nonstatify_disen_resnet
 

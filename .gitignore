@@ -2,6 +2,7 @@ __pycache__
 output/*/
 logs/
 logs_old/
+preprocessed_data
 *.zip
 data/TB_resample/
 test.ipynb

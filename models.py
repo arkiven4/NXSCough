@@ -436,6 +436,50 @@ class ResNet50MelAdversarial(nn.Module):
             # "d_emb": d_emb,
             # "s_emb": s_emb,
         }
+    
+import torch
+import torch.nn as nn
+from timm.models.swin_transformer import SwinTransformer
+
+class SwinCoughClassifier(nn.Module):
+    def __init__(self, input_size, output_dim=2, pretrained=True, **kwargs):
+        super().__init__()
+        # Load Swin backbone from timm
+        self.backbone = SwinTransformer(
+            img_size=224,            # adjust if your spectrogram is larger/smaller
+            patch_size=4,
+            in_chans=1,              # spectrograms are single-channel
+            embed_dim=96,
+            depths=(2, 2, 6, 2),
+            num_heads=(3, 6, 12, 24),
+            window_size=7,
+            drop_path_rate=0.2,
+            num_classes=0,           # remove classifier head
+            pretrained_window_sizes=[7, 7, 7, 7] if pretrained else None
+        )
+
+        # Adaptive pooling for variable-length input
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(768),
+            nn.Linear(768, output_dim)
+        )
+
+    def forward(self, x, attention_mask=None, grl_lambda=0.0):
+        # x: [B, 1, H, W]
+        x = x.unsqueeze(1)
+        features = self.backbone.forward_features(x)  # [B, C, H', W']
+        features = features.mean(dim=[1, 2])          # global average pool
+        disease_logits = self.classifier(features)
+
+        return {
+            "disease_logits": disease_logits,
+            # "speaker_logits": speaker_logits,
+            # "gender_logits": gender_logits,
+            # "d_emb": d_emb,
+            # "s_emb": s_emb,
+        }
 
 from torchvision.models.vision_transformer import VisionTransformer, vit_b_16
 import torch.nn.functional as F
