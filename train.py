@@ -19,7 +19,7 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoFeatureExtractor, AutoModel, get_linear_schedule_with_warmup
 
 import commons, models, utils
-from cough_datasets import CoughDatasets, CoughDatasetsCollate
+from cough_datasets import CoughDatasets, CoughDatasetsCollate, CoughDatasetsProcessorCollate
 from wrapper.wav2vec import Wav2VecWrapper
 from wrapper.wavlm_plus import WavLMWrapper
 from wrapper.whisper import WhisperWrapper
@@ -82,41 +82,41 @@ df_train_ukcovid = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/ukcovi
 df_test_ukcovid = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/ukcovid19/metadata.csv.val')
 df_train_ukcovid = df_train_ukcovid.rename(columns={"file_path": "path_file", 'covid_test_result': 'disease_status', 'gender': 'sex', 'participant_identifier': 'participant'})
 df_test_ukcovid = df_test_ukcovid.rename(columns={"file_path": "path_file", 'covid_test_result': 'disease_status', 'gender': 'sex', 'participant_identifier': 'participant'})
-df_2 = df_train_ukcovid[df_train_ukcovid['disease_status'] == 2]
-df_4 = df_train_ukcovid[df_train_ukcovid['disease_status'] == 4]
-df_2_down = resample(df_2, replace=False, n_samples=9138, random_state=42)
-df_4_down = resample(df_4, replace=False, n_samples=6000, random_state=42)
-df_train_ukcovid = pd.concat([df_2_down, df_4_down]).sample(frac=1, random_state=42).reset_index(drop=True)
-df_2 = df_test_ukcovid[df_test_ukcovid['disease_status'] == 2]
-df_4 = df_test_ukcovid[df_test_ukcovid['disease_status'] == 4]
-df_2_down = resample(df_2, replace=False, n_samples=3682, random_state=42)
-df_4_down = resample(df_4, replace=False, n_samples=1800, random_state=42)
-df_test_ukcovid = pd.concat([df_2_down, df_4_down]).sample(frac=1, random_state=42).reset_index(drop=True)
+# df_2 = df_train_ukcovid[df_train_ukcovid['disease_status'] == 2]
+# df_4 = df_train_ukcovid[df_train_ukcovid['disease_status'] == 4]
+# df_2_down = resample(df_2, replace=False, n_samples=9138, random_state=42)
+# df_4_down = resample(df_4, replace=False, n_samples=6000, random_state=42)
+# df_train_ukcovid = pd.concat([df_2_down, df_4_down]).sample(frac=1, random_state=42).reset_index(drop=True)
+# df_2 = df_test_ukcovid[df_test_ukcovid['disease_status'] == 2]
+# df_4 = df_test_ukcovid[df_test_ukcovid['disease_status'] == 4]
+# df_2_down = resample(df_2, replace=False, n_samples=3682, random_state=42)
+# df_4_down = resample(df_4, replace=False, n_samples=1800, random_state=42)
+# df_test_ukcovid = pd.concat([df_2_down, df_4_down]).sample(frac=1, random_state=42).reset_index(drop=True)
 
 df_longi = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/coda/longitudinal_original.csv')
-df_longi = (
-    df_longi.groupby('participant', group_keys=False)
-    .apply(lambda x: x.sample(n=50, random_state=42) if len(x) > 50 else x)
-)
+# df_longi = (
+#     df_longi.groupby('participant', group_keys=False)
+#     .apply(lambda x: x.sample(n=50, random_state=42) if len(x) > 50 else x)
+# )
 df_longi = df_longi.rename(columns={"tb_status": "disease_status"})
-df_0 = df_longi[df_longi['disease_status'] == 0]
-df_1 = df_longi[df_longi['disease_status'] == 1]
-df_0_down = resample(df_0, replace=False, n_samples=3000, random_state=42)
-df_longi = pd.concat([df_0_down, df_1]).sample(frac=1, random_state=42).reset_index(drop=True)
+# df_0 = df_longi[df_longi['disease_status'] == 0]
+# df_1 = df_longi[df_longi['disease_status'] == 1]
+# df_0_down = resample(df_0, replace=False, n_samples=3000, random_state=42)
+# df_longi = pd.concat([df_0_down, df_1]).sample(frac=1, random_state=42).reset_index(drop=True)
 
 df_solic = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/coda/solicited_original.csv')
 df_solic = df_solic.rename(columns={"tb_status": "disease_status"})
-df_0 = df_solic[df_solic['disease_status'] == 0]
-df_1 = df_solic[df_solic['disease_status'] == 1]
-df_0_down = resample(df_0, replace=False, n_samples=1800, random_state=42)
-df_solic = pd.concat([df_0_down, df_1]).sample(frac=1, random_state=42).reset_index(drop=True)
+# df_0 = df_solic[df_solic['disease_status'] == 0]
+# df_1 = df_solic[df_solic['disease_status'] == 1]
+# df_0_down = resample(df_0, replace=False, n_samples=1800, random_state=42)
+# df_solic = pd.concat([df_0_down, df_1]).sample(frac=1, random_state=42).reset_index(drop=True)
 
 
 df_tbscreen = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/TBscreen_Dataset/metadata_longitudinal.csv')
-df_tbscreen = (
-    df_tbscreen.groupby('participant', group_keys=False)
-    .apply(lambda x: x.sample(n=50, random_state=42) if len(x) > 50 else x)
-)
+# df_tbscreen = (
+#     df_tbscreen.groupby('participant', group_keys=False)
+#     .apply(lambda x: x.sample(n=50, random_state=42) if len(x) > 50 else x)
+# )
 
 df_train_tbscreen = df_tbscreen[df_tbscreen['split'] == 'train'].reset_index(drop=True)
 df_test_tbscreen   = df_tbscreen[df_tbscreen['split'] == 'validation'].reset_index(drop=True)
@@ -187,7 +187,14 @@ logger.info(hps)
 writer = SummaryWriter(log_dir=hps.model_dir)
 writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
 
-collate_fn = CoughDatasetsCollate(hps.data.many_class)
+if True:
+    from transformers import Qwen2_5OmniProcessor
+    collate_fn = CoughDatasetsProcessorCollate(hps.data.many_class, 
+                                               processor=Qwen2_5OmniProcessor.from_pretrained("Qwen/Qwen2.5-Omni-3B"), 
+                                               sampling_rate=hps.data.sampling_rate)
+else:
+    collate_fn = CoughDatasetsCollate(hps.data.many_class)
+
 train_dataset = CoughDatasets(df_train.values, hps.data, train=True)
 val_dataset = CoughDatasets(df_test.values, hps.data, train=False)
 
@@ -241,6 +248,20 @@ pool_model = pool_net(hps.model.feature_dim, **hps.model)
 if ssl_model != None:
     ssl_model.model_pooling = pool_model
     pool_model = ssl_model
+if ssl_model_type == "qwen_ssl":
+    logger.info("✨ Using Qwen Model")
+if ssl_model_type == "qwen_ssl":
+    from peft import get_peft_model, LoraConfig
+    lora_config = LoraConfig(
+        r=hps.model.lora_rank,
+        lora_alpha=hps.model.lora_alpha,
+        target_modules=hps.model.target_modules,
+        lora_dropout=0.05,
+        bias="none",
+    )
+    pool_model.audio_tower = get_peft_model(pool_model.audio_tower, lora_config)
+    print("Trainable parameters:", sum(p.numel() for p in pool_model.parameters() if p.requires_grad))
+    pool_model.audio_tower.print_trainable_parameters()
 
 pool_model = pool_model.cuda()
 optimizer_p = torch.optim.AdamW(list(filter(lambda p: p.requires_grad, pool_model.parameters())), hps.train.learning_rate, betas=hps.train.betas, eps=hps.train.eps)
@@ -300,8 +321,9 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
         x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True)
         with torch.amp.autocast("cuda", enabled=True):
             grl_lambda = getattr(hps.model, "grl_lambda", 0.0)
-            out_model = pool_model(audio, attention_mask=attention_masks, grl_lambda=grl_lambda_schedule(global_step, len(train_loader) * 20 , grl_lambda))
-        
+            out_model = pool_model(audio, attention_mask=attention_masks, 
+                                   grl_lambda=grl_lambda_schedule(global_step, len(train_loader) * 20 , grl_lambda))
+
             ld = utils.many_loss_category(out_model["disease_logits"], dse_ids, loss_type=hps.train.loss_function, weights=class_weights_tensor, model=pool_model)
             logit_keys = [k for k in out_model.keys() if k.endswith("_logits") and k != "disease_logits"]
             loss_cfg = [(0.1, spk_ids), (0.1, gndr_ids)]
@@ -382,8 +404,9 @@ for epoch in range(epoch_str, hps.train.epochs + 1):
             spk_ids = othr_ids[0].cuda(non_blocking=True).long()
             gndr_ids = othr_ids[1].cuda(non_blocking=True).long()
 
-            x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True).long()
-            out_model = pool_model(audio, attention_mask=attention_masks)
+            with torch.amp.autocast("cuda", enabled=True):
+                x_lengths = torch.tensor(commons.compute_length_from_mask(attention_masks)).cuda(non_blocking=True).long()
+                out_model = pool_model(audio, attention_mask=attention_masks)
 
             # if 'x_rec' in out_model:
             #     recon_loss = F.mse_loss(out_model['x_rec'], audio, reduction='mean')
@@ -463,8 +486,9 @@ def evaluate_model(loader, split_name):
             audio = audio.cuda(non_blocking=True).float().squeeze(1)
             attention_masks = attention_masks.cuda(non_blocking=True).float()
             dse_ids = dse_ids.cuda(non_blocking=True).float()
-
-            logits = pool_model(audio, attention_mask=attention_masks)["disease_logits"]
+            
+            with torch.amp.autocast("cuda", enabled=True):
+                logits = pool_model(audio, attention_mask=attention_masks)["disease_logits"]
             preds = torch.argmax(logits, dim=1)
             labels = np.argmax(dse_ids.cpu().numpy(), axis=-1)
 
@@ -520,7 +544,7 @@ df_solic['sex'] = df_solic['sex'].map(gender_mapping_longi)
 
 df_test = df_solic[hps.data.column_order]
 
-collate_fn = CoughDatasetsCollate(hps.data.many_class)
+#collate_fn = CoughDatasetsCollate(hps.data.many_class)
 val_dataset = CoughDatasets(df_test.values, hps.data, train=False)
 val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size, pin_memory=True, drop_last=True, collate_fn=collate_fn)
 
@@ -546,7 +570,7 @@ df['sex'] = df['sex'].map(gender_mapping_longi)
 
 df_test = df[hps.data.column_order]
 
-collate_fn = CoughDatasetsCollate(hps.data.many_class)
+#collate_fn = CoughDatasetsCollate(hps.data.many_class)
 val_dataset = CoughDatasets(df_test.values, hps.data, train=False)
 val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size, pin_memory=True, drop_last=True, collate_fn=collate_fn)
 
@@ -572,7 +596,7 @@ gender_mapping_longi = {gender: idx for idx, gender in enumerate(df['sex'].uniqu
 df['sex'] = df['sex'].map(gender_mapping_longi)
 df_test = df_test_tbscreen
 
-collate_fn = CoughDatasetsCollate(hps.data.many_class)
+#collate_fn = CoughDatasetsCollate(hps.data.many_class)
 val_dataset = CoughDatasets(df_test.values, hps.data, train=False)
 val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size, pin_memory=True, drop_last=True, collate_fn=collate_fn)
 

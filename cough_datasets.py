@@ -43,10 +43,10 @@ class CoughDatasets(torch.utils.data.Dataset):
         self.mae_training = getattr(hparams, "mae_training", False)
         self.mix_audio = hparams.mix_audio
         self.nClasses = hparams.many_class
-        print(self.train)
+
+        self.processor = None
 
         if self.augment_data:
-            print("Use Data Augmentation")
             self.data_augmentator = DataAugmentator(None, "/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_noises_labels.tsv",
                 None, "/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_rirs_labels.tsv",
                 5.5, ["apply_speed_perturbation", "apply_reverb", "add_background_noise", "apply_pitch_shift", "apply_random_gain"]) # "" apply_reverb add_background_noise
@@ -168,7 +168,7 @@ class CoughDatasets(torch.utils.data.Dataset):
             wav = wav.unsqueeze(0)
             wav = self.transform_train(wav)
             wav = wav.squeeze(0)
-            
+
         return (wavname, wav, dse_id, int(spk_id), int(gndr_id))
 
     def get_audio(self, filename): # random.randint(1, 6)
@@ -209,7 +209,9 @@ class CoughDatasets(torch.utils.data.Dataset):
 class CoughDatasetsCollate():
     """ Zero-pads model inputs and targets based on number of frames per step
     """
-    def __init__(self, many_data=2):
+    def __init__(self, many_data=2, processor=None, sampling_rate=16000):
+        self.processor = processor
+        self.sampling_rate = sampling_rate
         self.many_data = many_data
 
     def __call__(self, batch):
@@ -242,12 +244,45 @@ class CoughDatasetsCollate():
             wav_name.append(batch[i][0])
             wav = batch[ids_sorted_decreasing[i]][1]
             wav_padded[i, :, :wav.shape[-1]] = wav
-            attention_masks[i, :wav.shape[-1]] = 1
+            attention_masks[i, :] = batch[ids_sorted_decreasing[i]][5]
 
             dse_ids[i, :] = batch[ids_sorted_decreasing[i]][2]
             spk_ids[i] = batch[ids_sorted_decreasing[i]][3]
             gndr_ids[i] = batch[ids_sorted_decreasing[i]][4]
-        
+
+        return wav_name, wav_padded, attention_masks, dse_ids, [spk_ids, gndr_ids]
+
+class CoughDatasetsProcessorCollate():
+    """ Zero-pads model inputs and targets based on number of frames per step
+    """
+    def __init__(self, many_data=2, processor=None, sampling_rate=16000):
+        self.processor = processor
+        self.sampling_rate = sampling_rate
+        self.many_data = many_data
+
+    def __call__(self, batch):
+        """Collate's training batch from normalized text and mel-spectrogram
+        PARAMS
+        ------
+        batch: [text_normalized, mel_normalized]
+        """
+        wav_name = [x[0] for x in batch]
+        wavs = [x[1].squeeze().numpy() for x in batch]  # list[np.ndarray]
+        dse_ids = torch.stack([torch.tensor(x[2]).squeeze(0) for x in batch])
+        spk_ids = torch.stack([torch.tensor(x[3]) for x in batch])
+        gndr_ids = torch.stack([torch.tensor(x[4]) for x in batch])
+
+        audio_inputs = self.processor.feature_extractor(
+            wavs,
+            sampling_rate=self.sampling_rate,
+            return_tensors="pt",
+            #padding="max_length",
+            return_attention_mask=True,
+            padding=True
+        )
+        wav_padded = audio_inputs["input_features"]           # [B, n_mels, T]
+        attention_masks = audio_inputs["attention_mask"]   # [B, T]
+
         return wav_name, wav_padded, attention_masks, dse_ids, [spk_ids, gndr_ids]
 
 ############################ Multi Task Datasets

@@ -7,6 +7,8 @@ from torch.hub import load_state_dict_from_url
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from efficientnet_pytorch import EfficientNet
+from torch.nn.utils.rnn import pad_sequence
+from torchcrf import CRF
 
 import torchvision
 from transformers import AutoConfig, AutoFeatureExtractor
@@ -38,6 +40,225 @@ class GRL(nn.Module):
     def forward(self, x):
         return GradReverse.apply(x, self.λ)
 #################################################################################################
+def make_pad_mask(lengths, max_len=None, device=None):
+    if max_len is None:
+        max_len = int(lengths.max().item())
+    idxs = torch.arange(0, max_len, device=device).unsqueeze(0)  # [1, T]
+    mask = (idxs < lengths.unsqueeze(1))  # [B, T]
+    return mask
+
+class MyOwnQwen_CrossAttent(nn.Module):
+    def __init__(self, input_size, regress_hidden_dim, num_transformer_layers,
+                 output_dim, spk_dim, **kwargs):
+        super().__init__()
+
+        from transformers import Qwen2_5OmniThinkerForConditionalGeneration
+        temp_model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
+            "Qwen/Qwen2.5-Omni-3B",
+            torch_dtype="auto",
+            device_map="auto"
+        )
+
+        hidden_proj_dim = 512
+        cross_heads = 8
+
+        self.audio_tower = temp_model.audio_tower
+        del temp_model
+        import gc, torch
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        self.audiotower_hidden_dim = self.audio_tower.config.output_dim
+        self.project_shared = nn.Linear(self.audiotower_hidden_dim, hidden_proj_dim)
+
+        # Branch projections
+        self.spk_proj = nn.Linear(hidden_proj_dim, hidden_proj_dim)
+        self.gender_proj = nn.Linear(hidden_proj_dim, hidden_proj_dim)
+        self.dis_proj = nn.Linear(hidden_proj_dim, hidden_proj_dim)
+
+        self.cross = modules.BidirectionalCrossAttention(hidden_proj_dim, num_heads=cross_heads)
+
+        # TOKEN-LEVEL CE HEADS
+        self.spk_head = nn.Linear(hidden_proj_dim, spk_dim)
+        self.gender_head = nn.Linear(hidden_proj_dim, 2)
+        self.dis_head = nn.Linear(hidden_proj_dim, output_dim)
+
+        # Utterance-level heads
+        self.utt_speaker_cls = nn.Linear(hidden_proj_dim, spk_dim)
+        self.utt_gender_cls = nn.Linear(hidden_proj_dim, 2)
+        self.utt_disease_cls = nn.Linear(hidden_proj_dim, output_dim)
+
+        self.kl_weight = 0.1
+
+
+    def forward(self, input_features, attention_mask=None, grl_lambda=0.0):
+
+        device = input_features.device
+        attention_mask = attention_mask.long()
+
+        audio_feature_lengths = attention_mask.sum(1)
+        input_features = input_features.permute(0,2,1)[attention_mask.bool()].permute(1,0)
+
+        audio_feat_lengths, audio_output_lengths = self.audio_tower._get_feat_extract_output_lengths(
+            audio_feature_lengths
+        )
+
+        x = self.audio_tower(
+            input_features=input_features,
+            feature_lens=audio_feature_lengths,
+            aftercnn_lens=audio_feat_lengths
+        ).last_hidden_state
+
+        x = x.split(audio_output_lengths.tolist(), dim=0)
+        x = pad_sequence(x, batch_first=True)
+
+        z = self.project_shared(x)
+        mask = make_pad_mask(audio_output_lengths, max_len=z.size(1), device=device)
+
+        # latent streams
+        spk_latent = self.spk_proj(z)
+        gender_latent = self.gender_proj(z)
+        dis_latent = self.dis_proj(z)
+
+        spk_stream = spk_latent + gender_latent
+        spk_ctx, dis_ctx = self.cross(spk_stream, dis_latent, a_mask=mask, b_mask=mask)
+
+        # TOKEN-LEVEL EMISSIONS
+        spk_emissions = self.spk_head(spk_ctx)         # [B,T,spk_dim]
+        gender_emissions = self.gender_head(spk_ctx)   # [B,T,2]
+        dis_emissions = self.dis_head(dis_ctx)         # [B,T,out_dim]
+
+        outputs = {}
+        total_loss = 0.0
+
+        # KL ALIGNMENT
+        spk_logp = F.log_softmax(spk_emissions, -1)
+        dis_prob = F.softmax(dis_emissions, -1)
+
+        shared_dim = min(spk_logp.size(-1), dis_prob.size(-1))
+        spk_proj = spk_logp[..., :shared_dim]
+        dis_proj = dis_prob[..., :shared_dim]
+
+        kl_sym = 0.5 * (
+            F.kl_div(spk_proj, dis_proj, reduction='batchmean') +
+            F.kl_div(torch.log(dis_proj+1e-12), torch.exp(spk_proj), reduction='batchmean')
+        )
+
+        total_loss += self.kl_weight * kl_sym
+        outputs['kl_sym'] = kl_sym
+
+        # POOLING HEADS
+        mask_f = mask.float().unsqueeze(-1)
+        pooled_spk = (spk_ctx * mask_f).sum(1) / (mask_f.sum(1)+1e-9)
+        pooled_dis = (dis_ctx * mask_f).sum(1) / (mask_f.sum(1)+1e-9)
+
+        outputs['speaker_logits'] = self.utt_speaker_cls(pooled_spk)
+        outputs['gender_logits']  = self.utt_gender_cls(pooled_spk)
+        outputs['disease_logits'] = self.utt_disease_cls(pooled_dis)
+
+        outputs["internal_loss"] = total_loss
+
+        return outputs
+
+    
+class MyOwnQwen_AudioEncoder(nn.Module):
+    def __init__(self, input_size, regress_hidden_dim, num_transformer_layers, output_dim, spk_dim, **kwargs):
+        super(MyOwnQwen_AudioEncoder, self).__init__()
+
+        from transformers import Qwen2_5OmniThinkerForConditionalGeneration
+        temp_model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
+            "Qwen/Qwen2.5-Omni-3B",
+            torch_dtype="auto",
+            device_map="auto"
+        )
+        self.audio_tower = temp_model.audio_tower
+        self.audiotower_hidden_dim = self.audio_tower.config.output_dim
+
+        self.pooling = layers.AttentiveStatisticsPooling(self.audiotower_hidden_dim, attention_dim=1024)
+        embed_dim = self.audiotower_hidden_dim * 2  # Since ASP outputs 2*input_size
+        dropout = 0.2
+
+        # Projection layers for multi-task learning
+        self.disease_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),  # Use GELU like WavLM
+            nn.LayerNorm(embed_dim // 2, eps=1e-5),
+            nn.Dropout(dropout)
+        )
+        self.speaker_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.LayerNorm(embed_dim // 2, eps=1e-5),
+            nn.Dropout(dropout)
+        )
+
+        # Classifiers
+        self.disease_clf = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, output_dim)
+        )
+
+        self.speaker_clf = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, spk_dim)
+        )
+        
+        self.gender_clf = nn.Sequential(
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, 2)
+        )
+
+
+    def forward(self, input_features, attention_mask=None, grl_lambda=0.0):
+        attention_mask = attention_mask.long()
+
+        audio_feature_lengths = torch.sum(attention_mask, dim=1)
+        input_features = input_features.permute(0, 2, 1)[attention_mask.bool()].permute(1, 0)
+
+        audio_feat_lengths, audio_output_lengths = self.audio_tower._get_feat_extract_output_lengths(
+            audio_feature_lengths if audio_feature_lengths is not None else attention_mask.sum(-1))
+
+        feature_lens = audio_feature_lengths if audio_feature_lengths is not None else attention_mask.sum(-1)
+
+        x = self.audio_tower(
+            input_features=input_features,
+            feature_lens=feature_lens,
+            aftercnn_lens=audio_feat_lengths
+        )
+
+        x = x.last_hidden_state
+        if x.shape[0] != sum(audio_output_lengths.tolist()):
+            raise ValueError("length of audio_features should match audio_output_lengths")
+
+        x = x.split(audio_output_lengths.tolist(), dim=0)
+        x = pad_sequence(x, batch_first=True)  # [batch, max_len, hidden_dim]
+
+        feature_embedding = self.pooling(x)
+        
+        d_emb = self.disease_proj(feature_embedding)    
+        s_emb = self.speaker_proj(feature_embedding) 
+
+        disease_logits = self.disease_clf(d_emb)
+
+        s_in = grad_reverse(s_emb, grl_lambda) if self.training and grl_lambda > 0 else s_emb
+        speaker_logits = self.speaker_clf(s_in)
+        gender_logits = self.gender_clf(s_in)
+
+        return {
+            "disease_logits": disease_logits,
+            "speaker_logits": speaker_logits,
+            "gender_logits": gender_logits,
+            "d_emb": d_emb,
+            "s_emb": s_emb,
+        }
+    
 class PEFTWavlm_MyOwnGradeReversal(nn.Module):
     def __init__(self, input_size, regress_hidden_dim, num_transformer_layers, output_dim, spk_dim, **kwargs):
         super(PEFTWavlm_MyOwnGradeReversal, self).__init__()

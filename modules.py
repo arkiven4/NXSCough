@@ -172,6 +172,54 @@ class SELayer(nn.Module):
         y = self.fc(y).view(b, c, 1, 1)
         return x * y.expand_as(x)
 
+# -----------------------------
+# Cross-attention module
+# -----------------------------
+class BidirectionalCrossAttention(nn.Module):
+    def __init__(self, dim, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.a2b = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.b2a = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.layernorm_a = nn.LayerNorm(dim)
+        self.layernorm_b = nn.LayerNorm(dim)
+        self.ffn_a = nn.Sequential(nn.Linear(dim, dim*4), nn.GELU(), nn.Linear(dim*4, dim))
+        self.ffn_b = nn.Sequential(nn.Linear(dim, dim*4), nn.GELU(), nn.Linear(dim*4, dim))
+
+    def forward(self, a, b, a_mask=None, b_mask=None):
+        # a attends to b
+        a_attn, _ = self.a2b(query=a, key=b, value=b, key_padding_mask=~b_mask if b_mask is not None else None)
+        a = self.layernorm_a(a + a_attn)
+        a = self.layernorm_a(a + self.ffn_a(a))
+
+        # b attends to a
+        b_attn, _ = self.b2a(query=b, key=a, value=a, key_padding_mask=~a_mask if a_mask is not None else None)
+        b = self.layernorm_b(b + b_attn)
+        b = self.layernorm_b(b + self.ffn_b(b))
+
+        return a, b
+
+# -----------------------------
+# CRF sequence head wrapper
+# -----------------------------
+from torchcrf import CRF
+class CRFSequenceHead(nn.Module):
+    def __init__(self, hidden_dim, num_labels):
+        super().__init__()
+        self.emitter = nn.Linear(hidden_dim, num_labels)
+        self.crf = CRF(num_labels, batch_first=True)
+
+    def forward_emissions(self, x):
+        # x: [B, T, H]
+        return self.emitter(x)  # emissions (unnormalized logits)
+
+    def loss(self, emissions, tags, mask):
+        # returns negative log-likelihood (mean)
+        nll = -self.crf(emissions, tags, mask=mask, reduction='mean')
+        return nll
+
+    def decode(self, emissions, mask):
+        return self.crf.decode(emissions, mask=mask)
+
 # class LayerNorm(nn.Module):
 #   def __init__(self, channels, eps=1e-4):
 #       super().__init__()
