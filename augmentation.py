@@ -15,13 +15,14 @@ class DataAugmentator:
         augmentation_rirs_directory,
         augmentation_rirs_labels_path,
         augmentation_window_size_secs,
-        augmentation_effects,
+        augmentation_probability,
     ):
         
         self.augmentation_directory = augmentation_noises_directory # Background noises directory
         self.rirs_directory = augmentation_rirs_directory # RIRs directory
         self.window_size_secs = augmentation_window_size_secs
-        self.augmentation_effects = augmentation_effects
+        self.augmentation_effects = ["apply_speed_perturbation", "apply_pitch_shift", "apply_reverb", "add_background_noise", "apply_random_gain"]
+        self.augmentation_probability = augmentation_probability
 
         self.create_augmentation_list(augmentation_noises_labels_path)
         self.create_rir_list(augmentation_rirs_labels_path) 
@@ -29,7 +30,7 @@ class DataAugmentator:
         # TODO move to settings
         #self.EFFECTS = ["apply_speed_perturbation", "apply_reverb", "add_background_noise"]    
         self.PITCH_SHIFTS = [-1, 1]          
-        self.SPEEDS = ["0.9", "1.1"] # If 1 is an option, no augmentation is done!
+        self.SPEEDS = [0.9, 1.1] # If 1 is an option, no augmentation is done!
         self.SNR_NOISE_RANGE = [15, 35]
         self.SNR_SPEECH_RANGE = [15, 35]
         self.SNR_MUSIC_RANGE = [15, 35]
@@ -43,13 +44,11 @@ class DataAugmentator:
         
     
     def create_augmentation_list(self, augmentation_labels_path):
-        
         with open(augmentation_labels_path) as handle:
             self.augmentation_list = handle.readlines()
     
 
     def create_rir_list(self, rirs_labels_path):
-        
         with open(rirs_labels_path) as handle:
             self.rirs_list = handle.readlines()
     
@@ -69,7 +68,7 @@ class DataAugmentator:
         return audio_tensor, sample_rate
 
     def apply_speed_perturbation(self, audio, sample_rate):
-        speed = float(random.choice(self.SPEEDS))
+        speed = random.uniform(self.SPEEDS[0], self.SPEEDS[1])
         audio_np = audio.squeeze().numpy() if torch.is_tensor(audio) else audio
         perturbed = librosa.effects.time_stretch(audio_np, rate=speed)
         return torch.tensor(perturbed, dtype=torch.float32).unsqueeze(0) if torch.is_tensor(audio) else perturbed
@@ -80,16 +79,13 @@ class DataAugmentator:
             path = os.path.join(self.rirs_directory, random.choice(self.rirs_list).strip())
         else:
             path = random.choice(self.rirs_list).strip()
+
         try: 
             rir_wav, rir_sample_rate = self.load_audio_safe(path)
         except RuntimeError as e:
-            self.number_of_misses += 1
-            #logger.info(f"The number of misses that we have is {self.number_of_misses}")
-            #logger.error(f"Error loading RIR from path: {path}. Error: {str(e)}")
             return audio
 
         if rir_sample_rate != sample_rate:
-            # Convert to numpy for librosa resampling
             if isinstance(rir_wav, torch.Tensor):
                 rir_np = rir_wav.squeeze().cpu().numpy()
             else:
@@ -103,7 +99,6 @@ class DataAugmentator:
         normalized_rir = rir_wav[:, int(rir_sample_rate * 0.01) : int(rir_sample_rate * 1.3)]
         normalized_rir = normalized_rir / torch.norm(normalized_rir, p=2)
     
-
         # there is an speciefic file that is causing trouble bc it is of shape [8, 56889]
         normalized_rir = torch.mean(normalized_rir, dim=0)
         normalized_rir = normalized_rir.view(1, -1)
@@ -145,24 +140,23 @@ class DataAugmentator:
         return torch.from_numpy(shifted_audio).float()
     
     def apply_random_gain(self, audio):
-            """
-            Apply random gain to waveform.
+        """
+        Apply random gain to waveform.
 
-            Args:
-                audio (torch.Tensor): waveform tensor of shape [1, N] or [C, N]
-                gain_db_range (tuple): min and max gain in decibels
+        Args:
+            audio (torch.Tensor): waveform tensor of shape [1, N] or [C, N]
+            gain_db_range (tuple): min and max gain in decibels
 
-            Returns:
-                torch.Tensor: waveform with random gain applied
-            """
-            gain_db_range = random.choice(self.GAIN_DB)
-            gain_db = random.uniform(*gain_db_range)
-            gain = 10 ** (gain_db / 20)
-            augmented_audio = torch.clamp(audio * gain, -1.0, 1.0)
-            return augmented_audio
+        Returns:
+            torch.Tensor: waveform with random gain applied
+        """
+        gain_db_range = random.choice(self.GAIN_DB)
+        gain_db = random.uniform(*gain_db_range)
+        gain = 10 ** (gain_db / 20)
+        augmented_audio = torch.clamp(audio * gain, -1.0, 1.0)
+        return augmented_audio
     
     def get_SNR_bounds(self, background_audio_type):
-
         if background_audio_type == "noise":
             return self.SNR_NOISE_RANGE
         elif background_audio_type == "speech":
@@ -172,16 +166,11 @@ class DataAugmentator:
         else:
             return self.SNR_NOISE_RANGE
             
-    
     def sample_random_SNR(self, background_audio_type):
-
         snr_bounds = self.get_SNR_bounds(background_audio_type)
-        
         return random.uniform(snr_bounds[0], snr_bounds[1])
     
-    
     def crop_noise(self, noise, noise_sample_rate, window_size_secs):
-
         noise_duration_samples = noise.size()[1]
         noise_duration_secs = noise_duration_samples / noise_sample_rate
         window_size_samples = int(window_size_secs * noise_sample_rate)
@@ -189,24 +178,20 @@ class DataAugmentator:
         if noise_duration_secs <=  window_size_secs:
             cropped_noise = noise[:, :]
         else:
-            start = random.randint(0, noise_duration_samples - window_size_samples)
+            start = random.randint(int(0.5 * noise_sample_rate), noise_duration_samples - window_size_samples)
             end = start + window_size_samples
-            cropped_noise = noise[:, start : end]
+            cropped_noise = noise[:, start:end]
         
         return cropped_noise
     
 
     def pad_noise(self, noise, audio):
-
         pad_left = max(0, audio.shape[1] - noise.shape[1])
-
         cropped_noise_padded = torch.nn.functional.pad(noise, (pad_left, 0), mode = "constant")
-
         return cropped_noise_padded
     
     
     def add_background_noise(self, audio, sample_rate):
-            
         background_audio_line = random.choice(self.augmentation_list).strip()
 
         background_audio_name = background_audio_line.split("\t")[0].strip()
@@ -216,7 +201,18 @@ class DataAugmentator:
             path = os.path.join(self.augmentation_directory, background_audio_name)
         else:
             path = background_audio_name
-        noise, noise_sample_rate = self.load_audio_safe(path)
+        
+        try:
+            noise, noise_sample_rate = self.load_audio_safe(path)
+        except Exception as e:
+            print(f"Error loading noise file {path}: {e}")
+            return audio  # Return original audio on error
+        
+        # Check if noise is silent or empty
+        if noise.numel() == 0 or torch.max(torch.abs(noise)) < 1e-8:
+            print(f"Warning: Silent or empty noise file {path}, returning original audio")
+            return audio
+        
         if noise_sample_rate != sample_rate:
             # Convert to numpy for librosa resampling
             if isinstance(noise, torch.Tensor):
@@ -227,28 +223,55 @@ class DataAugmentator:
             noise = torch.from_numpy(resampled_noise).float().unsqueeze(0)
             noise_sample_rate = sample_rate
 
-        # TODO first loading the audio and then cropping is unefficient
+        # Crop noise
         cropped_noise = self.crop_noise(
             noise, 
             noise_sample_rate, 
-            min(self.window_size_secs, int(audio.size()[1] / sample_rate)),
+            min(self.window_size_secs, audio.size()[1] / sample_rate),
         )
+
+        # Check if cropped noise is empty or silent
+        if cropped_noise.numel() == 0 or torch.max(torch.abs(cropped_noise)) < 1e-8:
+            print("Warning: Cropped noise is empty or silent, returning original audio")
+            return audio
 
         padded_cropped_noise = self.pad_noise(cropped_noise, audio)
 
+        # Final check after padding
+        if padded_cropped_noise.numel() == 0 or torch.max(torch.abs(padded_cropped_noise)) < 1e-8:
+            print("Warning: Padded noise is empty or silent, returning original audio")
+            return audio
+
         audio_SNR_db = self.sample_random_SNR(background_audio_type)
         
-        # Manual implementation of add_noise functionality
         # Calculate signal and noise power
         signal_power = torch.mean(audio ** 2)
         noise_power = torch.mean(padded_cropped_noise ** 2)
+        
+        # Add minimum noise floor to prevent zero power
+        min_power = 1e-10
+        if noise_power < min_power:
+            print(f"Warning: Very low noise power ({noise_power}), adding noise floor")
+            noise_power = min_power
+        
+        if signal_power < min_power:
+            print(f"Warning: Very low signal power ({signal_power}), returning original audio")
+            return audio
         
         # Calculate scaling factor based on desired SNR
         snr_linear = 10 ** (audio_SNR_db / 10.0)
         scaling_factor = torch.sqrt(signal_power / (noise_power * snr_linear))
         
+        # Clamp scaling factor to reasonable range
+        scaling_factor = torch.clamp(scaling_factor, 1e-6, 100.0)
+        
         # Add scaled noise to signal
         noisy_audio = audio + padded_cropped_noise * scaling_factor
+        
+        # Check final result
+        if torch.isnan(noisy_audio).any() or torch.isinf(noisy_audio).any():
+            print("Warning: Final audio contains NaN/inf values, returning original audio")
+            return audio
 
         return noisy_audio
         
@@ -259,12 +282,21 @@ class DataAugmentator:
 
         The output shape is [1, len(waveform)]
         """
-        
-        effect = random.choice(self.augmentation_effects)
-        
-        # getattr(self, effect) is equivalent to apply self.effect(audio, sample_rate)
+        if len(self.augmentation_probability) != len(self.augmentation_effects):
+            raise ValueError(f"Number of probabilities ({len(self.augmentation_probability)}) must match number of effects ({len(self.augmentation_effects)})")
 
-        augmented_waveform = getattr(self, effect)(audio, sample_rate)
+        available_effects = self.augmentation_effects.copy()
+        available_probabilities = self.augmentation_probability.copy()
+        num_effects = random.randint(1, 2)
+        
+        augmented_waveform = audio
+        for _ in range(num_effects):
+            effect = random.choices(available_effects, weights=available_probabilities)[0]
+            augmented_waveform = getattr(self, effect)(augmented_waveform, sample_rate)
+
+            effect_index = available_effects.index(effect)
+            available_effects.pop(effect_index)
+            available_probabilities.pop(effect_index)
         
         return augmented_waveform
 
