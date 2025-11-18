@@ -47,9 +47,9 @@ class CoughDatasets(torch.utils.data.Dataset):
         self.processor = None
 
         if self.augment_data:
-            self.data_augmentator = DataAugmentator(None, "/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_noises_labels.tsv",
+            self.data_augmentator = DataAugmentator(None, "/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_noises_speechs_labels.tsv",
                 None, "/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_rirs_labels.tsv",
-                5.5, ["apply_speed_perturbation", "apply_reverb", "add_background_noise", "apply_pitch_shift", "apply_random_gain"]) # "" apply_reverb add_background_noise
+                5.5, [0.3, 0.15, 0.2, 0.4, 0.0]) # "" apply_reverb add_background_noise
 
         if self.mean_std_norm:
             with open(f"wav_stats.pickle", 'rb') as f:
@@ -244,7 +244,7 @@ class CoughDatasetsCollate():
             wav_name.append(batch[i][0])
             wav = batch[ids_sorted_decreasing[i]][1]
             wav_padded[i, :, :wav.shape[-1]] = wav
-            attention_masks[i, :] = batch[ids_sorted_decreasing[i]][5]
+            attention_masks[i, :wav.shape[-1]] = 1
 
             dse_ids[i, :] = batch[ids_sorted_decreasing[i]][2]
             spk_ids[i] = batch[ids_sorted_decreasing[i]][3]
