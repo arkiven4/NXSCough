@@ -28,7 +28,7 @@ class DataAugmentator:
 
         # TODO move to settings
         #self.EFFECTS = ["apply_speed_perturbation", "apply_reverb", "add_background_noise"]    
-        self.PITCH_SHIFTS = [-3, -2, -1, 1, 2, 3]          
+        self.PITCH_SHIFTS = [-1, 1]          
         self.SPEEDS = ["0.9", "1.1"] # If 1 is an option, no augmentation is done!
         self.SNR_NOISE_RANGE = [15, 35]
         self.SNR_SPEECH_RANGE = [15, 35]
@@ -63,6 +63,9 @@ class DataAugmentator:
         if len(data.shape) > 1:
             data = data.mean(axis=1)
         audio_tensor = torch.from_numpy(data)
+        # Ensure tensor is 2D with shape [1, N]
+        if audio_tensor.dim() == 1:
+            audio_tensor = audio_tensor.unsqueeze(0)
         return audio_tensor, sample_rate
 
     def apply_speed_perturbation(self, audio, sample_rate):
