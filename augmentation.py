@@ -251,7 +251,7 @@ class DataAugmentator:
         # Add minimum noise floor to prevent zero power
         min_power = 1e-10
         if noise_power < min_power:
-            print(f"Warning: Very low noise power ({noise_power}), adding noise floor")
+            #print(f"Warning: Very low noise power ({noise_power}), adding noise floor")
             noise_power = min_power
         
         if signal_power < min_power:

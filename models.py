@@ -178,41 +178,13 @@ class MyOwnQwen_AudioEncoder(nn.Module):
         self.pooling = layers.AttentiveStatisticsPooling(self.audiotower_hidden_dim, attention_dim=1024)
         embed_dim = self.audiotower_hidden_dim * 2  # Since ASP outputs 2*input_size
         dropout = 0.2
-
-        # Projection layers for multi-task learning
-        self.disease_proj = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim // 2),
-            nn.GELU(),  # Use GELU like WavLM
-            nn.LayerNorm(embed_dim // 2, eps=1e-5),
-            nn.Dropout(dropout)
-        )
-        self.speaker_proj = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim // 2),
-            nn.GELU(),
-            nn.LayerNorm(embed_dim // 2, eps=1e-5),
-            nn.Dropout(dropout)
-        )
-
-        # Classifiers
-        self.disease_clf = nn.Sequential(
-            nn.Linear(embed_dim // 2, embed_dim // 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(embed_dim // 4, output_dim)
-        )
-
-        self.speaker_clf = nn.Sequential(
-            nn.Linear(embed_dim // 2, embed_dim // 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(embed_dim // 4, spk_dim)
-        )
         
-        self.gender_clf = nn.Sequential(
-            nn.Linear(embed_dim // 2, embed_dim // 4),
-            nn.GELU(),
+        # Projection layers for multi-task learning
+        self.disease_clf = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(embed_dim // 4, 2)
+            nn.Linear(embed_dim // 2, output_dim)
         )
 
 
@@ -241,22 +213,9 @@ class MyOwnQwen_AudioEncoder(nn.Module):
         x = pad_sequence(x, batch_first=True)  # [batch, max_len, hidden_dim]
 
         feature_embedding = self.pooling(x)
-        
-        d_emb = self.disease_proj(feature_embedding)    
-        s_emb = self.speaker_proj(feature_embedding) 
-
-        disease_logits = self.disease_clf(d_emb)
-
-        s_in = grad_reverse(s_emb, grl_lambda) if self.training and grl_lambda > 0 else s_emb
-        speaker_logits = self.speaker_clf(s_in)
-        gender_logits = self.gender_clf(s_in)
-
+        disease_logits = self.disease_clf(feature_embedding)
         return {
             "disease_logits": disease_logits,
-            "speaker_logits": speaker_logits,
-            "gender_logits": gender_logits,
-            "d_emb": d_emb,
-            "s_emb": s_emb,
         }
     
 class PEFTWavlm_MyOwnGradeReversal(nn.Module):
@@ -324,6 +283,84 @@ class PEFTWavlm_MyOwnGradeReversal(nn.Module):
             "s_emb": s_emb,
         }
 
+class WavLMEncoder_MyOwn(nn.Module):
+    def __init__(self, input_size, regress_hidden_dim, num_transformer_layers, output_dim, spk_dim, **kwargs):
+        super(WavLMEncoder_MyOwn, self).__init__()
+
+        config = AutoConfig.from_pretrained("microsoft/wavlm-large")
+        self.feature_extractor = layers.WavLMFeatureEncoder(config)
+        self.feature_projection = layers.WavLMFeatureProjection(config)
+
+        embed_dim = 1024
+        num_heads = 16
+        dropout = 0.1
+
+        self.pos_conv_embed = nn.Conv1d(
+            embed_dim, embed_dim, kernel_size=128, padding=64, groups=16
+        )
+        self.layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+
+        self.attention_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=embed_dim,
+                nhead=num_heads,
+                dim_feedforward=embed_dim * 4,  # 4096 for WavLM-large
+                dropout=dropout,
+                activation='gelu',  # WavLM uses GELU
+                layer_norm_eps=1e-5,
+                batch_first=True,
+                norm_first=True  # Pre-norm like WavLM
+            ) for _ in range(num_transformer_layers)
+        ])
+        self.final_layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+        self.layer_weights = nn.Parameter(torch.ones(num_transformer_layers + 1))
+        self.pooling = nn.AdaptiveAvgPool1d(1)
+
+        # Classifiers
+        self.disease_clf = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 2, output_dim)
+        )
+
+
+    def forward(self, x, attention_mask=None, grl_lambda=0.0):
+        extract_features = self.feature_extractor(x)
+        extract_features = extract_features.transpose(1, 2)
+        hidden_states, extract_features = self.feature_projection(extract_features) # B, T, D
+
+        pos_conv_output = self.pos_conv_embed(hidden_states.transpose(1, 2))
+        pos_conv_output = pos_conv_output.transpose(1, 2)
+        min_seq_len = min(hidden_states.size(1), pos_conv_output.size(1))
+        hidden_states = hidden_states[:, :min_seq_len, :]
+        pos_conv_output = pos_conv_output[:, :min_seq_len, :]
+
+        hidden_states = hidden_states + pos_conv_output
+        hidden_states = self.layer_norm(hidden_states)
+
+        layer_outputs = [hidden_states]
+
+        for layer in self.attention_layers:
+            hidden_states = layer(hidden_states)
+            layer_outputs.append(hidden_states)
+        
+        hidden_states = self.final_layer_norm(hidden_states)
+        layer_outputs[-1] = hidden_states
+        layer_weights_normalized = torch.softmax(self.layer_weights, dim=0)
+        weighted_hidden_states = torch.zeros_like(hidden_states)
+        for i, layer_output in enumerate(layer_outputs):
+            weighted_hidden_states += layer_weights_normalized[i] * layer_output
+        
+        hidden_states = weighted_hidden_states.transpose(1, 2)  # [B, embed_dim, T]
+        feature_embedding = self.pooling(hidden_states).squeeze(-1)  # [B, embed_dim]
+        
+        disease_logits = self.disease_clf(feature_embedding)
+
+        return {
+            "disease_logits": disease_logits,
+        }
+    
 class WavLMEncoder_MyOwnGradeReversal(nn.Module):
     def __init__(self, input_size, regress_hidden_dim, num_transformer_layers, output_dim, spk_dim, **kwargs):
         super(WavLMEncoder_MyOwnGradeReversal, self).__init__()
@@ -553,6 +590,75 @@ class SE_Trans(nn.Module):
         }
 
 from torchvision.models import resnet50
+
+
+class ResNet50Mel(nn.Module):
+    def __init__(self,
+        input_size,
+        output_dim,
+        spk_dim,
+        embed_dim=2048,
+        dropout=0.3,
+        grl_lambda=1.0,
+        **kwargs): 
+        super().__init__()
+        
+        base = resnet50(pretrained=True)
+
+        # Replace first conv to handle 1-channel input (mel)
+        base.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.backbone = nn.Sequential(
+            base.conv1,
+            base.bn1,
+            base.relu,
+            base.maxpool,
+            base.layer1,
+            base.layer2,
+            base.layer3,
+            base.layer4,
+        )
+
+        # Global pooling handles variable time dimension
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        #self.global_pool = layers.AttentiveStatisticsPooling(embed_dim, attention_dim=1024)
+        #embed_dim = embed_dim * 2
+
+        self.disease_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 2, output_dim),
+        )
+
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x, attention_mask=None, grl_lambda=0.0):
+        """
+        x: [B, 1, F, T], T can vary per batch element
+        """
+        x = x.unsqueeze(1)
+        feat = self.backbone(x)                # [B, 2048, F', T']
+        feat = F.adaptive_avg_pool2d(feat, (feat.size(2), 1))
+        pooled = self.global_pool(feat).flatten(1)
+
+        # Attentive
+        #feat = feat.squeeze(-1).permute(0, 2, 1)
+        #pooled = self.global_pool(feat)#.flatten(1)  # [B, 2048]
+
+        disease_logits = self.disease_head(pooled)
+
+        return {
+            "disease_logits": disease_logits,
+        }
+    
 class ResNet50MelAdversarial(nn.Module):
     def __init__(self,
         input_size,
@@ -704,6 +810,69 @@ class SwinCoughClassifier(nn.Module):
 
 from torchvision.models.vision_transformer import VisionTransformer, vit_b_16
 import torch.nn.functional as F
+class ViTMel(nn.Module):
+    def __init__(
+        self,
+        input_size,
+        output_dim,
+        spk_dim,
+        embed_dim: int = 768,
+        patch_size: int = 16,
+        grl_lambda: float = 1.0,
+        dropout: float = 0.3,
+        **kwargs
+    ):
+        super().__init__()
+
+        # Use torchvision's ViT backbone (requires fixed-size patch, but variable time is fine with padding)
+        self.vit = vit_b_16(pretrained=True)
+        # Modify first conv layer for 1-channel input
+        self.vit.conv_proj = nn.Conv2d(1, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+        # Shared bottleneck
+        self.disease_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.LayerNorm(embed_dim // 2),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 2, output_dim),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x, attention_mask=None, grl_lambda=0.0):
+        """
+        x: [B, 1, F, T] (mel-spectrogram, variable T)
+        """
+        x = x.unsqueeze(1)
+        _, _, _, T = x.shape
+        pad_T = (16 - (T % 16)) % 16
+        if pad_T > 0:
+            x = nn.functional.pad(x, (0, pad_T))
+
+        x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+        vit_out = self.vit._process_input(x)
+
+        # Extract tokens and class embedding
+        n = vit_out.shape[0]
+        cls_token = self.vit.class_token.expand(n, -1, -1)
+        vit_out = torch.cat((cls_token, vit_out), dim=1)
+        vit_out = self.vit.encoder(vit_out)
+        pooled = vit_out[:, 0]  # CLS token as global embedding
+
+        disease_logits = self.disease_head(pooled)
+        
+        return {
+            "disease_logits": disease_logits,
+        }
+    
 class ViTMelAdversarial(nn.Module):
     def __init__(
         self,

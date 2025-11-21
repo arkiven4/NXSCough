@@ -1,4 +1,4 @@
-import argparse, gc, glob, json, logging, math, os, random, socket, string, subprocess, sys
+import argparse, gc, glob, json, logging, math, os, random, socket, string, subprocess, sys, hashlib
 import librosa
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,6 +9,7 @@ from sklearn.metrics import accuracy_score, f1_score
 from tensorboard.backend.event_processing import event_accumulator
 from torchaudio import transforms as T
 from sklearn.model_selection import StratifiedGroupKFold, train_test_split
+from scipy.signal import resample
 
 import losses
 MATPLOTLIB_FLAG = False
@@ -435,6 +436,12 @@ def generate_random_code(length=3):
     chars = string.ascii_uppercase + string.digits
     return ''.join(random.choices(chars, k=length))
 
+def seed_from_path(path):
+    h = hashlib.md5(path.encode()).hexdigest()
+    seed = int(h[:8], 16) 
+    random.seed(seed)
+    np.random.seed(seed)
+
 def cut_pad_sample_torchaudio(data, sample_rate, desired_length, pad_types='zero', right_pad_shift_sec=0.04):
     fade_samples_ratio = 6
     fade_samples = int(sample_rate / fade_samples_ratio)
@@ -453,27 +460,105 @@ def cut_pad_sample_torchaudio(data, sample_rate, desired_length, pad_types='zero
             pad_left = max((total_pad // 2) - left_shift_samples, 0)
             pad_right = total_pad - pad_left
             data = torch.nn.functional.pad(data, (pad_left, pad_right), mode='constant', value=0.0)
-
         elif pad_types == 'repeat':
             ratio = math.ceil(target_duration / data.shape[-1])
             data = data.repeat(1, ratio)
             data = data[..., :target_duration]
             data = fade_out(data)
-    
     return data
+
+
+def apply_fade_in(audio, sr, sec=0.08):
+    fade_len = int(sr * sec)
+    fade_len = min(fade_len, len(audio))
+    fade = np.linspace(0.0, 1.0, fade_len)
+    audio[:fade_len] *= fade
+    return audio
+
+def apply_fade_out(audio, sr, sec=0.08):
+    fade_len = int(sr * sec)
+    fade_len = min(fade_len, len(audio))
+    fade = np.linspace(1.0, 0.0, fade_len)
+    audio[-fade_len:] *= fade
+    return audio
+
+def speed_perturb(audio, factor_min=0.9, factor_max=1.1):
+    factor = random.uniform(factor_min, factor_max)
+    new_len = int(len(audio) / factor)
+    out = resample(audio, new_len)
+    return np.clip(out, -1.0, 1.0)
+
+def gain_perturb(audio, db_range):
+    low, high = db_range
+    gain_db = random.uniform(low, high)
+    gain = 10 ** (gain_db / 20)
+    out = audio * gain
+    return np.clip(out, -1.0, 1.0)
+
+def generate_gap(sr, low=0.08, high=0.12, noise_gain=0.0001):
+    gap_sec = random.uniform(low, high)
+    gap_len = int(sr * gap_sec)
+    noise = np.random.randn(gap_len) * noise_gain
+    return np.clip(noise, -1.0, 1.0)
+
+def build_tail_segment(audio, sr):
+    tail_gap = generate_gap(sr, low=0.15, high=0.4)
+    tail = audio.copy()
+
+    tail = speed_perturb(tail)
+    tail = gain_perturb(tail, (-5.0, -1.0))
+    return np.concatenate([tail_gap, tail], axis=0)
+
+def augment_and_merge(audio_original, path, sr, gain_db_set=[(-5.0, -1.0)]):
+    seed_from_path(path)
+
+    # fade-out original
+    audio_faded = audio_original.copy()
+    audio_faded = apply_fade_out(audio_faded, sr)
+
+    # extract segment aligned to energy peak
+    sec_i_start = max((audio_original ** 2).argmax() - 2400, 0)
+    sec_segment = audio_original.copy()[sec_i_start:]
+
+    # fade-in
+    sec_segment = apply_fade_in(sec_segment, sr)
+
+    # speed perturbation
+    sec_segment = speed_perturb(sec_segment)
+
+    # gain perturbation
+    gain_db = random.choice(gain_db_set)
+    sec_segment = gain_perturb(sec_segment, gain_db)
+
+    # noise gap prepend
+    gap_seg = generate_gap(sr)
+    sec_segment = np.concatenate([gap_seg, sec_segment], axis=0)
+
+    if random.random() < 0.50:
+        tail_segment = build_tail_segment(sec_segment, sr)
+        sec_segment = np.concatenate([sec_segment, tail_segment], axis=0)
+
+    # merge
+    merged = np.concatenate([audio_faded, sec_segment], axis=0)
+    return merged
+
 
 def load_audio_sample(file_path, db_sample_rate, is_saming_length, desired_length, fade_samples_ratio=6, pad_types='zero'):
     data, sample_rate = librosa.load(file_path, sr=db_sample_rate)
     if sample_rate != db_sample_rate:
         raise ValueError("{} SR doesn't match target {} SR".format(sample_rate, db_sample_rate))
     
-    data = torch.from_numpy(data).unsqueeze(0)
     if is_saming_length:
+      data = torch.from_numpy(data).unsqueeze(0)
       fade_samples = int(sample_rate / fade_samples_ratio)
       fade = T.Fade(fade_in_len=fade_samples, fade_out_len=fade_samples, fade_shape='linear')
       data = fade(data)
       data = cut_pad_sample_torchaudio(data, sample_rate, desired_length, pad_types=pad_types)
-    return data
+
+    if pad_types == "synthesis":
+      data = augment_and_merge(data, path=file_path, sr=sample_rate)
+      
+    return data if torch.is_tensor(data) else torch.from_numpy(data).unsqueeze(0)
 
 def smoothing_tensorboard(values, weight=0.9):
     """EMA smoothing of a curve."""

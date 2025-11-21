@@ -78,75 +78,20 @@ cur_bs = BATCH_SIZE // ACCUMULATION_STEP
 # =============================================================
 # SECTION: Loading Data
 # =============================================================
-df_train_ukcovid = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/ukcovid19/metadata.csv.train')
-df_test_ukcovid = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/ukcovid19/metadata.csv.val')
-df_train_ukcovid = df_train_ukcovid.rename(columns={"file_path": "path_file", 'covid_test_result': 'disease_status', 'gender': 'sex', 'participant_identifier': 'participant'})
-df_test_ukcovid = df_test_ukcovid.rename(columns={"file_path": "path_file", 'covid_test_result': 'disease_status', 'gender': 'sex', 'participant_identifier': 'participant'})
-# df_2 = df_train_ukcovid[df_train_ukcovid['disease_status'] == 2]
-# df_4 = df_train_ukcovid[df_train_ukcovid['disease_status'] == 4]
-# df_2_down = resample(df_2, replace=False, n_samples=9138, random_state=42)
-# df_4_down = resample(df_4, replace=False, n_samples=6000, random_state=42)
-# df_train_ukcovid = pd.concat([df_2_down, df_4_down]).sample(frac=1, random_state=42).reset_index(drop=True)
-# df_2 = df_test_ukcovid[df_test_ukcovid['disease_status'] == 2]
-# df_4 = df_test_ukcovid[df_test_ukcovid['disease_status'] == 4]
-# df_2_down = resample(df_2, replace=False, n_samples=3682, random_state=42)
-# df_4_down = resample(df_4, replace=False, n_samples=1800, random_state=42)
-# df_test_ukcovid = pd.concat([df_2_down, df_4_down]).sample(frac=1, random_state=42).reset_index(drop=True)
+df_train = pd.read_csv('/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/metadata.csv.train')
+df_test = pd.read_csv('/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/metadata.csv.val')
 
-df_longi = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/coda/longitudinal_original.csv')
-# df_longi = (
-#     df_longi.groupby('participant', group_keys=False)
-#     .apply(lambda x: x.sample(n=50, random_state=42) if len(x) > 50 else x)
-# )
-df_longi = df_longi.rename(columns={"tb_status": "disease_status"})
-# df_0 = df_longi[df_longi['disease_status'] == 0]
-# df_1 = df_longi[df_longi['disease_status'] == 1]
-# df_0_down = resample(df_0, replace=False, n_samples=3000, random_state=42)
-# df_longi = pd.concat([df_0_down, df_1]).sample(frac=1, random_state=42).reset_index(drop=True)
+df_train = df_train.reset_index(drop=True)
+df_test = df_test.reset_index(drop=True)
 
-df_solic = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/coda/solicited_original.csv')
-df_solic = df_solic.rename(columns={"tb_status": "disease_status"})
-# df_0 = df_solic[df_solic['disease_status'] == 0]
-# df_1 = df_solic[df_solic['disease_status'] == 1]
-# df_0_down = resample(df_0, replace=False, n_samples=1800, random_state=42)
-# df_solic = pd.concat([df_0_down, df_1]).sample(frac=1, random_state=42).reset_index(drop=True)
-
-
-df_tbscreen = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/TBscreen_Dataset/metadata_longitudinal.csv')
-# df_tbscreen = (
-#     df_tbscreen.groupby('participant', group_keys=False)
-#     .apply(lambda x: x.sample(n=50, random_state=42) if len(x) > 50 else x)
-# )
-
-df_train_tbscreen = df_tbscreen[df_tbscreen['split'] == 'train'].reset_index(drop=True)
-df_test_tbscreen   = df_tbscreen[df_tbscreen['split'] == 'validation'].reset_index(drop=True)
+prob = pd.read_csv("/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/problematics.csv")
+df_train = df_train[~df_train["path_file"].isin(prob["path_file"])]
+df_test = df_test[~df_test["path_file"].isin(prob["path_file"])]
 
 if hps.data.reorder_target:
     cols = hps.data.column_order
-    df_longi = df_longi[cols]
-    df_solic = df_solic[cols]
-
-    df_train_tbscreen = df_train_tbscreen[cols]
-    df_test_tbscreen = df_test_tbscreen[cols]
-
-    df_train_ukcovid = df_train_ukcovid[cols]
-    df_test_ukcovid = df_test_ukcovid[cols]
-    
-    df_train = pd.concat([df_longi, df_train_tbscreen, df_train_ukcovid], ignore_index=True)
-    df_test  = pd.concat([df_solic, df_test_tbscreen, df_test_ukcovid], ignore_index=True)
-
-df_train['sex'] = df_train['sex'].replace({'Male': 0, 'Female': 1})
-df_test['sex']  = df_test['sex'].replace({'Male': 0, 'Female': 1})
-
-participant_mapping_longi = {participant: idx for idx, participant in enumerate(set(np.concatenate([df_train['participant'].unique(), df_test['participant'].unique()])))}
-df_train['participant'] = df_train['participant'].map(participant_mapping_longi)
-df_test['participant'] = df_test['participant'].map(participant_mapping_longi)
-
-df_train['disease_status'] = df_train['disease_status'].replace(4, 0)
-df_test['disease_status'] = df_test['disease_status'].replace(4, 0)
-
-df_train.loc[df_train["disease_status"] == 2, "disease_status"] = 0
-df_test.loc[df_test["disease_status"] == 2, "disease_status"] = 0
+    df_train = df_train[cols]
+    df_test = df_test[cols]
 
 disease_codes = df_train[hps.data.target_column].unique().tolist()
 class_frequencies = df_train[hps.data.target_column].value_counts().to_dict()
@@ -187,7 +132,8 @@ logger.info(hps)
 writer = SummaryWriter(log_dir=hps.model_dir)
 writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
 
-if True:
+# TODO Add Balance get Speaker and Disease
+if hps.model.ssl_model_type.lower() == "qwen_ssl":
     from transformers import Qwen2_5OmniProcessor
     collate_fn = CoughDatasetsProcessorCollate(hps.data.many_class, 
                                                processor=Qwen2_5OmniProcessor.from_pretrained("Qwen/Qwen2.5-Omni-3B"), 
@@ -240,7 +186,7 @@ if ssl_model != None:
     trainable_percentage = 100 * trainable_params / total_params if total_params > 0 else 0
     logger.info(f'Trainable params: {trainable_params} | Total params: {total_params} | Trainable%: {trainable_percentage:.2f}% | Size: {trainable_params/(1e6):.2f}M')
     hps.model.feature_dim = ssl_model.hidden_size_ssl
-hps.model.spk_dim = len(participant_mapping_longi)
+hps.model.spk_dim = 0 #len(participant_mapping_longi)
 
 pool_net = getattr(models, hps.model.pooling_model)
 pool_model = pool_net(hps.model.feature_dim, **hps.model)
@@ -531,38 +477,61 @@ with open(f"{model_dir}/result_summary.txt", "w") as f:
     )
 
 # =============================================================
-# TBCoda Solicited
+# df Test
 # =============================================================
-df_solic = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/coda/solicited_original.csv')
-df_solic = df_solic.rename(columns={"tb_status": "disease_status"})
-
-participant_mapping_longi = {participant: idx for idx, participant in enumerate(set(np.concatenate([df_solic['participant'].unique()])))} # df_solic['participant'].unique()
-df_solic['participant'] = df_solic['participant'].map(participant_mapping_longi)
-
-gender_mapping_longi = {gender: idx for idx, gender in enumerate(df_solic['sex'].unique())}
-df_solic['sex'] = df_solic['sex'].map(gender_mapping_longi)
-
-df_test = df_solic[hps.data.column_order]
+df_test = pd.read_csv('/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/metadata.csv.test')
+df_test = df_test.rename(columns={"tb_status": "disease_status"})
+df_test = df_test[~df_test["path_file"].isin(prob["path_file"])]
+df_test = df_test[hps.data.column_order]
 
 #collate_fn = CoughDatasetsCollate(hps.data.many_class)
 val_dataset = CoughDatasets(df_test.values, hps.data, train=False)
 val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size, pin_memory=True, drop_last=True, collate_fn=collate_fn)
 
-cirdz_metrics = evaluate_model(val_loader, "coda_solicited")
+cirdz_metrics = evaluate_model(val_loader, "df_test")
 
 with open(f"{model_dir}/result_summary.txt", "a") as f:
     f.write(
-        f"==================================== TBCoda Solicited =====================================\n"
+        f"==================================== Test Split =====================================\n"
     )
     f.write(
         f"Val - Acc {cirdz_metrics[0]:.2f} | BalAcc {cirdz_metrics[1]:.2f} | "
         f"Sens {cirdz_metrics[2]:.2f} | Spec {cirdz_metrics[3]:.2f}\n\n"
     )
 
+# # =============================================================
+# # TBCoda Solicited
+# # =============================================================
+# df_solic = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/coda/solicited_original.csv')
+# df_solic = df_solic.rename(columns={"tb_status": "disease_status"})
+
+# participant_mapping_longi = {participant: idx for idx, participant in enumerate(set(np.concatenate([df_solic['participant'].unique()])))} # df_solic['participant'].unique()
+# df_solic['participant'] = df_solic['participant'].map(participant_mapping_longi)
+
+# gender_mapping_longi = {gender: idx for idx, gender in enumerate(df_solic['sex'].unique())}
+# df_solic['sex'] = df_solic['sex'].map(gender_mapping_longi)
+
+# df_test = df_solic[hps.data.column_order]
+
+# #collate_fn = CoughDatasetsCollate(hps.data.many_class)
+# val_dataset = CoughDatasets(df_test.values, hps.data, train=False)
+# val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size, pin_memory=True, drop_last=True, collate_fn=collate_fn)
+
+# cirdz_metrics = evaluate_model(val_loader, "coda_solicited")
+
+# with open(f"{model_dir}/result_summary.txt", "a") as f:
+#     f.write(
+#         f"==================================== TBCoda Solicited =====================================\n"
+#     )
+#     f.write(
+#         f"Val - Acc {cirdz_metrics[0]:.2f} | BalAcc {cirdz_metrics[1]:.2f} | "
+#         f"Sens {cirdz_metrics[2]:.2f} | Spec {cirdz_metrics[3]:.2f}\n\n"
+#     )
+
 # =============================================================
 # CIRDZ
 # =============================================================
-df = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/cirdz/metadata_wavs.csv')
+df = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/cirdz/metadata_wavs_filtered.csv')
 participant_mapping_longi = {participant: idx for idx, participant in enumerate(set(np.concatenate([df['participant'].unique()])))}
 df['participant'] = df['participant'].map(participant_mapping_longi)
 gender_mapping_longi = {gender: idx for idx, gender in enumerate(df['sex'].unique())}
@@ -585,33 +554,33 @@ with open(f"{model_dir}/result_summary.txt", "a") as f:
         f"Sens {cirdz_metrics[2]:.2f} | Spec {cirdz_metrics[3]:.2f}\n\n"
     )
 
-# =============================================================
-# TBScreen
-# =============================================================
-hps.data.column_order = ["path_file", "disease_status", "sex", "participant"]
-df = df_test_tbscreen
-participant_mapping_longi = {participant: idx for idx, participant in enumerate(set(np.concatenate([df['participant'].unique()])))}
-df['participant'] = df['participant'].map(participant_mapping_longi)
-gender_mapping_longi = {gender: idx for idx, gender in enumerate(df['sex'].unique())}
-df['sex'] = df['sex'].map(gender_mapping_longi)
-df_test = df_test_tbscreen
+# # =============================================================
+# # TBScreen
+# # =============================================================
+# hps.data.column_order = ["path_file", "disease_status", "sex", "participant"]
+# df = df_test_tbscreen
+# participant_mapping_longi = {participant: idx for idx, participant in enumerate(set(np.concatenate([df['participant'].unique()])))}
+# df['participant'] = df['participant'].map(participant_mapping_longi)
+# gender_mapping_longi = {gender: idx for idx, gender in enumerate(df['sex'].unique())}
+# df['sex'] = df['sex'].map(gender_mapping_longi)
+# df_test = df_test_tbscreen
 
-#collate_fn = CoughDatasetsCollate(hps.data.many_class)
-val_dataset = CoughDatasets(df_test.values, hps.data, train=False)
-val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size, pin_memory=True, drop_last=True, collate_fn=collate_fn)
+# #collate_fn = CoughDatasetsCollate(hps.data.many_class)
+# val_dataset = CoughDatasets(df_test.values, hps.data, train=False)
+# val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size, pin_memory=True, drop_last=True, collate_fn=collate_fn)
 
-cirdz_metrics = evaluate_model(val_loader, "tbscreen_solicited")
+# cirdz_metrics = evaluate_model(val_loader, "tbscreen_solicited")
 
-with open(f"{model_dir}/result_summary.txt", "a") as f:
-    f.write(
-        f"==================================== TBScreen Solicited =====================================\n"
-    )
-    f.write(
-        f"Val - Acc {cirdz_metrics[0]:.2f} | BalAcc {cirdz_metrics[1]:.2f} | "
-        f"Sens {cirdz_metrics[2]:.2f} | Spec {cirdz_metrics[3]:.2f}\n\n"
-    )
+# with open(f"{model_dir}/result_summary.txt", "a") as f:
+#     f.write(
+#         f"==================================== TBScreen Solicited =====================================\n"
+#     )
+#     f.write(
+#         f"Val - Acc {cirdz_metrics[0]:.2f} | BalAcc {cirdz_metrics[1]:.2f} | "
+#         f"Sens {cirdz_metrics[2]:.2f} | Spec {cirdz_metrics[3]:.2f}\n\n"
+#     )
 
-############################################################################################################
+# ############################################################################################################
 
 utils.plot_loss_from_tensorboard(
     best_lost,

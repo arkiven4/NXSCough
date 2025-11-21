@@ -4,7 +4,7 @@
     "log_interval": 20,
     "seed": 1234,
     "epochs": 10000,
-    "learning_rate": 1e-4,
+    "learning_rate": 3e-5,
     "betas": [0.8, 0.99],
     "eps": 1e-9,
     "lr_decay": 0.999875,
@@ -29,14 +29,14 @@
     "mel_fmax": 8000.0,
 
     "saming_length": false,
-    "desired_length": 2.5,
+    "desired_length": 3.0,
     "fade_samples_ratio": 16,
-    "pad_types": "repeat",
+    "pad_types": "synthesis",
 
-    "acoustic_feature": false,
+    "acoustic_feature": true,
     "feature_type": "melspectogram",
 
-    "multimask_augment": false,
+    "multimask_augment": true,
     "tau": 0.10,
     "nu": 0.10,
     "num_masks": 4,
@@ -54,7 +54,7 @@
     "column_order": ["path_file", "disease_status", "sex", "participant"]
   }, 
   "model": {
-    "ssl_model_type": "qwen_ssl",
+    "ssl_model_type": "nonssl",
 
     "finetune_method": "lora",
     "adapter_hidden_dim": 128,
@@ -65,7 +65,7 @@
     "use_conv_output": true,
 
     "grl_lambda": 5.0,
-    "pooling_model": "MyOwnQwen_CrossAttent",
+    "pooling_model": "ViTMel",
     "feature_dim": 128,
     "p_dropout": 0.1,
     "num_transformer_layers": 12,

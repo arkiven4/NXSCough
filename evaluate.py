@@ -60,35 +60,73 @@ cur_bs = BATCH_SIZE // ACCUMULATION_STEP
 # =============================================================
 # SECTION: Loading Data
 # =============================================================
+df_train = pd.read_csv('/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/metadata.csv.train')
+df_test = pd.read_csv('/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/metadata.csv.val')
 
-df_longi = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/coda/longitudinal_original.csv')
-#df_solic = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/coda/solicited_original.csv')
+df_train = df_train.reset_index(drop=True)
+df_test = df_test.reset_index(drop=True)
 
-participant_mapping_longi = {participant: idx for idx, participant in enumerate(set(np.concatenate([df_longi['participant'].unique()])))} # df_solic['participant'].unique()
-df_longi['participant'] = df_longi['participant'].map(participant_mapping_longi)
-#df_solic['participant'] = df_solic['participant'].map(participant_mapping_longi)
-
-gender_mapping_longi = {gender: idx for idx, gender in enumerate(df_longi['sex'].unique())}
-df_longi['sex'] = df_longi['sex'].map(gender_mapping_longi)
-#df_solic['sex'] = df_solic['sex'].map(gender_mapping_longi)
-
-#df_longi_train, df_longi_val = utils.stratified_group_split(df_longi)
-#df_solic_train, df_solic_val = utils.stratified_group_split(df_solic)
-
-df_train, df_test = train_test_split(
-    df_longi,
-    test_size=0.2,
-    stratify=df_longi[hps.data.target_column],
-    random_state=42,
-)
-#df_train = pd.concat([df_longi_train, df_solic_train], ignore_index=True)
-#df_test = pd.concat([df_longi_val, df_solic_val], ignore_index=True)
+prob = pd.read_csv("/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/problematics.csv")
+df_train = df_train[~df_train["path_file"].isin(prob["path_file"])]
+df_test = df_test[~df_test["path_file"].isin(prob["path_file"])]
 
 if hps.data.reorder_target:
     cols = hps.data.column_order
     df_train = df_train[cols]
     df_test = df_test[cols]
 
+disease_codes = df_train[hps.data.target_column].unique().tolist()
+class_frequencies = df_train[hps.data.target_column].value_counts().to_dict()
+total_samples = len(df_train)
+class_weights = {cls: total_samples / (len(disease_codes) * freq) if freq != 0 else 0 for cls, freq in class_frequencies.items()}
+weights_list = [class_weights[cls] for cls in disease_codes]
+class_weights_tensor = torch.tensor(weights_list, device='cuda', dtype=torch.float)
+print(class_weights_tensor)
+df_train = pd.read_csv('/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/metadata.csv.train')
+df_test = pd.read_csv('/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/metadata.csv.val')
+
+df_train = df_train.reset_index(drop=True)
+df_test = df_test.reset_index(drop=True)
+
+prob = pd.read_csv("/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/problematics.csv")
+df_train = df_train[~df_train["path_file"].isin(prob["path_file"])]
+df_test = df_test[~df_test["path_file"].isin(prob["path_file"])]
+
+if hps.data.reorder_target:
+    cols = hps.data.column_order
+    df_train = df_train[cols]
+    df_test = df_test[cols]
+
+disease_codes = df_train[hps.data.target_column].unique().tolist()
+class_frequencies = df_train[hps.data.target_column].value_counts().to_dict()
+total_samples = len(df_train)
+class_weights = {cls: total_samples / (len(disease_codes) * freq) if freq != 0 else 0 for cls, freq in class_frequencies.items()}
+weights_list = [class_weights[cls] for cls in disease_codes]
+class_weights_tensor = torch.tensor(weights_list, device='cuda', dtype=torch.float)
+print(class_weights_tensor)
+
+pickle_path = 'wav_stats.pickle'
+if not os.path.exists(pickle_path):
+    means, stds = [], []
+    paths = df_train['path_file'].dropna().tolist()
+
+    for path in tqdm(paths, desc="Processing WAV files", unit="file"):
+        if not os.path.isfile(path):
+            continue
+        try:
+            audio, _ = librosa.load(path, sr=None, mono=True)
+            means.append(np.mean(audio))
+            stds.append(np.std(audio))
+        except Exception:
+            continue
+
+    stats = {
+        "mean_db": float(np.mean(means)),
+        "std_db": float(np.mean(stds))
+    }
+
+    with open(pickle_path, 'wb') as f:
+        pickle.dump(stats, f)
 # =============================================================
 # SECTION: Setup Logger, Dataloader
 # =============================================================
@@ -140,7 +178,7 @@ if ssl_model != None:
     trainable_percentage = 100 * trainable_params / total_params if total_params > 0 else 0
     logger.info(f'Trainable params: {trainable_params} | Total params: {total_params} | Trainable%: {trainable_percentage:.2f}% | Size: {trainable_params/(1e6):.2f}M')
     hps.model.feature_dim = ssl_model.hidden_size_ssl
-hps.model.spk_dim = len(participant_mapping_longi)
+hps.model.spk_dim = 0 #len(participant_mapping_longi)
 
 temp_path = tempfile.NamedTemporaryFile(suffix=".py", delete=False).name
 shutil.copy(f"{model_dir}/model_net.py.bak", temp_path)
@@ -226,36 +264,36 @@ with open(f"{model_dir}/evaluate_summary.txt", "w") as f:
 # =============================================================
 # TBCoda Solicited
 # =============================================================
-df_solic = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/coda/solicited_original.csv')
+# df_solic = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/coda/solicited_original.csv')
 
-participant_mapping_longi = {participant: idx for idx, participant in enumerate(set(np.concatenate([df_solic['participant'].unique()])))} # df_solic['participant'].unique()
-df_solic['participant'] = df_solic['participant'].map(participant_mapping_longi)
+# participant_mapping_longi = {participant: idx for idx, participant in enumerate(set(np.concatenate([df_solic['participant'].unique()])))} # df_solic['participant'].unique()
+# df_solic['participant'] = df_solic['participant'].map(participant_mapping_longi)
 
-gender_mapping_longi = {gender: idx for idx, gender in enumerate(df_solic['sex'].unique())}
-df_solic['sex'] = df_solic['sex'].map(gender_mapping_longi)
+# gender_mapping_longi = {gender: idx for idx, gender in enumerate(df_solic['sex'].unique())}
+# df_solic['sex'] = df_solic['sex'].map(gender_mapping_longi)
 
-df_test = df_solic[hps.data.column_order]
+# df_test = df_solic[hps.data.column_order]
 
-collate_fn = CoughDatasetsCollate(hps.data.many_class)
-val_dataset = CoughDatasets(df_test.values, hps.data, train=False)
-val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size, pin_memory=True, drop_last=True, collate_fn=collate_fn)
+# collate_fn = CoughDatasetsCollate(hps.data.many_class)
+# val_dataset = CoughDatasets(df_test.values, hps.data, train=False)
+# val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size, pin_memory=True, drop_last=True, collate_fn=collate_fn)
 
-cirdz_metrics = evaluate_model(val_loader, "coda_solicited")
+# cirdz_metrics = evaluate_model(val_loader, "coda_solicited")
 
-with open(f"{model_dir}/evaluate_summary.txt", "a") as f:
-    f.write(
-        f"==================================== TBCoda Solicited =====================================\n"
-    )
-    f.write(
-        f"Val - Acc {cirdz_metrics[0]:.2f} | BalAcc {cirdz_metrics[1]:.2f} | "
-        f"Sens {cirdz_metrics[2]:.2f} | Spec {cirdz_metrics[3]:.2f}\n\n"
-    )
+# with open(f"{model_dir}/evaluate_summary.txt", "a") as f:
+#     f.write(
+#         f"==================================== TBCoda Solicited =====================================\n"
+#     )
+#     f.write(
+#         f"Val - Acc {cirdz_metrics[0]:.2f} | BalAcc {cirdz_metrics[1]:.2f} | "
+#         f"Sens {cirdz_metrics[2]:.2f} | Spec {cirdz_metrics[3]:.2f}\n\n"
+#     )
 
 # =============================================================
 # CIRDZ
 # =============================================================
 hps.data.column_order = ["path_file", "disease_status", "sex", "participant"]
-df = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/cirdz/metadata_wavs.csv')
+df = pd.read_csv('/run/media/fourier/Data1/Pras/DatabaseLLM/cirdz/metadata_wavs_filtered.csv')
 participant_mapping_longi = {participant: idx for idx, participant in enumerate(set(np.concatenate([df['participant'].unique()])))}
 df['participant'] = df['participant'].map(participant_mapping_longi)
 gender_mapping_longi = {gender: idx for idx, gender in enumerate(df['sex'].unique())}
