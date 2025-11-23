@@ -10,65 +10,94 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from typing import Optional
 
-def init_layer(layer):
-    """Initialize a Linear or Convolutional layer."""
-    nn.init.xavier_uniform_(layer.weight)
+from timm.models.layers import to_2tuple
 
-    if hasattr(layer, "bias"):
-        if layer.bias is not None:
-            layer.bias.data.fill_(0.0)
+###########################################
+# OPERAGT_MAE
+###########################################
 
-def init_bn(bn):
-    """Initialize a Batchnorm layer."""
-    bn.bias.data.fill_(0.0)
-    bn.weight.data.fill_(1.0)
+class PatchEmbed_org(nn.Module):
+    """ Image to Patch Embedding"""
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
+        super().__init__()
+        img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)
+        print(img_size,patch_size)
+        num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
+        self.patch_hw = (img_size[1] // patch_size[1], img_size[0] // patch_size[0])
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = num_patches
+        print('number of patches:', num_patches)
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
 
-def init_gru(rnn):
-    """Initialize a GRU layer."""
+    def forward(self, x):
+        #print('x shape:', x.shape)
+        x = x.unsqueeze(1)
+        B, C, H, W = x.shape
+        # FIXME look at relaxing size constraints
+        #assert H == self.img_size[0] and W == self.img_size[1], \
+        #    f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+        #y = self.proj(x)
+        #print('y:', y.shape)
+        x = self.proj(x).flatten(2).transpose(1, 2)
+        #print('patch embedding:', x.shape)
+        return x
 
-    def _concat_init(tensor, init_funcs):
-        (length, fan_out) = tensor.shape
-        fan_in = length // len(init_funcs)
-
-        for i, init_func in enumerate(init_funcs):
-            init_func(tensor[i * fan_in : (i + 1) * fan_in, :])
-
-    def _inner_uniform(tensor):
-        fan_in = nn.init._calculate_correct_fan(tensor, "fan_in")
-        nn.init.uniform_(tensor, -math.sqrt(3 / fan_in), math.sqrt(3 / fan_in))
-
-    for i in range(rnn.num_layers):
-        _concat_init(
-            getattr(rnn, "weight_ih_l{}".format(i)),
-            [_inner_uniform, _inner_uniform, _inner_uniform],
-        )
-        torch.nn.init.constant_(getattr(rnn, "bias_ih_l{}".format(i)), 0)
-
-        _concat_init(
-            getattr(rnn, "weight_hh_l{}".format(i)),
-            [_inner_uniform, _inner_uniform, nn.init.orthogonal_],
-        )
-        torch.nn.init.constant_(getattr(rnn, "bias_hh_l{}".format(i)), 0)
-
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+class PatchEmbed_new(nn.Module):
+    """ Flexible Image to Patch Embedding
     """
-    embed_dim: output dimension for each position
-    pos: a list of positions to be encoded: size (M,)
-    out: (M, D)
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, stride=10):
+        super().__init__()
+        img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)
+        stride = to_2tuple(stride)
+        
+        self.img_size = img_size
+        self.patch_size = patch_size
+        
+
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=stride) # with overlapped patches
+        #self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+        #self.patch_hw = (img_size[1] // patch_size[1], img_size[0] // patch_size[0])
+        #self.num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
+        _, _, h, w = self.get_output_shape(img_size) # n, emb_dim, h, w
+        self.patch_hw = (h, w)
+        self.num_patches = h*w
+
+    def get_output_shape(self, img_size):
+        # todo: don't be lazy..
+        return self.proj(torch.randn(1,1,img_size[0],img_size[1])).shape 
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        # FIXME look at relaxing size constraints
+        #assert H == self.img_size[0] and W == self.img_size[1], \
+        #    f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+        #x = self.proj(x).flatten(2).transpose(1, 2)
+        x = self.proj(x) # 32, 1, 1024, 128 -> 32, 768, 101, 12
+        x = x.flatten(2) # 32, 768, 101, 12 -> 32, 768, 1212
+        x = x.transpose(1, 2) # 32, 768, 1212 -> 32, 1212, 768
+        return x
+
+def get_2d_sincos_pos_embed_flexible(embed_dim, grid_size, cls_token=False):
     """
-    assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=float)
-    omega /= embed_dim / 2.
-    omega = 1. / 10000**omega  # (D/2,)
+    grid_size: int of the grid height and width
+    return:
+    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
+    """
+    grid_h = np.arange(grid_size[0], dtype=np.float32)
+    grid_w = np.arange(grid_size[1], dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
+    grid = np.stack(grid, axis=0)
 
-    pos = pos.reshape(-1)  # (M,)
-    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
+    grid = grid.reshape([2, 1, grid_size[0], grid_size[1]])
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+    if cls_token:
+        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
+    return pos_embed
 
-    emb_sin = np.sin(out) # (M, D/2)
-    emb_cos = np.cos(out) # (M, D/2)
-
-    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
-    return emb
 
 def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     assert embed_dim % 2 == 0
@@ -80,22 +109,26 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
     return emb
 
-def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
-    """
-    grid_size: int of the grid height and width
-    return:
-    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
-    """
-    grid_h = np.arange(grid_size, dtype=np.float32)
-    grid_w = np.arange(grid_size, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
-    grid = np.stack(grid, axis=0)
 
-    grid = grid.reshape([2, 1, grid_size, grid_size])
-    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    if cls_token:
-        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
-    return pos_embed
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    """
+    embed_dim: output dimension for each position
+    pos: a list of positions to be encoded: size (M,)
+    out: (M, D)
+    """
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float32)
+    omega /= embed_dim / 2.
+    omega = 1. / 10000**omega  # (D/2,)
+
+    pos = pos.reshape(-1)  # (M,)
+    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
+
+    emb_sin = np.sin(out) # (M, D/2)
+    emb_cos = np.cos(out) # (M, D/2)
+
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    return emb
 
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels):

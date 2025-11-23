@@ -621,12 +621,11 @@ def orthogonality_loss(d_emb, s_emb):
     dots = torch.sum(d * s, dim=1)  # (B,)
     return torch.mean(dots * dots)
 
-def many_loss_category(pred, lab, loss_type="CE", test=False, weights=None, gate_weights=None, model=None):
+def many_loss_category(pred, lab, loss_type="CE", test=False, weights=None):
     if test == True:
         pred_labels = torch.max(pred, 1).cpu().numpy()
         lab = lab.cpu().numpy()
 
-        # Compute F1 scores and accuracy
         f1_micro = f1_score(lab, pred_labels, average='micro')
         f1_macro = f1_score(lab, pred_labels, average='macro')
         accuracy = accuracy_score(lab, pred_labels)
@@ -638,37 +637,9 @@ def many_loss_category(pred, lab, loss_type="CE", test=False, weights=None, gate
         return [loss]
     elif loss_type == "BCE":
         criterion = torch.nn.BCEWithLogitsLoss(weight=weights)
-        loss = criterion(pred, lab.unsqueeze(1).float())
-        return [loss]
-    elif loss_type == "MSE":
-        criterion = torch.nn.MSELoss()
         loss = criterion(pred, lab)
-        return [loss]
-    elif loss_type == "L1":
-        criterion = torch.nn.L1Loss()
-        loss = criterion(pred, lab)
-        return [loss]
-    elif loss_type == "AFLoss":
-        criterion = losses.AFLoss(margin=0.2, scale=1, num_layers=len(list(range(1, 25))))
-        loss = criterion(pred, gate_weights, lab)
-        return [loss]
-    elif loss_type == "FocalLoss":
-        criterion = losses.FocalLoss(weight=weights)
-        loss = criterion(pred, lab)
-        return [loss]
-    elif loss_type == "AMSoftmaxLoss":
-        loss = model.objective(pred, lab)
         return [loss]
     elif loss_type == "KLDivLoss":
         criterion = losses.KLDivLoss()
         loss = criterion(pred, lab)
         return [loss]
-    elif loss_type == "KLDivAFLoss":
-        criterion1 = losses.KLDivLoss()
-        loss1 = criterion1(pred, lab)
-
-        criterion2 = losses.AFLoss(margin=0.2, scale=1, num_layers=len(list(range(1, 25))))
-        loss2 = criterion2(pred, gate_weights, torch.argmax(lab, dim=-1))
-
-        loss = [loss1, loss2]
-        return loss

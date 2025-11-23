@@ -178,7 +178,7 @@ class DataAugmentator:
         if noise_duration_secs <=  window_size_secs:
             cropped_noise = noise[:, :]
         else:
-            start = random.randint(int(0.5 * noise_sample_rate), noise_duration_samples - window_size_samples)
+            start = random.randint(0, noise_duration_samples - window_size_samples)
             end = start + window_size_samples
             cropped_noise = noise[:, start:end]
         
@@ -210,7 +210,7 @@ class DataAugmentator:
         
         # Check if noise is silent or empty
         if noise.numel() == 0 or torch.max(torch.abs(noise)) < 1e-8:
-            print(f"Warning: Silent or empty noise file {path}, returning original audio")
+            #print(f"Warning: Silent or empty noise file {path}, returning original audio")
             return audio
         
         if noise_sample_rate != sample_rate:
@@ -255,7 +255,7 @@ class DataAugmentator:
             noise_power = min_power
         
         if signal_power < min_power:
-            print(f"Warning: Very low signal power ({signal_power}), returning original audio")
+            #print(f"Warning: Very low signal power ({signal_power}), returning original audio")
             return audio
         
         # Calculate scaling factor based on desired SNR
