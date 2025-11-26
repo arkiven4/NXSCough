@@ -24,8 +24,6 @@ from timm.models.vision_transformer import Block
 
 import modules, commons, layers
 
-
-
 ###########################################
 # OPERAGT_MAE
 ###########################################
@@ -36,7 +34,7 @@ class OPERAGT_MAE(nn.Module):
                  mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), norm_pix_loss=False, 
                  in_chans=1, audio_exp=True, alpha=0.0, beta=4.0, mode=0, use_custom_patch=False, split_pos=False, 
                  pos_trainable=False, use_nce=False, decoder_mode=1, mask_2d=False, mask_t_prob=0.5, mask_f_prob=0.5, 
-                 no_shift=False, output_dim=2, **kwargs ):
+                 no_shift=False, output_dim=2, **kwargs):
         super(OPERAGT_MAE, self).__init__()
 
         # 256 -> Time, 64 mel
@@ -99,15 +97,13 @@ class OPERAGT_MAE(nn.Module):
                     SwinTransformerBlock(
                         dim=decoder_embed_dim,
                         num_heads=16,
-                        feat_size=feat_size,
+                        input_resolution=feat_size,
                         window_size=window_size,
                         shift_size=shift_size,
                         mlp_ratio=mlp_ratio,
-                        drop=0.0,
-                        drop_attn=0.0,
+                        proj_drop=0.0,
+                        attn_drop=0.0,
                         drop_path=0.0,
-                        extra_norm=False,
-                        sequential_attn=False,
                         norm_layer=norm_layer, #nn.LayerNorm,
                     )
                 )
@@ -431,9 +427,8 @@ class OPERAGT_MAE(nn.Module):
         if self.decoder_mode > 3: # mvit
             x = self.decoder_blocks(x)
         else:
-            # apply Transformer blocks
+            x = x.unsqueeze(1)
             for blk in self.decoder_blocks:
-                #print(x.shape)
                 x = blk(x)
         x = self.decoder_norm(x)
 
@@ -472,13 +467,44 @@ class OPERAGT_MAE(nn.Module):
         # print(pred.shape, loss.shape)
         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         # print('return:', loss)
-        return loss      
+        return loss, self.unpatchify(target), self.unpatchify(pred)  
 
-    def forward(self, imgs):
+    def forward(self, imgs, attention_mask=None):
         # torch.optim.Adam(self.parameters(), lr=1e-4)
-        # print(imgs.shape)
+        imgs = imgs.permute(0, 2, 1)#.unsqueeze(1)
         #print(self.patch_embed.proj.weight.data)
         emb_enc, mask, ids_restore, _ = self.forward_encoder(imgs, self.mask_ratio, mask_2d=self.mask_2d)
         pred, _, _ = self.forward_decoder(emb_enc, ids_restore)  # [N, L, p*p*3]
-        loss_recon = self.forward_loss(imgs, pred, mask, norm_pix_loss=self.norm_pix_loss)
-        return loss_recon, pred, mask
+        loss_recon, target, pred = self.forward_loss(imgs, pred, mask, norm_pix_loss=self.norm_pix_loss)
+
+        return {
+            "loss": loss_recon,
+            "pred": pred.squeeze(1),
+            "imgs": imgs.squeeze(1),
+        }
+    
+
+class Eff_MyOwn1(nn.Module):
+    def __init__(self, input_size, output_dim, **kwargs):
+        super(Eff_MyOwn1, self).__init__()
+
+        self.cnn1 = torch.nn.Conv2d(1, 3, kernel_size=3)
+        self.efficientnet = EfficientNet.from_name("efficientnet-b0", include_top=False, drop_connect_rate=0.1) # [128, 1280, 1, 1]
+
+        self.dense = nn.Linear(1280, 512)
+        self.dropout = nn.Dropout(0.1)
+        self.out_proj = nn.Linear(512, output_dim)
+
+    def forward(self, x, attention_mask=None):
+        x = x.unsqueeze(1) # [128, 1, 94, 64]
+        x = self.cnn1(x) # [128, 3, 92, 62]
+        x = self.efficientnet(x).squeeze(-1).squeeze(-1)
+        x = self.dropout(x)
+        x = self.dense(x)
+        x = torch.tanh(x)
+        x = self.dropout(x)
+        disease_logits = self.out_proj(x)
+        
+        return {
+            "disease_logits": disease_logits,
+        }

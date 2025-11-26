@@ -1,4 +1,4 @@
-import argparse, gc, glob, json, logging, math, os, random, socket, string, subprocess, sys, hashlib
+import argparse, gc, glob, json, logging, math, os, random, socket, string, subprocess, sys, hashlib, pickle
 import librosa
 import matplotlib.pyplot as plt
 import numpy as np
@@ -10,6 +10,7 @@ from tensorboard.backend.event_processing import event_accumulator
 from torchaudio import transforms as T
 from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 from scipy.signal import resample
+from tqdm import tqdm
 
 import losses
 MATPLOTLIB_FLAG = False
@@ -560,6 +561,37 @@ def load_audio_sample(file_path, db_sample_rate, is_saming_length, desired_lengt
       
     return data if torch.is_tensor(data) else torch.from_numpy(data).unsqueeze(0)
 
+def plot_spectrogram_to_numpy(spectrogram):
+    global MATPLOTLIB_FLAG
+    if not MATPLOTLIB_FLAG:
+      import matplotlib
+      matplotlib.use("Agg")
+      MATPLOTLIB_FLAG = True
+      mpl_logger = logging.getLogger('matplotlib')
+      mpl_logger.setLevel(logging.WARNING)
+    import matplotlib.pylab as plt
+    import numpy as np
+
+    fig, ax = plt.subplots()
+    im = ax.imshow(spectrogram, aspect="auto", origin="lower",
+                    interpolation='none')
+    plt.colorbar(im, ax=ax)
+    plt.xlabel("Frames")
+    plt.ylabel("Channels")
+    plt.tight_layout()
+
+    fig.canvas.draw()
+    buf = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8)
+
+    w, h = fig.canvas.get_width_height()
+    buf = buf.reshape((h, w, 4))  # ARGB
+
+    # Convert ARGB → RGB
+    buf = buf[:, :, 1:]  # drop alpha, keep R G B
+
+    plt.close()
+    return torch.from_numpy(buf.copy()).permute(2, 0, 1).float() / 255.0
+
 def smoothing_tensorboard(values, weight=0.9):
     """EMA smoothing of a curve."""
     smoothed = []
@@ -620,6 +652,48 @@ def orthogonality_loss(d_emb, s_emb):
     # dot product per sample then squared mean
     dots = torch.sum(d * s, dim=1)  # (B,)
     return torch.mean(dots * dots)
+
+def compute_class_weights(df, target_col, device="cuda"):
+    disease_codes = df[target_col].unique().tolist()
+    class_frequencies = df[target_col].value_counts().to_dict()
+    total_samples = len(df)
+
+    class_weights = {
+        cls: total_samples / (len(disease_codes) * freq) if freq != 0 else 0
+        for cls, freq in class_frequencies.items()
+    }
+
+    weights_list = [class_weights[cls] for cls in disease_codes]
+    return torch.tensor(weights_list, device=device, dtype=torch.float)
+
+
+def compute_wav_stats(df, path_col, pickle_path="wav_stats.pickle"):
+    if os.path.exists(pickle_path):
+        with open(pickle_path, "rb") as f:
+            return pickle.load(f)
+
+    means, stds = [], []
+    paths = df[path_col].dropna().tolist()
+
+    for path in tqdm(paths, desc="Processing WAV files", unit="file"):
+        if not os.path.isfile(path):
+            continue
+        try:
+            audio, _ = librosa.load(path, sr=None, mono=True)
+            means.append(np.mean(audio))
+            stds.append(np.std(audio))
+        except Exception:
+            continue
+
+    stats = {
+        "mean_db": float(np.mean(means)),
+        "std_db": float(np.mean(stds))
+    }
+
+    with open(pickle_path, "wb") as f:
+        pickle.dump(stats, f)
+
+    return stats
 
 def many_loss_category(pred, lab, loss_type="CE", test=False, weights=None):
     if test == True:

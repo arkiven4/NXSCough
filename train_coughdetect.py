@@ -14,7 +14,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers.tensorboard import TensorBoardLogger
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.metrics import confusion_matrix, accuracy_score, balanced_accuracy_score
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -23,50 +23,6 @@ import commons, models, utils
 from cough_datasets import CoughDatasets, CoughDatasetsCollate
 
 torch.set_float32_matmul_precision("medium")
-
-def compute_class_weights(df, target_col, device="cuda"):
-    disease_codes = df[target_col].unique().tolist()
-    class_frequencies = df[target_col].value_counts().to_dict()
-    total_samples = len(df)
-
-    class_weights = {
-        cls: total_samples / (len(disease_codes) * freq) if freq != 0 else 0
-        for cls, freq in class_frequencies.items()
-    }
-
-    weights_list = [class_weights[cls] for cls in disease_codes]
-    return torch.tensor(weights_list, device=device, dtype=torch.float)
-
-
-def compute_wav_stats(df, path_col, pickle_path="wav_stats.pickle"):
-    if os.path.exists(pickle_path):
-        with open(pickle_path, "rb") as f:
-            return pickle.load(f)
-
-    means, stds = [], []
-    paths = df[path_col].dropna().tolist()
-
-    for path in tqdm(paths, desc="Processing WAV files", unit="file"):
-        if not os.path.isfile(path):
-            continue
-        try:
-            audio, _ = librosa.load(path, sr=None, mono=True)
-            means.append(np.mean(audio))
-            stds.append(np.std(audio))
-        except Exception:
-            continue
-
-    stats = {
-        "mean_db": float(np.mean(means)),
-        "std_db": float(np.mean(stds))
-    }
-
-    with open(pickle_path, "wb") as f:
-        pickle.dump(stats, f)
-
-    return stats
-
-
 #######################################################################
 parser = argparse.ArgumentParser()
 parser.add_argument("--init", action="store_true")
@@ -98,6 +54,7 @@ config = json.loads(data)
 
 hps = utils.HParams(**config)
 hps.model_dir = model_dir
+hps.data.mae_training = hps.train.mae_training
 
 # =============================================================
 # SECTION: Loading Data
@@ -110,9 +67,6 @@ df_test = df_test.reset_index(drop=True)
 
 df_train = df_train[hps.data.column_order]
 df_test = df_test[hps.data.column_order]
-
-# class_weights_tensor = compute_class_weights(df_train, hps.data.target_column)
-# compute_wav_stats(df_train, "path_file", pickle_path="wav_stats.pickle")
 
 collate_fn = CoughDatasetsCollate(hps.data.many_class)
 # =============================================================
@@ -158,7 +112,7 @@ class CoughDetectionRunner(L.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "loss/epoch",
+                "monitor": "val/loss",
             },
         }
 
@@ -179,7 +133,7 @@ class CoughDetectionRunner(L.LightningModule):
         ld = utils.many_loss_category(out_model["disease_logits"], dse_ids, 
                                       loss_type=self.hps.train.loss_function, weights=self.class_weights)
         loss = sum(ld)
-        
+
         self.log("train/loss_step", loss, on_step=True, on_epoch=False, prog_bar=True, logger=True)
         self.logger.experiment.add_scalars('loss', {'train': loss}, self.global_step)
         return loss
@@ -197,6 +151,7 @@ class CoughDetectionRunner(L.LightningModule):
 
         loss = sum(ld)
         self.logger.experiment.add_scalars('loss', {'valid': loss}, self.global_step)
+        self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
 
     def on_test_epoch_start(self):
         self.test_preds = []
@@ -277,8 +232,8 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(df_train, target_labels)):
     train_fold = df_train.iloc[train_idx].reset_index(drop=True)
     val_fold = df_train.iloc[val_idx].reset_index(drop=True)
     
-    class_weights_tensor = compute_class_weights(train_fold, hps.data.target_column)
-    compute_wav_stats(train_fold, "path_file", pickle_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle")
+    class_weights_tensor = utils.compute_class_weights(train_fold, hps.data.target_column)
+    utils.compute_wav_stats(train_fold, "path_file", pickle_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle")
 
     train_dataset = CoughDatasets(train_fold.values, hps.data, wav_stats_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle", train=True)
     val_dataset = CoughDatasets(val_fold.values, hps.data, wav_stats_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle", train=False)
@@ -294,15 +249,14 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(df_train, target_labels)):
 
     checkpoint_callback = ModelCheckpoint(
        dirpath=f"{hps.model_dir}/fold_{fold}",
-       monitor="loss/epoch",
+       monitor="val/loss",
        filename=f"pool_fold{fold}_{{epoch:02d}}",
        save_top_k=1,
        mode="min",
     )
 
     tb_logger = TensorBoardLogger(save_dir=hps.model_dir, name=f"fold_{fold}", sub_dir="train")
-    early_stopping = EarlyStopping(monitor="loss/epoch", patience=5, mode="min", verbose=False)
-
+    early_stopping = EarlyStopping(monitor="val/loss", patience=5, mode="min", verbose=False)
     runner_lightning = CoughDetectionRunner(pool_model, hps=hps, class_weights=class_weights_tensor)
     trainer = L.Trainer(
        max_epochs=1000,

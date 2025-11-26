@@ -52,8 +52,10 @@ class CoughDatasets(torch.utils.data.Dataset):
         self.nu = getattr(hparams, "nu", 0.0)
         self.num_masks = getattr(hparams, "num_masks", 0)
         self.mae_training = getattr(hparams, "mae_training", False)
+        self.rezize_size = tuple(getattr(hparams, "rezize_size", [224, 224]))
 
         self.nClasses = getattr(hparams, "many_class", None)
+        self.cough_detection = getattr(hparams, "cough_detection", None)
         self.processor = None
 
         if self.augment_data:
@@ -71,7 +73,7 @@ class CoughDatasets(torch.utils.data.Dataset):
 
         if self.mae_training:
             self.transform_train = transforms.Compose([
-                transforms.Resize((224, 224)),
+                transforms.Resize(self.rezize_size),
                 # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             ])
 
@@ -145,9 +147,14 @@ class CoughDatasets(torch.utils.data.Dataset):
     #     self.audiopaths_and_text = np.array(new_audiopaths, dtype=object)
 
     def get_mel_text_pair(self, audiopath_and_text):
-        wavname, dse_id, gndr_id, spk_id = audiopath_and_text[0], audiopath_and_text[1], 0, 0 #, audiopath_and_text[2], audiopath_and_text[3]
-        #wav = self.get_audio(self.db_path + "/" + wavname)
-        wav = self.get_audio(self.db_path + "/" + wavname, start_index=audiopath_and_text[2], end_index=audiopath_and_text[3])
+        # WARN : ONLY FOR COUGH DETECTIOP
+        if self.cough_detection == True:
+            wavname, dse_id, gndr_id, spk_id = audiopath_and_text[0], audiopath_and_text[1], 0, 0 #, audiopath_and_text[2], audiopath_and_text[3]
+            wav = self.get_audio(self.db_path + "/" + wavname, start_index=audiopath_and_text[2], end_index=audiopath_and_text[3])
+        else:
+            wavname, dse_id, gndr_id, spk_id = audiopath_and_text[0], audiopath_and_text[1], audiopath_and_text[2], audiopath_and_text[3]
+            wav = self.get_audio(self.db_path + "/" + wavname)
+
         wav, dse_id = self.mix_audio_sample(wav, dse_id)
         
         if self.mean_std_norm:
@@ -168,13 +175,13 @@ class CoughDatasets(torch.utils.data.Dataset):
                     nu=int(wav.shape[0] * self.nu),
                     num_masks=self.num_masks)  # T, F
             
-            wav = F.interpolate(wav.unsqueeze(0).unsqueeze(0), size=(240, 240), mode="bilinear", align_corners=False).squeeze(0).squeeze(0)
+            # WARN : ONLY FOR COUGH DETECTIOPN AND FIXED INPUT SIZE
+            if self.cough_detection:
+                wav = F.interpolate(wav.unsqueeze(0).unsqueeze(0), size=(240, 240), mode="bilinear", align_corners=False).squeeze(0).squeeze(0)
         
         wav = wav.unsqueeze(0)
         if self.mae_training == True:
-            wav = wav.unsqueeze(0)
-            wav = self.transform_train(wav)
-            wav = wav.squeeze(0)
+            wav = self.transform_train(wav.unsqueeze(0)).squeeze(0)
 
         return (wavname, wav, dse_id, int(spk_id), int(gndr_id))
 
@@ -183,7 +190,8 @@ class CoughDatasets(torch.utils.data.Dataset):
                                         self.desired_length, fade_samples_ratio=self.fade_samples_ratio,
                                         pad_types=self.pad_types)  # repeat zero
         
-        if self.pad_types != "synthesis":
+        ## WARN : ONLY FOR COUGH DETECTIOPN
+        if self.pad_types != "synthesis" and self.cough_detection:
             audio = audio[:, start_index:] if end_index == -1 else audio[:, start_index:end_index]
             
         if self.augment_data and self.train:

@@ -14,59 +14,17 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers.tensorboard import TensorBoardLogger
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.metrics import confusion_matrix, accuracy_score, balanced_accuracy_score
 import matplotlib.pyplot as plt
 import seaborn as sns
+from matplotlib import cm
 
 import commons, models, utils
 from cough_datasets import CoughDatasets, CoughDatasetsCollate
 
 torch.set_float32_matmul_precision("medium")
-
-def compute_class_weights(df, target_col, device="cuda"):
-    disease_codes = df[target_col].unique().tolist()
-    class_frequencies = df[target_col].value_counts().to_dict()
-    total_samples = len(df)
-
-    class_weights = {
-        cls: total_samples / (len(disease_codes) * freq) if freq != 0 else 0
-        for cls, freq in class_frequencies.items()
-    }
-
-    weights_list = [class_weights[cls] for cls in disease_codes]
-    return torch.tensor(weights_list, device=device, dtype=torch.float)
-
-
-def compute_wav_stats(df, path_col, pickle_path="wav_stats.pickle"):
-    if os.path.exists(pickle_path):
-        with open(pickle_path, "rb") as f:
-            return pickle.load(f)
-
-    means, stds = [], []
-    paths = df[path_col].dropna().tolist()
-
-    for path in tqdm(paths, desc="Processing WAV files", unit="file"):
-        if not os.path.isfile(path):
-            continue
-        try:
-            audio, _ = librosa.load(path, sr=None, mono=True)
-            means.append(np.mean(audio))
-            stds.append(np.std(audio))
-        except Exception:
-            continue
-
-    stats = {
-        "mean_db": float(np.mean(means)),
-        "std_db": float(np.mean(stds))
-    }
-
-    with open(pickle_path, "wb") as f:
-        pickle.dump(stats, f)
-
-    return stats
-
-
+cmap = cm.get_cmap("viridis")
 #######################################################################
 parser = argparse.ArgumentParser()
 parser.add_argument("--init", action="store_true")
@@ -98,6 +56,7 @@ config = json.loads(data)
 
 hps = utils.HParams(**config)
 hps.model_dir = model_dir
+hps.data.mae_training = hps.train.mae_training
 
 # =============================================================
 # SECTION: Loading Data
@@ -110,9 +69,6 @@ df_test = df_test.reset_index(drop=True)
 
 df_train = df_train[hps.data.column_order]
 df_test = df_test[hps.data.column_order]
-
-# class_weights_tensor = compute_class_weights(df_train, hps.data.target_column)
-# compute_wav_stats(df_train, "path_file", pickle_path="wav_stats.pickle")
 
 collate_fn = CoughDatasetsCollate(hps.data.many_class)
 # =============================================================
@@ -147,6 +103,9 @@ class CoughDetectionRunner(L.LightningModule):
         self.hps = hps
         self.class_weights = class_weights
 
+        ckpt = torch.load("/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/pretrained/encoder-operaGT.ckpt")
+        self.model.load_state_dict(ckpt["state_dict"], strict=False)
+
     def forward(self, x, attention_mask=None):
         x = self.model(x, attention_mask=attention_mask)
         return x
@@ -176,12 +135,32 @@ class CoughDetectionRunner(L.LightningModule):
         _, audio, attention_masks, dse_ids, othr_ids = batch
         
         out_model = self.forward(audio, attention_mask=attention_masks)
-        ld = utils.many_loss_category(out_model["disease_logits"], dse_ids, 
-                                      loss_type=self.hps.train.loss_function, weights=self.class_weights)
-        loss = sum(ld)
-        
+
+        if "disease_logits" in out_model:
+            ld = utils.many_loss_category(out_model["disease_logits"], dse_ids, 
+                                        loss_type=self.hps.train.loss_function, weights=self.class_weights)
+            loss = sum(ld)
+        else:
+            loss = out_model["loss"]
+    
         self.log("train/loss_step", loss, on_step=True, on_epoch=False, prog_bar=True, logger=True)
         self.logger.experiment.add_scalars('loss', {'train': loss}, self.global_step)
+
+        if "pred" in out_model:
+            random_idx = torch.randint(0, out_model["pred"].size(0), (1,)).item()
+            
+            self.logger.experiment.add_image(
+                "pred_image",
+                utils.plot_spectrogram_to_numpy(out_model["pred"][random_idx].data.cpu().numpy().T),
+                global_step=self.global_step
+            )
+
+            self.logger.experiment.add_image(
+                "orig_image",
+                utils.plot_spectrogram_to_numpy(audio[random_idx].data.cpu().numpy()),
+                global_step=self.global_step
+            )
+
         return loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
@@ -192,10 +171,13 @@ class CoughDetectionRunner(L.LightningModule):
         _, audio, attention_masks, dse_ids, othr_ids = batch
         
         out_model = self.forward(audio, attention_mask=attention_masks)
-        ld = utils.many_loss_category(out_model["disease_logits"], dse_ids, 
-                                      loss_type=self.hps.train.loss_function, weights=self.class_weights)
+        if "disease_logits" in out_model:
+            ld = utils.many_loss_category(out_model["disease_logits"], dse_ids, 
+                                        loss_type=self.hps.train.loss_function, weights=self.class_weights)
+            loss = sum(ld)
+        else:
+            loss = out_model["loss"]
 
-        loss = sum(ld)
         self.logger.experiment.add_scalars('loss', {'valid': loss}, self.global_step)
         self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
 
@@ -269,17 +251,29 @@ class CoughDetectionRunner(L.LightningModule):
 fold_metrics = []
 fold_checkpoints = []
 
-skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 target_labels = df_train[hps.data.target_column]
+if hps.train.use_Kfold:
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    splitter = skf.split(df_train, target_labels)
+    num_folds = skf.get_n_splits()
+else:
+    train_idx, val_idx = train_test_split(
+        df_train.index.to_numpy(),
+        test_size=0.2,
+        random_state=42,
+        stratify=target_labels
+    )
+    splitter = [(train_idx, val_idx)]
+    num_folds = 1
 
-for fold, (train_idx, val_idx) in enumerate(skf.split(df_train, target_labels)):
-    logger.info(f"\n{'='*20} Fold {fold+1}/{skf.get_n_splits()} {'='*20}")
-    
+for fold, (train_idx, val_idx) in enumerate(splitter):
+    logger.info(f"\n{'='*20} Fold {fold+1}/{num_folds} {'='*20}")
+
     train_fold = df_train.iloc[train_idx].reset_index(drop=True)
     val_fold = df_train.iloc[val_idx].reset_index(drop=True)
     
-    class_weights_tensor = compute_class_weights(train_fold, hps.data.target_column)
-    compute_wav_stats(train_fold, "path_file", pickle_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle")
+    class_weights_tensor = utils.compute_class_weights(train_fold, hps.data.target_column)
+    utils.compute_wav_stats(train_fold, "path_file", pickle_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle")
 
     train_dataset = CoughDatasets(train_fold.values, hps.data, wav_stats_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle", train=True)
     val_dataset = CoughDatasets(val_fold.values, hps.data, wav_stats_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle", train=False)
@@ -303,7 +297,6 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(df_train, target_labels)):
 
     tb_logger = TensorBoardLogger(save_dir=hps.model_dir, name=f"fold_{fold}", sub_dir="train")
     early_stopping = EarlyStopping(monitor="val/loss", patience=5, mode="min", verbose=False)
-
     runner_lightning = CoughDetectionRunner(pool_model, hps=hps, class_weights=class_weights_tensor)
     trainer = L.Trainer(
        max_epochs=1000,
@@ -314,31 +307,32 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(df_train, target_labels)):
        default_root_dir=hps.model_dir
     )
     trainer.fit(runner_lightning, train_dataloaders=train_loader, val_dataloaders=val_loader)
-    results = trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
+    if hps.train.use_Kfold:
+        results = trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
+        if results:
+            current_bacc = results[0].get('test_bacc', 0.0)
+            logger.info(f"Fold {fold+1} Balanced Accuracy: {current_bacc:.4f}")
+            fold_metrics.append(current_bacc)
+            fold_checkpoints.append(checkpoint_callback.best_model_path)
 
-    if results:
-        current_bacc = results[0].get('test_bacc', 0.0)
-        logger.info(f"Fold {fold+1} Balanced Accuracy: {current_bacc:.4f}")
-        fold_metrics.append(current_bacc)
-        fold_checkpoints.append(checkpoint_callback.best_model_path)
+if hps.train.use_Kfold:
+    mean_bacc = np.mean(fold_metrics)
+    differences = [abs(metric - mean_bacc) for metric in fold_metrics]
+    best_fold_idx = np.argmin(differences)
+    best_fold_metric = fold_metrics[best_fold_idx]
+    best_model_path = fold_checkpoints[best_fold_idx]
 
-mean_bacc = np.mean(fold_metrics)
-differences = [abs(metric - mean_bacc) for metric in fold_metrics]
-best_fold_idx = np.argmin(differences)
-best_fold_metric = fold_metrics[best_fold_idx]
-best_model_path = fold_checkpoints[best_fold_idx]
+    logger.info(f"\n{'='*20} BEST MODEL SELECTION {'='*20}")
+    logger.info(f"All Fold Balanced Accuracies: {[f'{m:.4f}' for m in fold_metrics]}")
+    logger.info(f"Mean Balanced Accuracy: {mean_bacc:.4f}")
+    logger.info(f"Best Fold (Closest to Mean): {best_fold_idx+1}")
+    logger.info(f"Best Fold Balanced Accuracy: {best_fold_metric:.4f}")
+    logger.info(f"Difference from Mean: {abs(best_fold_metric - mean_bacc):.4f}")
+    logger.info(f"Source Checkpoint: {best_model_path}")
 
-logger.info(f"\n{'='*20} BEST MODEL SELECTION {'='*20}")
-logger.info(f"All Fold Balanced Accuracies: {[f'{m:.4f}' for m in fold_metrics]}")
-logger.info(f"Mean Balanced Accuracy: {mean_bacc:.4f}")
-logger.info(f"Best Fold (Closest to Mean): {best_fold_idx+1}")
-logger.info(f"Best Fold Balanced Accuracy: {best_fold_metric:.4f}")
-logger.info(f"Difference from Mean: {abs(best_fold_metric - mean_bacc):.4f}")
-logger.info(f"Source Checkpoint: {best_model_path}")
-
-if best_model_path and os.path.exists(best_model_path):
-    production_path = os.path.join(hps.model_dir, "best_model.ckpt")
-    shutil.copy2(best_model_path, production_path)
-    logger.info(f"🏆 Saved Production Model to: {production_path}")
-else:
-    logger.info("❌ Could not find best model checkpoint to copy.")
+    if best_model_path and os.path.exists(best_model_path):
+        production_path = os.path.join(hps.model_dir, "best_model.ckpt")
+        shutil.copy2(best_model_path, production_path)
+        logger.info(f"🏆 Saved Production Model to: {production_path}")
+    else:
+        logger.info("❌ Could not find best model checkpoint to copy.")
