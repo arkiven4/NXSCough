@@ -15,6 +15,7 @@ from torchaudio import transforms as T
 import torchvision.transforms as transforms
 
 import librosa
+import opensmile
 
 import utils
 import commons
@@ -24,6 +25,26 @@ from augmentation import (
     ISD_additive_noise,
     LnL_convolutive_noise,
 )
+
+FEATURE_SETS = [
+    opensmile.FeatureSet.ComParE_2016,
+    opensmile.FeatureSet.GeMAPSv01b,
+    opensmile.FeatureSet.eGeMAPSv02,
+    opensmile.FeatureSet.emobase,
+    opensmile.FeatureSet.IS09,
+    opensmile.FeatureSet.IS10,
+    opensmile.FeatureSet.IS11,
+    opensmile.FeatureSet.IS12,
+    opensmile.FeatureSet.IS13,
+]
+
+SMILE_CLIENTS = {
+    str(fs): opensmile.Smile(
+        feature_set=fs,
+        feature_level=opensmile.FeatureLevel.LowLevelDescriptors
+    )
+    for fs in FEATURE_SETS
+}
 
 class CoughDatasets(torch.utils.data.Dataset):
     def __init__(self, data_numpy, hparams, train=True, wav_stats_path=None):
@@ -55,7 +76,7 @@ class CoughDatasets(torch.utils.data.Dataset):
         self.rezize_size = tuple(getattr(hparams, "rezize_size", [224, 224]))
 
         self.nClasses = getattr(hparams, "many_class", None)
-        self.cough_detection = getattr(hparams, "cough_detection", None)
+        self.cough_detection = getattr(hparams, "cough_detection", False)
         self.processor = None
 
         if self.augment_data:
@@ -121,6 +142,19 @@ class CoughDatasets(torch.utils.data.Dataset):
                     ),
                     dtype=torch.float32
                 )
+            elif hparams.feature_type == "opensmile":
+                import joblib
+                self.scaler = joblib.load("precomputed_stats/opensmile_global_scaler.pkl")
+                self.wav_transform = lambda wav: torch.tensor(self.scaler.transform(
+                    pd.concat(
+                    [client.process_signal(wav, self.sampling_rate)
+                     .reset_index(drop=True)
+                     .add_prefix(f"{fs_name}__")
+                        for fs_name, client in SMILE_CLIENTS.items()
+                    ],
+                    axis=1).fillna(0.0).values).T,
+                    dtype=torch.float32
+                )
 
         if self.mix_audio == True:
             self.probs = [1 / self.nClasses] * self.nClasses
@@ -164,6 +198,9 @@ class CoughDatasets(torch.utils.data.Dataset):
             wav = wav / max_val if max_val != 0 else wav
 
         if self.wav_transform != None:
+            if self.feature_type == "opensmile":
+                wav = wav.numpy().reshape(-1)
+
             wav = self.wav_transform(wav)  # [80, 224]
             # delta = torch.tensor(librosa.feature.delta(wav.numpy()), dtype=torch.float32)
             # delta2 = torch.tensor(librosa.feature.delta(wav.numpy(), order=2), dtype=torch.float32)
