@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib import cm
 
-import commons, models, utils
+import commons, models, utils, losses
 from cough_datasets import CoughDatasets, CoughDatasetsCollate
 
 torch.set_float32_matmul_precision("medium")
@@ -97,14 +97,26 @@ shutil.copy2('./models.py', f'{hps.model_dir}/model_net.py.bak')
 # =============================================================
 
 class CoughDetectionRunner(L.LightningModule):
-    def __init__(self, model, hps, class_weights):
+    def __init__(self, model, hps, class_weights=[]):
         super().__init__()
         self.model = model
         self.hps = hps
         self.class_weights = class_weights
 
-        ckpt = torch.load("/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/pretrained/encoder-operaGT.ckpt")
-        self.model.load_state_dict(ckpt["state_dict"], strict=False)
+        self.supcon_loss = losses.SupConLoss()
+
+        #ckpt = torch.load("/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/pretrained/encoder-operaGT.ckpt")
+        #self.model.load_state_dict(ckpt["state_dict"], strict=False)
+
+        if hps.model.pooling_model.split("_")[0] == "WavLMEncoder":
+            logger.info("Loaded Pretrained WavLM")
+            from transformers import AutoModel
+            ssl_model = AutoModel.from_pretrained("microsoft/wavlm-large")
+            self.model.feature_extractor.load_state_dict(ssl_model.feature_extractor.state_dict())
+            self.model.feature_extractor._freeze_parameters()
+
+            del ssl_model
+            torch.cuda.empty_cache()
 
     def forward(self, x, attention_mask=None):
         x = self.model(x, attention_mask=attention_mask)
@@ -133,16 +145,23 @@ class CoughDetectionRunner(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         _, audio, attention_masks, dse_ids, othr_ids = batch
-        
         out_model = self.forward(audio, attention_mask=attention_masks)
 
+        tot_loss = []
         if "disease_logits" in out_model:
-            ld = utils.many_loss_category(out_model["disease_logits"], dse_ids, 
-                                        loss_type=self.hps.train.loss_function, weights=self.class_weights)
-            loss = sum(ld)
-        else:
-            loss = out_model["loss"]
-    
+            ld = utils.many_loss_category(out_model["disease_logits"], dse_ids, loss_type=self.hps.train.loss_function, weights=self.class_weights)
+            tot_loss.append(ld[0])
+
+        if "loss" in out_model:
+            tot_loss.append(out_model["loss"])
+
+        if "embedding" in out_model:
+            tot_loss.append(self.supcon_loss(out_model["embedding"], dse_ids))
+
+        loss = sum(tot_loss)
+        for idx_loss, now_loss in enumerate(tot_loss):
+            self.log(f"train/loss_{idx_loss}", now_loss, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+
         self.log("train/loss_step", loss, on_step=True, on_epoch=False, prog_bar=True, logger=True)
         self.logger.experiment.add_scalars('loss', {'train': loss}, self.global_step)
 
@@ -169,15 +188,20 @@ class CoughDetectionRunner(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         _, audio, attention_masks, dse_ids, othr_ids = batch
-        
         out_model = self.forward(audio, attention_mask=attention_masks)
+        
+        tot_loss = []
         if "disease_logits" in out_model:
-            ld = utils.many_loss_category(out_model["disease_logits"], dse_ids, 
-                                        loss_type=self.hps.train.loss_function, weights=self.class_weights)
-            loss = sum(ld)
-        else:
-            loss = out_model["loss"]
+            ld = utils.many_loss_category(out_model["disease_logits"], dse_ids, loss_type=self.hps.train.loss_function, weights=self.class_weights)
+            tot_loss.append(ld[0])
 
+        if "loss" in out_model:
+            tot_loss.append(out_model["loss"])
+
+        if "embedding" in out_model:
+            tot_loss.append(self.supcon_loss(out_model["embedding"], dse_ids))
+
+        loss = sum(tot_loss)
         self.logger.experiment.add_scalars('loss', {'valid': loss}, self.global_step)
         self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
 
@@ -336,3 +360,79 @@ if hps.train.use_Kfold:
         logger.info(f"🏆 Saved Production Model to: {production_path}")
     else:
         logger.info("❌ Could not find best model checkpoint to copy.")
+
+    payload = {
+        "best_fold_idx": best_fold_idx,
+        "fold_metrics": fold_metrics,
+    }
+
+    with open(os.path.join(hps.model_dir, "info_fold.pkl"), "wb") as f:
+        pickle.dump(payload, f)
+
+
+# =============================================================
+# SECTION: Test Phase
+# =============================================================
+db_map = {
+    0: "TBCoda Logitudinal",
+    1: "TBCoda Solicited",
+    2: "TBScreen Logitudinal",
+    3: "TBScreen Solicited",
+    4: "UK19Covid",
+}
+
+runner_lightning = CoughDetectionRunner(pool_model, hps=hps, class_weights=[])
+runner_lightning = CoughDetectionRunner.load_from_checkpoint(
+    os.path.join(hps.model_dir, "best_model.ckpt"),
+    model=pool_model,
+    hps=hps
+)
+runner_lightning.eval()
+trainer = L.Trainer(accelerator="gpu" if torch.cuda.is_available() else "cpu", devices="auto")
+
+with open(os.path.join(hps.model_dir, "info_fold.pkl"), "rb") as f:
+    info_fold = pickle.load(f)
+best_fold_idx = info_fold["best_fold_idx"]
+fold_metrics = info_fold["fold_metrics"]
+# Only For Debugging
+#best_fold_idx = 3
+
+with open(f"{model_dir}/result_summary.txt", "w") as f:
+    f.write(f"=========================== Train Phase =============================\n")
+
+df_test = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.train')
+df_test = df_test.reset_index(drop=True)
+df_test = df_test[hps.data.column_order + ['db']]
+for db_type in df_test['db'].unique().tolist():
+    df_nowtest = df_test[df_test['db'] == db_type]
+    val_dataset = CoughDatasets(df_nowtest.values, hps.data, wav_stats_path=f"{hps.model_dir}/wav_stats_fold_{best_fold_idx}.pickle", train=False)
+    val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size, pin_memory=True, drop_last=True, collate_fn=collate_fn)
+    results = trainer.test(runner_lightning, dataloaders=val_loader)[0]
+    with open(f"{model_dir}/result_summary.txt", "a") as f:
+        f.write(f"{db_map[db_type]} - Acc {results['test_acc']:.2f} | BalAcc {results['test_bacc']:.2f} | "
+            f"Sens {results['test_sens']:.2f} | Spec {results['test_spec']:.2f}\n")
+
+with open(f"{model_dir}/result_summary.txt", "a") as f:
+    f.write(f"=========================== Test Phase =============================\n")
+
+df_test = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.test')
+df_test = df_test.reset_index(drop=True)
+df_test = df_test[hps.data.column_order + ['db']]
+for db_type in df_test['db'].unique().tolist():
+    df_nowtest = df_test[df_test['db'] == db_type]
+    val_dataset = CoughDatasets(df_nowtest.values, hps.data, wav_stats_path=f"{hps.model_dir}/wav_stats_fold_{best_fold_idx}.pickle", train=False)
+    val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size, pin_memory=True, drop_last=True, collate_fn=collate_fn)
+    results = trainer.test(runner_lightning, dataloaders=val_loader)[0]
+    with open(f"{model_dir}/result_summary.txt", "a") as f:
+        f.write(f"{db_map[db_type]} - Acc {results['test_acc']:.2f} | BalAcc {results['test_bacc']:.2f} | "
+            f"Sens {results['test_sens']:.2f} | Spec {results['test_spec']:.2f}\n")
+
+df_test = pd.read_csv(f'/run/media/fourier/Data1/Pras/DatabaseLLM/cirdz/metadata_wavs_capped.csv')
+df_test = df_test.reset_index(drop=True)
+df_test = df_test[hps.data.column_order]
+val_dataset = CoughDatasets(df_test.values, hps.data, wav_stats_path=f"{hps.model_dir}/wav_stats_fold_{best_fold_idx}.pickle", train=False)
+val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size, pin_memory=True, drop_last=True, collate_fn=collate_fn)
+results = trainer.test(runner_lightning, dataloaders=val_loader)[0]
+with open(f"{model_dir}/result_summary.txt", "a") as f:
+    f.write(f"CIRDZ - Acc {results['test_acc']:.2f} | BalAcc {results['test_bacc']:.2f} | "
+        f"Sens {results['test_sens']:.2f} | Spec {results['test_spec']:.2f}\n")

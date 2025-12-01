@@ -507,10 +507,10 @@ def build_tail_segment(audio, sr):
     tail = audio.copy()
 
     tail = speed_perturb(tail)
-    tail = gain_perturb(tail, (-5.0, -1.0))
+    tail = gain_perturb(tail, (1.0, 6.0))
     return np.concatenate([tail_gap, tail], axis=0)
 
-def augment_and_merge(audio_original, path, sr, gain_db_set=[(-5.0, -1.0)]):
+def augment_and_merge(audio_original, path, sr, gain_db_set=[(-5.0, 0.0)]):
     seed_from_path(path)
 
     # fade-out original

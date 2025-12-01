@@ -46,6 +46,10 @@ SMILE_CLIENTS = {
     for fs in FEATURE_SETS
 }
 
+from matplotlib import cm
+viridis_lut = torch.tensor(cm.get_cmap("viridis").colors, dtype=torch.float32)  # (256,4)
+viridis_lut = viridis_lut[:, :3]
+
 class CoughDatasets(torch.utils.data.Dataset):
     def __init__(self, data_numpy, hparams, train=True, wav_stats_path=None):
         self.audiopaths_and_text = shuffle(data_numpy, random_state=20)
@@ -155,6 +159,17 @@ class CoughDatasets(torch.utils.data.Dataset):
                     axis=1).fillna(0.0).values).T,
                     dtype=torch.float32
                 )
+            
+            # WARN RESNET ONLY
+            from torchvision.transforms import (
+                Compose, Resize, CenterCrop, ToTensor, Normalize, InterpolationMode
+            )
+            self.img_transform = Compose([
+                Resize([256], interpolation=InterpolationMode.BILINEAR),
+                CenterCrop([224]),
+                Normalize(mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225]),
+            ])
 
         if self.mix_audio == True:
             self.probs = [1 / self.nClasses] * self.nClasses
@@ -215,6 +230,16 @@ class CoughDatasets(torch.utils.data.Dataset):
             # WARN : ONLY FOR COUGH DETECTIOPN AND FIXED INPUT SIZE
             if self.cough_detection:
                 wav = F.interpolate(wav.unsqueeze(0).unsqueeze(0), size=(240, 240), mode="bilinear", align_corners=False).squeeze(0).squeeze(0)
+
+            if self.img_transform != None:
+                wav = torch.flip(wav, dims=[0])
+                mel_min = wav.min()
+                mel_max = wav.max()
+                wav = (wav - mel_min) / (mel_max - mel_min + 1e-6)
+                idx = (wav * 255).clamp(0, 255).long()
+                wav = viridis_lut[idx]
+                wav = wav.permute(2, 0, 1).float()
+                wav = self.img_transform(wav)
         
         wav = wav.unsqueeze(0)
         if self.mae_training == True:
@@ -307,7 +332,8 @@ class CoughDatasetsCollate:
         feature_dim = first_wav.shape[1] if first_wav.ndim == 3 else 1
 
         wav_names = []
-        wav_padded = torch.zeros(bsz, feature_dim, max_len, dtype=first_wav.dtype)
+        #wav_padded = torch.zeros(bsz, feature_dim, max_len, dtype=first_wav.dtype)
+        wav_padded = torch.zeros(bsz, 3, 224, 224, dtype=first_wav.dtype)
         attention_masks = torch.zeros(bsz, max_len)
 
         dse_ids = torch.zeros(bsz, self.many_data, dtype=torch.float32)
@@ -319,7 +345,8 @@ class CoughDatasetsCollate:
             wav_names.append(name)
             wav_length = wav.shape[-1]
 
-            wav_padded[i, :, :wav_length] = wav
+            #wav_padded[i, :, :wav_length] = wav
+            wav_padded[i, :, :, :wav_length] = wav
             attention_masks[i, :wav_length] = 1
 
             dse_ids[i] = dse

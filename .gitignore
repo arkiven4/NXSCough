@@ -3,6 +3,7 @@ output/*/
 data/
 logs/
 logs_old/
+lightning_logs/
 preprocessed_data
 *.zip
 data/TB_resample/

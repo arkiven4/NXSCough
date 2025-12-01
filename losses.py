@@ -247,3 +247,37 @@ class AMSoftmaxLoss(nn.Module):
         loss = self.loss(logits, labels)
 
         return loss
+    
+
+class SupConLoss(nn.Module):
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, features, labels):
+        """
+        features: [B, D]
+        labels: [B]
+        """
+        B, _ = features.shape
+        if labels.dim() == 2:
+            labels = torch.argmax(labels, dim=1)
+        labels = labels.view(B)
+
+        features = F.normalize(features, dim=-1)
+        batch_size = features.size(0)
+
+        mask = torch.eq(labels.unsqueeze(1), labels.unsqueeze(0)).float()  # [B,B]
+        logits = torch.div(torch.matmul(features, features.T), self.temperature)
+
+        # remove self-contrast
+        logits_mask = torch.ones_like(mask) - torch.eye(batch_size, device=mask.device)
+        mask = mask * logits_mask
+
+        logits = logits - logits.max(dim=1, keepdim=True).values
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-12)
+
+        mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-12)
+        loss = -mean_log_prob_pos.mean()
+        return loss

@@ -28,11 +28,11 @@
     "saming_length": false,
     "desired_length": 0.5,
     "fade_samples_ratio": 16,
-    "pad_types": "zeros",
+    "pad_types": "zero",
     "rezize_size": [64, 256],
 
     "acoustic_feature": true,
-    "feature_type": "opensmile",
+    "feature_type": "melspectogram",
 
     "multimask_augment": false,
     "tau": 0.10,
@@ -52,7 +52,7 @@
     "column_order": ["path_file", "disease_status", "sex", "participant"]
   }, 
   "model": {
-    "pooling_model": "Opensmile_Attention",
+    "pooling_model": "ResNet152Classifier",
     "feature_dim": 376,
     "output_dim": 2
   }

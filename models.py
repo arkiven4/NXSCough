@@ -498,41 +498,38 @@ class OPERAGT_MAE(nn.Module):
 
 
 class Opensmile_Attention(nn.Module):
-    def __init__(self, input_size, cnn_channels=128, embed_dim=128, num_heads=4, output_dim=2, **kwargs):
+    def __init__(self, input_size, embed_dim=256, depth=4, heads=4, mlp_ratio=4, output_dim=2, **kwargs):
         super().__init__()
 
         self.cnn = nn.Sequential(
-            nn.Conv1d(input_size, cnn_channels, kernel_size=3, padding=1),
+            nn.Conv1d(input_size, embed_dim, 5, padding=2),
             nn.ReLU(),
-            nn.Conv1d(cnn_channels, embed_dim, kernel_size=3, padding=1),
+            nn.Conv1d(embed_dim, embed_dim, 5, padding=2),
             nn.ReLU()
         )
 
-        self.attn = nn.MultiheadAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=heads,
+            dim_feedforward=embed_dim * mlp_ratio,
             batch_first=True
         )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
 
+        self.pool = nn.Linear(embed_dim, 1)
         self.head = nn.Sequential(
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, output_dim)
         )
 
     def forward(self, x, attention_mask=None, return_attn=False, **kwargs):
-        # x: [B, 376, T] where T is dynamic
+        h = self.cnn(x)         # [B, E, T]
+        h = h.transpose(1, 2)   # [B, T, E]
 
-        h = self.cnn(x)                # [B, embed_dim, T]
-        h = h.transpose(1, 2)          # [B, T, embed_dim]
-        attn_out, attn_weights = self.attn(h, h, h)
-        pooled = attn_out.mean(dim=1)  # [B, embed_dim]
-        logits = self.head(pooled)     # [B, 2]
-
-        if return_attn:
-            return {
-                "disease_logits": logits,
-                "attn_weights": attn_weights,
-            }
+        t = self.transformer(h)
+        w = torch.softmax(self.pool(t), dim=1)   # [B, T, 1]
+        pooled = (w * t).sum(dim=1)              # [B, E]
+        logits = self.head(pooled)
         
         return {
             "disease_logits": logits,
@@ -563,4 +560,104 @@ class Eff_MyOwn1(nn.Module):
 
         return {
             "disease_logits": disease_logits,
+        }
+
+
+class WavLMEncoder_MyOwn(nn.Module):
+    def __init__(self, input_size, num_transformer_layers=12, output_dim=2, **kwargs):
+        super(WavLMEncoder_MyOwn, self).__init__()
+
+        config = AutoConfig.from_pretrained("microsoft/wavlm-large")
+        self.feature_extractor = layers.WavLMFeatureEncoder(config)
+        self.feature_projection = layers.WavLMFeatureProjection(config)
+
+        embed_dim = 1024
+        num_heads = 16
+        dropout = 0.1
+
+        self.pos_conv_embed = nn.Conv1d(
+            embed_dim, embed_dim, kernel_size=128, padding=64, groups=16
+        )
+        self.layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+
+        self.attention_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=embed_dim,
+                nhead=num_heads,
+                dim_feedforward=embed_dim * 4,  # 4096 for WavLM-large
+                dropout=dropout,
+                activation='gelu',  # WavLM uses GELU
+                layer_norm_eps=1e-5,
+                batch_first=True,
+                norm_first=True  # Pre-norm like WavLM
+            ) for _ in range(num_transformer_layers)
+        ])
+        self.final_layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+        self.layer_weights = nn.Parameter(torch.ones(num_transformer_layers + 1))
+        self.pooling = nn.AdaptiveAvgPool1d(1)
+
+        # Classifiers
+        self.disease_clf = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 4, output_dim)
+        )
+
+
+    def forward(self, x, attention_mask=None):
+        x = x.squeeze(1)
+        extract_features = self.feature_extractor(x)
+        extract_features = extract_features.transpose(1, 2)
+        hidden_states, extract_features = self.feature_projection(extract_features) # B, T, D
+
+        pos_conv_output = self.pos_conv_embed(hidden_states.transpose(1, 2))
+        pos_conv_output = pos_conv_output.transpose(1, 2)
+        min_seq_len = min(hidden_states.size(1), pos_conv_output.size(1))
+        hidden_states = hidden_states[:, :min_seq_len, :]
+        pos_conv_output = pos_conv_output[:, :min_seq_len, :]
+
+        hidden_states = hidden_states + pos_conv_output
+        hidden_states = self.layer_norm(hidden_states)
+
+        layer_outputs = [hidden_states]
+
+        for layer in self.attention_layers:
+            hidden_states = layer(hidden_states)
+            layer_outputs.append(hidden_states)
+        
+        hidden_states = self.final_layer_norm(hidden_states)
+        layer_outputs[-1] = hidden_states
+        layer_weights_normalized = torch.softmax(self.layer_weights, dim=0)
+        weighted_hidden_states = torch.zeros_like(hidden_states)
+        for i, layer_output in enumerate(layer_outputs):
+            weighted_hidden_states += layer_weights_normalized[i] * layer_output
+        
+        hidden_states = weighted_hidden_states.transpose(1, 2)  # [B, embed_dim, T]
+        feature_embedding = self.pooling(hidden_states).squeeze(-1)  # [B, embed_dim]
+
+        disease_logits = self.disease_clf(feature_embedding)
+
+        return {
+            "embedding": feature_embedding,
+            "disease_logits": disease_logits,
+        }
+    
+
+class ResNet152Classifier(nn.Module):
+    def __init__(self, dummy_input, output_dim=2, pretrained=True, **kwargs):
+        super().__init__()
+
+        # Backbone provisioning
+        from torchvision import models
+        self.backbone = models.resnet152(weights=models.ResNet152_Weights.DEFAULT if pretrained else None)
+
+        # Replace final FC for downstream task alignment
+        in_features = self.backbone.fc.in_features
+        self.backbone.fc = nn.Linear(in_features, output_dim)
+
+    def forward(self, x, attention_mask=None):
+        disease_logits = self.backbone(x)
+        return {
+                "disease_logits": disease_logits,
         }
