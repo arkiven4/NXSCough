@@ -452,7 +452,7 @@ def cut_pad_sample_torchaudio(data, sample_rate, desired_length, pad_types='zero
 
     if data.shape[-1] > target_duration:
         max_start = data.shape[-1] - target_duration
-        start = np.random.randint(0, max_start + 1)  # random start index
+        start = 0 #np.random.randint(0, max_start + 1)  # random start index
         data = data[..., start:start + target_duration]
     else:
         if pad_types == 'zero':

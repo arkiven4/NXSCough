@@ -642,7 +642,151 @@ class WavLMEncoder_MyOwn(nn.Module):
             "embedding": feature_embedding,
             "disease_logits": disease_logits,
         }
+
+
+class WavLMEncoder_MyOwnSCL(nn.Module):
+    def __init__(self, input_size, num_transformer_layers=12, output_dim=2, **kwargs):
+        super(WavLMEncoder_MyOwnSCL, self).__init__()
+
+        config = AutoConfig.from_pretrained("microsoft/wavlm-large")
+        self.feature_extractor = layers.WavLMFeatureEncoder(config)
+        self.feature_projection = layers.WavLMFeatureProjection(config)
+
+        embed_dim = 1024
+        num_heads = 16
+        dropout = 0.1
+        self.temperature = 0.1
+
+        self.pos_conv_embed = nn.Conv1d(
+            embed_dim, embed_dim, kernel_size=128, padding=64, groups=16
+        )
+        self.layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+
+        self.attention_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=embed_dim,
+                nhead=num_heads,
+                dim_feedforward=embed_dim * 4,  # 4096 for WavLM-large
+                dropout=dropout,
+                activation='gelu',  # WavLM uses GELU
+                layer_norm_eps=1e-5,
+                batch_first=True,
+                norm_first=True  # Pre-norm like WavLM
+            ) for _ in range(num_transformer_layers)
+        ])
+        self.final_layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
+        self.layer_weights = nn.Parameter(torch.ones(num_transformer_layers + 1))
+
+        #self.pooling = nn.AdaptiveAvgPool1d(1)
+        self.pooling = layers.AttentiveStatisticsPooling(embed_dim)
+        embed_dim = embed_dim * 2
+        
+        self.projector = layers.CustomWalvmProjector(
+            dim_in=embed_dim, 
+            dim_hidden=4096, 
+            dim_out=256
+        )
+
+    def calc_cl(self, z1, z2):
+        """
+        z1, z2: [batch, dim] embeddings from two augmented views
+        """
+        B = z1.size(0)
+
+        z1 = F.normalize(z1, dim=1)
+        z2 = F.normalize(z2, dim=1)
+
+        logits = torch.matmul(z1, z2.t()) / self.temperature
+        labels = torch.arange(B, device=z1.device)
+
+        loss_12 = F.cross_entropy(logits, labels)
+        loss_21 = F.cross_entropy(logits.t(), labels)
+
+        return (loss_12 + loss_21) * 0.5
+
+
+    def forward_encoder(self, x, attention_mask=None):
+        x = x.squeeze(1)
+        extract_features = self.feature_extractor(x)
+        extract_features = extract_features.transpose(1, 2)
+        hidden_states, extract_features = self.feature_projection(extract_features) # B, T, D
+
+        pos_conv_output = self.pos_conv_embed(hidden_states.transpose(1, 2))
+        pos_conv_output = pos_conv_output.transpose(1, 2)
+        min_seq_len = min(hidden_states.size(1), pos_conv_output.size(1))
+        hidden_states = hidden_states[:, :min_seq_len, :]
+        pos_conv_output = pos_conv_output[:, :min_seq_len, :]
+
+        hidden_states = hidden_states + pos_conv_output
+        hidden_states = self.layer_norm(hidden_states)
+
+        layer_outputs = [hidden_states]
+        for layer in self.attention_layers:
+            hidden_states = layer(hidden_states)
+            layer_outputs.append(hidden_states)
+        
+        hidden_states = self.final_layer_norm(hidden_states)
+        layer_outputs[-1] = hidden_states
+
+        layer_weights_normalized = torch.softmax(self.layer_weights, dim=0)
+        weighted_hidden_states = torch.zeros_like(hidden_states)
+        for i, layer_output in enumerate(layer_outputs):
+            weighted_hidden_states += layer_weights_normalized[i] * layer_output
+        
+        #hidden_states = weighted_hidden_states.transpose(1, 2)  # [B, embed_dim, T]
+        hidden_states = weighted_hidden_states#.transpose(1, 2)  # [B, embed_dim, T]
+
+        feature_embedding = self.pooling(hidden_states).squeeze(-1)  # [B, embed_dim]
+        z = self.projector(feature_embedding)
+        return feature_embedding, z
     
+    def forward(self, x, x2=None, attention_mask=None):
+        _, z1 = self.forward_encoder(x)
+        _, z2 = self.forward_encoder(x2)
+
+        return {
+            "loss": self.calc_cl(z1, z2),
+        }
+
+class DownstreamWavLMEncoder_MyOwnSCL(nn.Module):
+    def __init__(self, input_size, num_transformer_layers=12, output_dim=2, freeze_encoder=False, use_proj_output=True, **kwargs):
+        super(DownstreamWavLMEncoder_MyOwnSCL, self).__init__()
+
+        self.use_proj_output = use_proj_output
+        self.sscl_model = WavLMEncoder_MyOwnSCL(1000, 12, 2)
+        temp_ckpt = torch.load("/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/logs/wavlmencoder_scl_attentive/fold_0/pool_fold0_epoch=03.ckpt")
+        raw_sd = temp_ckpt["state_dict"]
+        patched_sd = {}
+        for k, v in raw_sd.items():
+            patched_key = k[len("model."):] if k.startswith("model.") else k
+            patched_sd[patched_key] = v
+        self.sscl_model.load_state_dict(patched_sd, strict=False)
+        self.sscl_model.feature_extractor._freeze_parameters()
+
+        if freeze_encoder:
+            for p in self.sscl_model.parameters():
+                p.requires_grad = False
+
+        in_dim = 256 if use_proj_output else 2048
+        self.head = nn.Sequential(
+            nn.Linear(in_dim, in_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.4),
+            nn.Linear(in_dim // 2, output_dim)
+        )
+    
+    def forward(self, x, x2=None, attention_mask=None):
+        out = self.sscl_model.forward_encoder(x)
+        if self.use_proj_output:
+            feature_embedding = out[1]
+        else:
+            feature_embedding = out[0]
+
+        disease_logits = self.head(feature_embedding)
+        return {
+            "embedding": feature_embedding,
+            "disease_logits": disease_logits,
+        }
 
 class ResNet152Classifier(nn.Module):
     def __init__(self, dummy_input, output_dim=2, pretrained=True, **kwargs):

@@ -101,7 +101,13 @@ class WhisperFeatureEncoder(nn.Module):
         return hidden_states
 
 class AttentiveStatisticsPooling(nn.Module):
-    """Attentive Statistics Pooling layer that computes weighted mean and std"""
+    """Attentive Statistics Pooling layer that computes weighted mean and std
+    attention_dim	Behavior
+    64	lightweight, low-capacity attention
+    128	baseline, balanced (recommended)
+    256	high-capacity attention, improved discrimination
+    512	very expressive but risk of overfitting; slower
+    """
     def __init__(self, input_dim, attention_dim=128):
         super(AttentiveStatisticsPooling, self).__init__()
         self.input_dim = input_dim
@@ -206,3 +212,41 @@ class SEBlock(nn.Module):
             raise Exception("Incorrect argument!")
 
         return x
+
+class CustomWalvmProjector(nn.Module):
+    def __init__(self, dim_in=1024, dim_hidden=2048, dim_out=256):
+        super().__init__()
+        # CHANGE: explicit layer definitions to ensure final linear+BN are executed
+        self.fc1 = nn.Linear(dim_in, dim_hidden)
+        self.bn1 = nn.BatchNorm1d(dim_hidden)
+        self.fc2 = nn.Linear(dim_hidden, dim_hidden)
+        self.bn2 = nn.BatchNorm1d(dim_hidden)
+
+        # residual mapping (dim_in -> dim_hidden)
+        self.shortcut = nn.Linear(dim_in, dim_hidden) if dim_in != dim_hidden else nn.Identity()
+
+        # final projection to dim_out + BN (affine=False)
+        self.fc3 = nn.Linear(dim_hidden, dim_out)
+        self.bn3 = nn.BatchNorm1d(dim_out, affine=False)
+
+    def forward(self, x):
+        # x: [B, dim_in]
+        # block 1
+        out = self.fc1(x)
+        out = self.bn1(out)
+        out = F.relu(out, inplace=True)
+
+        out = self.fc2(out)
+        out = self.bn2(out)
+        out = F.relu(out, inplace=True)
+
+        # residual add (CHANGE: residual applied before dimension collapse)
+        res = self.shortcut(x) if not isinstance(self.shortcut, nn.Identity) else x
+        out = out + res
+
+        # final projection
+        out = self.fc3(out)
+        out = self.bn3(out)  # affine False -> whitened output (SimCLR v2 style)
+
+        # optional: L2 normalize here or leave to loss function (we normalize in calc_cl)
+        return out

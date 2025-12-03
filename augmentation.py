@@ -108,7 +108,8 @@ class DataAugmentator:
         rir_np = normalized_rir.squeeze().cpu().numpy() if isinstance(normalized_rir, torch.Tensor) else normalized_rir.squeeze()
         
         # Apply convolution using scipy
-        convolved = signal.fftconvolve(audio_np, rir_np, mode='full')
+        convolved = signal.fftconvolve(audio_np, rir_np, mode='same')
+        #convolved = convolved[:len(audio_np)]
         
         # Convert back to torch tensor
         augmented_waveform = torch.from_numpy(convolved).float().unsqueeze(0)

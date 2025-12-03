@@ -57,12 +57,17 @@ config = json.loads(data)
 hps = utils.HParams(**config)
 hps.model_dir = model_dir
 hps.data.mae_training = hps.train.mae_training
+hps.data.ssccl_training = hps.train.ssccl_training
 
 # =============================================================
 # SECTION: Loading Data
 # =============================================================
 df_train = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.train')
 df_test = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.test')
+
+print(df_train['db'].value_counts())
+print(df_train['disease_status'].value_counts())
+#df_train = df_train[~df_train['db'].isin([0, 1])]
 
 df_train = df_train.reset_index(drop=True)
 df_test = df_test.reset_index(drop=True)
@@ -81,6 +86,7 @@ logger.info(f"======================================")
 logger.info(f"✨ Loss: {hps.train.loss_function}")
 logger.info(f"✨ Use Between Class Training: {hps.data.mix_audio}")
 logger.info(f"✨ Use Augment: {hps.data.augment_data}")
+logger.info(f"✨ Use Augment: Prob {hps.data.augment_prob}")
 logger.info(f"✨ Use Rawboost Augment: {hps.data.augment_rawboost}")
 logger.info(f"✨ Padding Type: {hps.data.pad_types}")
 logger.info(f"✨ Using Model: {hps.model.pooling_model}")
@@ -103,27 +109,33 @@ class CoughDetectionRunner(L.LightningModule):
         self.hps = hps
         self.class_weights = class_weights
 
-        self.supcon_loss = losses.SupConLoss()
+        self.supcon_loss = losses.SupervisedContrastiveLoss()
+        self.center_loss = losses.CenterLoss(num_classes=hps.model.output_dim, feat_dim=256, lambda_c=0.01)
 
+        # =============================================================
+        # SECTION: Additional Setupo
+        # =============================================================
         #ckpt = torch.load("/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/pretrained/encoder-operaGT.ckpt")
         #self.model.load_state_dict(ckpt["state_dict"], strict=False)
-
         if hps.model.pooling_model.split("_")[0] == "WavLMEncoder":
             logger.info("Loaded Pretrained WavLM")
             from transformers import AutoModel
             ssl_model = AutoModel.from_pretrained("microsoft/wavlm-large")
             self.model.feature_extractor.load_state_dict(ssl_model.feature_extractor.state_dict())
             self.model.feature_extractor._freeze_parameters()
-
             del ssl_model
             torch.cuda.empty_cache()
 
-    def forward(self, x, attention_mask=None):
-        x = self.model(x, attention_mask=attention_mask)
+    def forward(self, x1, x2=None, attention_mask=None):
+        x = self.model(x1, x2=x2, attention_mask=attention_mask)
         return x
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.hps.train.learning_rate)
+        optimizer = torch.optim.Adam([
+            {"params": self.model.sscl_model.parameters(), "lr": 1e-5},
+            {"params": self.model.head.parameters(), "lr": self.hps.train.learning_rate},
+            {"params": self.center_loss.parameters(), "lr": self.hps.train.learning_rate},
+        ])
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=2)
         return {
             "optimizer": optimizer,
@@ -144,8 +156,8 @@ class CoughDetectionRunner(L.LightningModule):
         self.log("train/grad_norm", total_norm, sync_dist=True)
 
     def training_step(self, batch, batch_idx):
-        _, audio, attention_masks, dse_ids, othr_ids = batch
-        out_model = self.forward(audio, attention_mask=attention_masks)
+        _, audio1, audio2, attention_masks, dse_ids, _ = batch
+        out_model = self.forward(audio1, audio2, attention_mask=attention_masks)
 
         tot_loss = []
         if "disease_logits" in out_model:
@@ -156,7 +168,8 @@ class CoughDetectionRunner(L.LightningModule):
             tot_loss.append(out_model["loss"])
 
         if "embedding" in out_model:
-            tot_loss.append(self.supcon_loss(out_model["embedding"], dse_ids))
+            tot_loss.append(self.supcon_loss(out_model["embedding"], dse_ids) * 0.03)
+            tot_loss.append(self.center_loss(out_model["embedding"], dse_ids) * 0.005)
 
         loss = sum(tot_loss)
         for idx_loss, now_loss in enumerate(tot_loss):
@@ -176,7 +189,7 @@ class CoughDetectionRunner(L.LightningModule):
 
             self.logger.experiment.add_image(
                 "orig_image",
-                utils.plot_spectrogram_to_numpy(audio[random_idx].data.cpu().numpy()),
+                utils.plot_spectrogram_to_numpy(audio1[random_idx].data.cpu().numpy()),
                 global_step=self.global_step
             )
 
@@ -187,8 +200,8 @@ class CoughDetectionRunner(L.LightningModule):
         self.log("train/lr", lr, sync_dist=True)
 
     def validation_step(self, batch, batch_idx):
-        _, audio, attention_masks, dse_ids, othr_ids = batch
-        out_model = self.forward(audio, attention_mask=attention_masks)
+        _, audio1, audio2, attention_masks, dse_ids, _ = batch
+        out_model = self.forward(audio1, audio2, attention_mask=attention_masks)
         
         tot_loss = []
         if "disease_logits" in out_model:
@@ -199,7 +212,8 @@ class CoughDetectionRunner(L.LightningModule):
             tot_loss.append(out_model["loss"])
 
         if "embedding" in out_model:
-            tot_loss.append(self.supcon_loss(out_model["embedding"], dse_ids))
+            tot_loss.append(self.supcon_loss(out_model["embedding"], dse_ids) * 0.03)
+            tot_loss.append(self.center_loss(out_model["embedding"], dse_ids) * 0.005)
 
         loss = sum(tot_loss)
         self.logger.experiment.add_scalars('loss', {'valid': loss}, self.global_step)
@@ -210,13 +224,10 @@ class CoughDetectionRunner(L.LightningModule):
         self.test_labels = []
 
     def test_step(self, batch, batch_idx):
-        _, audio, attention_masks, dse_ids, _ = batch
-
-        audio = audio.float().squeeze(1)
-        attention_masks = attention_masks.float()
+        _, audio1, audio2, attention_masks, dse_ids, _ = batch
         dse_ids = dse_ids.float()
-
-        logits = self(audio, attention_mask=attention_masks)["disease_logits"]
+        logits = self.forward(audio1, audio2, attention_mask=attention_masks)["disease_logits"]
+        
         preds = torch.argmax(logits, dim=1)
         labels = torch.argmax(dse_ids, dim=1)
 
@@ -331,13 +342,12 @@ for fold, (train_idx, val_idx) in enumerate(splitter):
        default_root_dir=hps.model_dir
     )
     trainer.fit(runner_lightning, train_dataloaders=train_loader, val_dataloaders=val_loader)
-    if hps.train.use_Kfold:
-        results = trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
-        if results:
-            current_bacc = results[0].get('test_bacc', 0.0)
-            logger.info(f"Fold {fold+1} Balanced Accuracy: {current_bacc:.4f}")
-            fold_metrics.append(current_bacc)
-            fold_checkpoints.append(checkpoint_callback.best_model_path)
+    results = trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
+    if results:
+        current_bacc = results[0].get('test_bacc', 0.0)
+        logger.info(f"Fold {fold+1} Balanced Accuracy: {current_bacc:.4f}")
+        fold_metrics.append(current_bacc)
+        fold_checkpoints.append(checkpoint_callback.best_model_path)
 
 if hps.train.use_Kfold:
     mean_bacc = np.mean(fold_metrics)
@@ -368,6 +378,20 @@ if hps.train.use_Kfold:
 
     with open(os.path.join(hps.model_dir, "info_fold.pkl"), "wb") as f:
         pickle.dump(payload, f)
+else:
+    best_fold_idx = 0
+    best_fold_metric = fold_metrics[best_fold_idx]
+    best_model_path = fold_checkpoints[best_fold_idx]
+    production_path = os.path.join(hps.model_dir, "best_model.ckpt")
+    shutil.copy2(best_model_path, production_path)
+
+    payload = {
+        "best_fold_idx": best_fold_idx,
+        "fold_metrics": fold_metrics,
+    }
+
+    with open(os.path.join(hps.model_dir, "info_fold.pkl"), "wb") as f:
+        pickle.dump(payload, f)
 
 
 # =============================================================
@@ -378,7 +402,8 @@ db_map = {
     1: "TBCoda Solicited",
     2: "TBScreen Logitudinal",
     3: "TBScreen Solicited",
-    4: "UK19Covid",
+    4: "CIRDZ",
+    5: "UK19Covid",
 }
 
 runner_lightning = CoughDetectionRunner(pool_model, hps=hps, class_weights=[])

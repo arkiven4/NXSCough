@@ -248,36 +248,63 @@ class AMSoftmaxLoss(nn.Module):
 
         return loss
     
-
-class SupConLoss(nn.Module):
-    def __init__(self, temperature=0.07):
+class SupervisedContrastiveLoss(nn.Module):
+    """
+    Supervised Contrastive Loss from Khosla et al. (2020):
+    L = Σ_i 1/(|P(i)|) Σ_{p ∈ P(i)} -log( exp(z_i · z_p / τ) / Σ_{a≠i} exp(z_i · z_a / τ) )
+    """
+    def __init__(self, temperature=0.1):
         super().__init__()
         self.temperature = temperature
 
     def forward(self, features, labels):
         """
-        features: [B, D]
-        labels: [B]
+        features: [B, D] embedding
+        labels: [B] int labels
         """
-        B, _ = features.shape
         if labels.dim() == 2:
             labels = torch.argmax(labels, dim=1)
-        labels = labels.view(B)
+        device = features.device
+        features = F.normalize(features, dim=1)
 
-        features = F.normalize(features, dim=-1)
-        batch_size = features.size(0)
+        logits = torch.div(
+            torch.matmul(features, features.T),
+            self.temperature
+        )
 
-        mask = torch.eq(labels.unsqueeze(1), labels.unsqueeze(0)).float()  # [B,B]
-        logits = torch.div(torch.matmul(features, features.T), self.temperature)
+        # Mask out self-comparisons
+        logits_mask = torch.ones_like(logits) - torch.eye(logits.size(0), device=device)
+        logits = logits * logits_mask
 
-        # remove self-contrast
-        logits_mask = torch.ones_like(mask) - torch.eye(batch_size, device=mask.device)
-        mask = mask * logits_mask
+        labels = labels.contiguous().view(-1, 1)
+        mask = torch.eq(labels, labels.T).float().to(device)
+        mask = mask * logits_mask  # remove diagonal
 
-        logits = logits - logits.max(dim=1, keepdim=True).values
-        exp_logits = torch.exp(logits) * logits_mask
-        log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-12)
+        exp_logits = torch.exp(logits)
+        log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-8)
 
-        mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-12)
+        mean_log_prob_pos = (mask * log_prob).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+
         loss = -mean_log_prob_pos.mean()
         return loss
+
+class CenterLoss(nn.Module):
+    """
+    Center Loss (Wen et al. 2016)
+    """
+    def __init__(self, num_classes=2, feat_dim=256, lambda_c=1.0):
+        super().__init__()
+        self.num_classes = num_classes
+        self.feat_dim = feat_dim
+        self.lambda_c = lambda_c
+        
+        # class centers: [C, D]
+        self.centers = nn.Parameter(torch.randn(num_classes, feat_dim))
+
+    def forward(self, features, labels):
+        if labels.dim() == 2:
+            labels = torch.argmax(labels, dim=1)
+            
+        batch_centers = self.centers[labels]  # [B, D]
+        loss = ((features - batch_centers) ** 2).sum() / 2.0
+        return self.lambda_c * loss

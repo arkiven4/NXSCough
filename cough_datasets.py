@@ -77,6 +77,7 @@ class CoughDatasets(torch.utils.data.Dataset):
         self.nu = getattr(hparams, "nu", 0.0)
         self.num_masks = getattr(hparams, "num_masks", 0)
         self.mae_training = getattr(hparams, "mae_training", False)
+        self.ssccl_training = getattr(hparams, "ssccl_training", False)
         self.rezize_size = tuple(getattr(hparams, "rezize_size", [224, 224]))
 
         self.nClasses = getattr(hparams, "many_class", None)
@@ -84,6 +85,7 @@ class CoughDatasets(torch.utils.data.Dataset):
         self.processor = None
 
         if self.augment_data:
+            # ["apply_speed_perturbation", "apply_pitch_shift", "apply_reverb", "add_background_noise", "apply_random_gain"]
             self.data_augmentator = DataAugmentator(
                 None,
                 augmentation_noises_labels_path="/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_noises_speechs_labels.tsv",
@@ -103,7 +105,7 @@ class CoughDatasets(torch.utils.data.Dataset):
             ])
 
         self.wav_transform = None
-        
+
         if hparams.acoustic_feature:
             if hparams.feature_type == "mfcc":
                 self.wav_transform = lambda wav: torch.tensor(librosa.feature.mfcc(
@@ -161,15 +163,15 @@ class CoughDatasets(torch.utils.data.Dataset):
                 )
             
             # WARN RESNET ONLY
-            from torchvision.transforms import (
-                Compose, Resize, CenterCrop, ToTensor, Normalize, InterpolationMode
-            )
-            self.img_transform = Compose([
-                Resize([256], interpolation=InterpolationMode.BILINEAR),
-                CenterCrop([224]),
-                Normalize(mean=[0.485, 0.456, 0.406],
-                        std=[0.229, 0.224, 0.225]),
-            ])
+            # from torchvision.transforms import (
+            #     Compose, Resize, CenterCrop, ToTensor, Normalize, InterpolationMode
+            # )
+            # self.img_transform = Compose([
+            #     Resize([256], interpolation=InterpolationMode.BILINEAR),
+            #     CenterCrop([224]),
+            #     Normalize(mean=[0.485, 0.456, 0.406],
+            #             std=[0.229, 0.224, 0.225]),
+            # ])
 
         if self.mix_audio == True:
             self.probs = [1 / self.nClasses] * self.nClasses
@@ -196,63 +198,26 @@ class CoughDatasets(torch.utils.data.Dataset):
     #     self.audiopaths_and_text = np.array(new_audiopaths, dtype=object)
 
     def get_mel_text_pair(self, audiopath_and_text):
-        # WARN : ONLY FOR COUGH DETECTIOP
         if self.cough_detection == True:
             wavname, dse_id, gndr_id, spk_id = audiopath_and_text[0], audiopath_and_text[1], 0, 0 #, audiopath_and_text[2], audiopath_and_text[3]
             wav = self.get_audio(self.db_path + "/" + wavname, start_index=audiopath_and_text[2], end_index=audiopath_and_text[3])
+            return (wavname, wav, dse_id, int(spk_id), int(gndr_id))
+        
+        wavname, dse_id, gndr_id, spk_id = audiopath_and_text[0], audiopath_and_text[1], audiopath_and_text[2], audiopath_and_text[3]
+        wav1, dse_id = self.get_audio(self.db_path + "/" + wavname, dse_id)
+
+        if self.ssccl_training:
+            wav2, _ = self.get_audio(self.db_path + "/" + wavname)
         else:
-            wavname, dse_id, gndr_id, spk_id = audiopath_and_text[0], audiopath_and_text[1], audiopath_and_text[2], audiopath_and_text[3]
-            wav = self.get_audio(self.db_path + "/" + wavname)
+            wav2 = torch.empty(0, dtype=wav1.dtype, device="cpu")
 
-        wav, dse_id = self.mix_audio_sample(wav, dse_id)
+        return (wavname, wav1, wav2, dse_id, int(spk_id), int(gndr_id))
         
-        if self.mean_std_norm:
-            wav = (wav - self.wav_mean) / (self.wav_std + 1e-6)
-        elif self.max_wav_value:
-            max_val = torch.max(torch.abs(wav))
-            wav = wav / max_val if max_val != 0 else wav
-
-        if self.wav_transform != None:
-            if self.feature_type == "opensmile":
-                wav = wav.numpy().reshape(-1)
-
-            wav = self.wav_transform(wav)  # [80, 224]
-            # delta = torch.tensor(librosa.feature.delta(wav.numpy()), dtype=torch.float32)
-            # delta2 = torch.tensor(librosa.feature.delta(wav.numpy(), order=2), dtype=torch.float32)
-            # wav = torch.cat([wav, delta, delta2], dim=0)
-
-            if self.multimask_augment == True and self.train == True:
-                wav = audio_processing.multi_mask_spectrogram(
-                    wav, tau=int(wav.shape[1] * self.tau),
-                    nu=int(wav.shape[0] * self.nu),
-                    num_masks=self.num_masks)  # T, F
-            
-            # WARN : ONLY FOR COUGH DETECTIOPN AND FIXED INPUT SIZE
-            if self.cough_detection:
-                wav = F.interpolate(wav.unsqueeze(0).unsqueeze(0), size=(240, 240), mode="bilinear", align_corners=False).squeeze(0).squeeze(0)
-
-            if self.img_transform != None:
-                wav = torch.flip(wav, dims=[0])
-                mel_min = wav.min()
-                mel_max = wav.max()
-                wav = (wav - mel_min) / (mel_max - mel_min + 1e-6)
-                idx = (wav * 255).clamp(0, 255).long()
-                wav = viridis_lut[idx]
-                wav = wav.permute(2, 0, 1).float()
-                wav = self.img_transform(wav)
-        
-        wav = wav.unsqueeze(0)
-        if self.mae_training == True:
-            wav = self.transform_train(wav.unsqueeze(0)).squeeze(0)
-
-        return (wavname, wav, dse_id, int(spk_id), int(gndr_id))
-
-    def get_audio(self, filename, start_index=0, end_index=-1):
+    def get_audio(self, filename, dse_id=None, start_index=0, end_index=-1):
         audio = utils.load_audio_sample(filename, self.sampling_rate, self.saming_length,
                                         self.desired_length, fade_samples_ratio=self.fade_samples_ratio,
                                         pad_types=self.pad_types)  # repeat zero
-        
-        ## WARN : ONLY FOR COUGH DETECTIOPN
+       
         if self.pad_types != "synthesis" and self.cough_detection:
             audio = audio[:, start_index:] if end_index == -1 else audio[:, start_index:end_index]
             
@@ -272,10 +237,56 @@ class CoughDatasets(torch.utils.data.Dataset):
 
         if self.add_noise:
             audio = audio + torch.rand_like(audio)
+        
+        if len(audio) > 15000:
+            print(audio.shape)
+            
+        audio = audio.unsqueeze(0)
+        if dse_id != None: # and self.train:
+            audio, dse_id = self.mix_audio_sample(audio, dse_id)
+        
+        if self.mean_std_norm:
+            audio = (audio - self.wav_mean) / (self.wav_std + 1e-6)
+        elif self.max_wav_value:
+            max_val = torch.max(torch.abs(audio))
+            audio = audio / max_val if max_val != 0 else audio
 
-        return audio.unsqueeze(0)
+        if self.wav_transform != None:
+            if self.feature_type == "opensmile":
+                audio = audio.numpy().reshape(-1)
+
+            audio = self.wav_transform(audio)  # [80, 224]
+            # delta = torch.tensor(librosa.feature.delta(wav.numpy()), dtype=torch.float32)
+            # delta2 = torch.tensor(librosa.feature.delta(wav.numpy(), order=2), dtype=torch.float32)
+            # wav = torch.cat([wav, delta, delta2], dim=0)
+
+            if self.multimask_augment == True and self.train == True:
+                audio = audio_processing.multi_mask_spectrogram(
+                    audio, tau=int(audio.shape[1] * self.tau),
+                    nu=int(audio.shape[0] * self.nu),
+                    num_masks=self.num_masks)  # T, F
+            
+            if self.cough_detection:
+                audio = F.interpolate(audio.unsqueeze(0).unsqueeze(0), size=(240, 240), mode="bilinear", align_corners=False).squeeze(0).squeeze(0)
+
+            if self.img_transform != None:
+                audio = torch.flip(audio, dims=[0])
+                mel_min = audio.min()
+                mel_max = audio.max()
+                audio = (audio - mel_min) / (mel_max - mel_min + 1e-6)
+                idx = (audio * 255).clamp(0, 255).long()
+                audio = viridis_lut[idx]
+                wav = audio.permute(2, 0, 1).float()
+                audio = self.img_transform(audio)
+        
+        audio = audio.unsqueeze(0)
+        if self.mae_training == True:
+            audio = self.transform_train(audio.unsqueeze(0)).squeeze(0)
+
+        return audio, dse_id
 
     def mix_audio_sample(self, wav, dse_id):
+        dse_id = int(dse_id)
         if not (self.mix_audio and self.train):
             eye = np.eye(self.nClasses)
             dse_id = torch.from_numpy(eye[dse_id].astype(np.float32)).unsqueeze(0)
@@ -295,10 +306,10 @@ class CoughDatasets(torch.utils.data.Dataset):
                 dse_id = torch.from_numpy(dse_id).unsqueeze(0)
                 break
 
-        wav_rand = self.get_audio(os.path.join(self.db_path, sampled_row[0]))
-
+        wav_rand, _ = self.get_audio(os.path.join(self.db_path, sampled_row[0]))
+        
         sound1 = wav.squeeze(0).numpy()
-        sound2 = wav_rand.squeeze(0).numpy()
+        sound2 = wav_rand.squeeze(0, 1).numpy()
         size = min(len(sound1), len(sound2))
 
         sound1 = sound1[:size]
@@ -322,18 +333,21 @@ class CoughDatasetsCollate:
         self.many_data = many_data
 
     def __call__(self, batch):
-        lengths = torch.tensor([x[1].shape[-1] for x in batch])
-        lengths_sorted, idx = torch.sort(lengths, descending=True)
+        lengths1 = torch.tensor([x[1].shape[-1] for x in batch])
+        lengths2 = torch.tensor([x[2].shape[-1] for x in batch])
+        lengths_sorted1, idx = torch.sort(lengths1, descending=True)
+        lengths_sorted2, idx = torch.sort(lengths2, descending=True)
 
-        max_len = lengths_sorted[0]
+        max_len = lengths_sorted1[0]
         bsz = len(batch)
 
         first_wav = batch[0][1]
         feature_dim = first_wav.shape[1] if first_wav.ndim == 3 else 1
 
         wav_names = []
-        #wav_padded = torch.zeros(bsz, feature_dim, max_len, dtype=first_wav.dtype)
-        wav_padded = torch.zeros(bsz, 3, 224, 224, dtype=first_wav.dtype)
+        wav_padded1 = torch.zeros(bsz, feature_dim, lengths_sorted1[0], dtype=first_wav.dtype)
+        wav_padded2 = torch.zeros(bsz, feature_dim, lengths_sorted2[0], dtype=first_wav.dtype)
+        #wav_padded = torch.zeros(bsz, 3, 224, 224, dtype=first_wav.dtype)
         attention_masks = torch.zeros(bsz, max_len)
 
         dse_ids = torch.zeros(bsz, self.many_data, dtype=torch.float32)
@@ -341,19 +355,19 @@ class CoughDatasetsCollate:
         gndr_ids = torch.zeros(bsz, dtype=torch.long)
 
         for i, j in enumerate(idx):
-            name, wav, dse, spk, gndr = batch[j]
+            name, wav1, wav2, dse, spk, gndr = batch[j]
             wav_names.append(name)
-            wav_length = wav.shape[-1]
 
-            #wav_padded[i, :, :wav_length] = wav
-            wav_padded[i, :, :, :wav_length] = wav
-            attention_masks[i, :wav_length] = 1
-
+            wav_padded1[i, :, :wav1.shape[-1]] = wav1
+            wav_padded2[i, :, :wav2.shape[-1]] = wav2
+            #wav_padded[i, :, :, :wav_length] = wav
+            attention_masks[i, :wav1.shape[-1]] = 1
+            
             dse_ids[i] = dse
             spk_ids[i] = spk
             gndr_ids[i] = gndr
 
-        return wav_names, wav_padded, attention_masks, dse_ids, [spk_ids, gndr_ids]
+        return wav_names, wav_padded1, wav_padded2, attention_masks, dse_ids, [spk_ids, gndr_ids]
 
 class CoughDatasetsProcessorCollate():
     """ Zero-pads model inputs and targets based on number of frames per step
