@@ -710,7 +710,9 @@ def many_loss_category(pred, lab, loss_type="CE", test=False, weights=None):
         loss = criterion(pred, lab)
         return [loss]
     elif loss_type == "BCE":
-        criterion = torch.nn.BCEWithLogitsLoss(weight=weights)
+        if len(lab.shape) == 2:
+           lab = lab.squeeze(-1)
+        criterion = torch.nn.BCEWithLogitsLoss()
         loss = criterion(pred, lab)
         return [loss]
     elif loss_type == "KLDivLoss":

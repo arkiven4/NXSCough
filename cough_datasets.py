@@ -1,3 +1,5 @@
+from torch.utils.data import Sampler
+from matplotlib import cm
 import os
 import pickle
 import random
@@ -46,13 +48,13 @@ SMILE_CLIENTS = {
     for fs in FEATURE_SETS
 }
 
-from matplotlib import cm
 viridis_lut = torch.tensor(cm.get_cmap("viridis").colors, dtype=torch.float32)  # (256,4)
 viridis_lut = viridis_lut[:, :3]
 
+
 class CoughDatasets(torch.utils.data.Dataset):
     def __init__(self, data_numpy, hparams, train=True, wav_stats_path=None):
-        self.audiopaths_and_text = shuffle(data_numpy, random_state=20)
+        self.audiopaths_and_text = data_numpy
         self.train = getattr(hparams, "train", train)
 
         self.hop_length = getattr(hparams, "hop_length", None)
@@ -63,6 +65,7 @@ class CoughDatasets(torch.utils.data.Dataset):
         self.desired_length = getattr(hparams, "desired_length", None)
         self.pad_types = getattr(hparams, "pad_types", None)
         self.feature_type = getattr(hparams, "feature_type", None)
+        self.delta_feature = getattr(hparams, "delta_feature", None)
         self.db_path = getattr(hparams, "db_path", None)
 
         self.augment_data = getattr(hparams, "augment_data", False)
@@ -72,7 +75,7 @@ class CoughDatasets(torch.utils.data.Dataset):
         self.fade_samples_ratio = getattr(hparams, "fade_samples_ratio", 0.0)
         self.add_noise = getattr(hparams, "add_noise", False)
         self.mix_audio = getattr(hparams, "mix_audio", False)
-        
+
         self.tau = getattr(hparams, "tau", 0.0)
         self.nu = getattr(hparams, "nu", 0.0)
         self.num_masks = getattr(hparams, "num_masks", 0)
@@ -91,7 +94,7 @@ class CoughDatasets(torch.utils.data.Dataset):
                 augmentation_noises_labels_path="/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_noises_speechs_labels.tsv",
                 augmentation_rirs_directory=None,
                 augmentation_rirs_labels_path="/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_rirs_labels.tsv",
-                augmentation_window_size_secs=5.5, augmentation_probability=[0.3, 0.15, 0.2, 0.4, 0.0])
+                augmentation_window_size_secs=5.5, augmentation_probability=[0.3, 0.15, 0.2, 0.4, 0.0])  # 0.3, 0.15, 0.2, 0.4, 0.0
 
         if self.mean_std_norm:
             with open(wav_stats_path, 'rb') as f:
@@ -134,6 +137,21 @@ class CoughDatasets(torch.utils.data.Dataset):
                     ),
                     dtype=torch.float32,
                 )
+            elif hparams.feature_type == "melspectogram":
+                from gammatone.gtgram import gtgram
+                self.wav_transform = lambda wav: torch.tensor(
+                    gtgram(
+                        y=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
+                        sr=hparams.sampling_rate,
+                        n_mels=hparams.n_mel_channels,
+                        fmin=hparams.mel_fmin,
+                        fmax=hparams.mel_fmax,
+                        n_fft=hparams.filter_length,
+                        hop_length=hparams.hop_length,
+                        power=2.0,
+                    ),
+                    dtype=torch.float32,
+                )
             elif hparams.feature_type == "spectogram":
                 self.wav_transform = lambda wav: torch.tensor(
                     librosa.amplitude_to_db(
@@ -153,15 +171,15 @@ class CoughDatasets(torch.utils.data.Dataset):
                 self.scaler = joblib.load("precomputed_stats/opensmile_global_scaler.pkl")
                 self.wav_transform = lambda wav: torch.tensor(self.scaler.transform(
                     pd.concat(
-                    [client.process_signal(wav, self.sampling_rate)
-                     .reset_index(drop=True)
-                     .add_prefix(f"{fs_name}__")
-                        for fs_name, client in SMILE_CLIENTS.items()
-                    ],
-                    axis=1).fillna(0.0).values).T,
+                        [client.process_signal(wav, self.sampling_rate)
+                         .reset_index(drop=True)
+                         .add_prefix(f"{fs_name}__")
+                         for fs_name, client in SMILE_CLIENTS.items()
+                         ],
+                        axis=1).fillna(0.0).values).T,
                     dtype=torch.float32
                 )
-            
+
             # WARN RESNET ONLY
             # from torchvision.transforms import (
             #     Compose, Resize, CenterCrop, ToTensor, Normalize, InterpolationMode
@@ -177,8 +195,7 @@ class CoughDatasets(torch.utils.data.Dataset):
             self.probs = [1 / self.nClasses] * self.nClasses
 
         random.seed(1234)
-        #self._filter()
-        
+        # self._filter()
 
     # def _filter(self, min_sec=0.4):
     #     lengths = []
@@ -199,10 +216,15 @@ class CoughDatasets(torch.utils.data.Dataset):
 
     def get_mel_text_pair(self, audiopath_and_text):
         if self.cough_detection == True:
-            wavname, dse_id, gndr_id, spk_id = audiopath_and_text[0], audiopath_and_text[1], 0, 0 #, audiopath_and_text[2], audiopath_and_text[3]
-            wav = self.get_audio(self.db_path + "/" + wavname, start_index=audiopath_and_text[2], end_index=audiopath_and_text[3])
-            return (wavname, wav, dse_id, int(spk_id), int(gndr_id))
-        
+            # , audiopath_and_text[2], audiopath_and_text[3]
+            wavname, dse_id, gndr_id, spk_id = audiopath_and_text[0], audiopath_and_text[1], 0, 0
+            wav, dse_id = self.get_audio(
+                self.db_path + "/" + wavname, dse_id, start_index=audiopath_and_text[2],
+                end_index=audiopath_and_text[3])
+            # print(wav.shape)
+            wav2 = torch.empty(0, dtype=wav.dtype, device="cpu")
+            return (wavname, wav, wav2, dse_id, int(spk_id), int(gndr_id))
+
         wavname, dse_id, gndr_id, spk_id = audiopath_and_text[0], audiopath_and_text[1], audiopath_and_text[2], audiopath_and_text[3]
         wav1, dse_id = self.get_audio(self.db_path + "/" + wavname, dse_id)
 
@@ -212,15 +234,19 @@ class CoughDatasets(torch.utils.data.Dataset):
             wav2 = torch.empty(0, dtype=wav1.dtype, device="cpu")
 
         return (wavname, wav1, wav2, dse_id, int(spk_id), int(gndr_id))
-        
+
     def get_audio(self, filename, dse_id=None, start_index=0, end_index=-1):
         audio = utils.load_audio_sample(filename, self.sampling_rate, self.saming_length,
                                         self.desired_length, fade_samples_ratio=self.fade_samples_ratio,
                                         pad_types=self.pad_types)  # repeat zero
-       
+
         if self.pad_types != "synthesis" and self.cough_detection:
-            audio = audio[:, start_index:] if end_index == -1 else audio[:, start_index:end_index]
-            
+            if audio.shape[-1] < end_index:
+                audio = audio[:, start_index:]
+            else:
+                audio = audio[:, start_index:end_index]
+            # audio = audio[:, start_index:] if end_index == -1 else audio[:, start_index:end_index]
+
         if self.augment_data and self.train:
             if random.uniform(0, 0.999) > 1 - self.augment_prob:
                 audio = self.data_augmentator(audio, self.sampling_rate)
@@ -237,14 +263,11 @@ class CoughDatasets(torch.utils.data.Dataset):
 
         if self.add_noise:
             audio = audio + torch.rand_like(audio)
-        
-        if len(audio) > 15000:
-            print(audio.shape)
-            
+
         audio = audio.unsqueeze(0)
-        if dse_id != None: # and self.train:
+        if dse_id != None:  # and self.train:
             audio, dse_id = self.mix_audio_sample(audio, dse_id)
-        
+
         if self.mean_std_norm:
             audio = (audio - self.wav_mean) / (self.wav_std + 1e-6)
         elif self.max_wav_value:
@@ -256,29 +279,30 @@ class CoughDatasets(torch.utils.data.Dataset):
                 audio = audio.numpy().reshape(-1)
 
             audio = self.wav_transform(audio)  # [80, 224]
-            # delta = torch.tensor(librosa.feature.delta(wav.numpy()), dtype=torch.float32)
-            # delta2 = torch.tensor(librosa.feature.delta(wav.numpy(), order=2), dtype=torch.float32)
-            # wav = torch.cat([wav, delta, delta2], dim=0)
+            if self.delta_feature:
+                delta = torch.tensor(librosa.feature.delta(audio.numpy()), dtype=torch.float32)
+                delta2 = torch.tensor(librosa.feature.delta(audio.numpy(), order=2), dtype=torch.float32)
+                audio = torch.cat([audio, delta, delta2], dim=0)
 
             if self.multimask_augment == True and self.train == True:
                 audio = audio_processing.multi_mask_spectrogram(
                     audio, tau=int(audio.shape[1] * self.tau),
                     nu=int(audio.shape[0] * self.nu),
                     num_masks=self.num_masks)  # T, F
-            
-            if self.cough_detection:
-                audio = F.interpolate(audio.unsqueeze(0).unsqueeze(0), size=(240, 240), mode="bilinear", align_corners=False).squeeze(0).squeeze(0)
 
-            if self.img_transform != None:
-                audio = torch.flip(audio, dims=[0])
-                mel_min = audio.min()
-                mel_max = audio.max()
-                audio = (audio - mel_min) / (mel_max - mel_min + 1e-6)
-                idx = (audio * 255).clamp(0, 255).long()
-                audio = viridis_lut[idx]
-                wav = audio.permute(2, 0, 1).float()
-                audio = self.img_transform(audio)
-        
+            # if self.cough_detection:
+            #     audio = F.interpolate(audio.unsqueeze(0).unsqueeze(0), size=(240, 240), mode="bilinear", align_corners=False).squeeze(0).squeeze(0)
+
+            # if self.img_transform != None:
+            #     audio = torch.flip(audio, dims=[0])
+            #     mel_min = audio.min()
+            #     mel_max = audio.max()
+            #     audio = (audio - mel_min) / (mel_max - mel_min + 1e-6)
+            #     idx = (audio * 255).clamp(0, 255).long()
+            #     audio = viridis_lut[idx]
+            #     wav = audio.permute(2, 0, 1).float()
+            #     audio = self.img_transform(audio)
+
         audio = audio.unsqueeze(0)
         if self.mae_training == True:
             audio = self.transform_train(audio.unsqueeze(0)).squeeze(0)
@@ -288,8 +312,12 @@ class CoughDatasets(torch.utils.data.Dataset):
     def mix_audio_sample(self, wav, dse_id):
         dse_id = int(dse_id)
         if not (self.mix_audio and self.train):
-            eye = np.eye(self.nClasses)
-            dse_id = torch.from_numpy(eye[dse_id].astype(np.float32)).unsqueeze(0)
+            if self.nClasses == 1:
+                dse_id = torch.tensor([float(dse_id)], dtype=torch.float32)
+            else:
+                eye = torch.eye(self.nClasses, dtype=torch.float32)
+                dse_id = eye[dse_id]
+                dse_id = dse_id.unsqueeze(0)
             return wav.squeeze(0), dse_id
 
         r = np.array(random.random(), dtype=np.float32)
@@ -307,7 +335,7 @@ class CoughDatasets(torch.utils.data.Dataset):
                 break
 
         wav_rand, _ = self.get_audio(os.path.join(self.db_path, sampled_row[0]))
-        
+
         sound1 = wav.squeeze(0).numpy()
         sound2 = wav_rand.squeeze(0, 1).numpy()
         size = min(len(sound1), len(sound2))
@@ -325,6 +353,7 @@ class CoughDatasets(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.audiopaths_and_text)
+
 
 class CoughDatasetsCollate:
     def __init__(self, many_data=2, processor=None, sampling_rate=16000):
@@ -347,7 +376,7 @@ class CoughDatasetsCollate:
         wav_names = []
         wav_padded1 = torch.zeros(bsz, feature_dim, lengths_sorted1[0], dtype=first_wav.dtype)
         wav_padded2 = torch.zeros(bsz, feature_dim, lengths_sorted2[0], dtype=first_wav.dtype)
-        #wav_padded = torch.zeros(bsz, 3, 224, 224, dtype=first_wav.dtype)
+        # wav_padded = torch.zeros(bsz, 3, 224, 224, dtype=first_wav.dtype)
         attention_masks = torch.zeros(bsz, max_len)
 
         dse_ids = torch.zeros(bsz, self.many_data, dtype=torch.float32)
@@ -360,14 +389,15 @@ class CoughDatasetsCollate:
 
             wav_padded1[i, :, :wav1.shape[-1]] = wav1
             wav_padded2[i, :, :wav2.shape[-1]] = wav2
-            #wav_padded[i, :, :, :wav_length] = wav
+            # wav_padded[i, :, :, :wav_length] = wav
             attention_masks[i, :wav1.shape[-1]] = 1
-            
+
             dse_ids[i] = dse
             spk_ids[i] = spk
             gndr_ids[i] = gndr
 
         return wav_names, wav_padded1, wav_padded2, attention_masks, dse_ids, [spk_ids, gndr_ids]
+
 
 class CoughDatasetsProcessorCollate():
     """ Zero-pads model inputs and targets based on number of frames per step
@@ -402,3 +432,130 @@ class CoughDatasetsProcessorCollate():
         attention_masks = audio_inputs["attention_mask"]   # [B, T]
 
         return wav_name, wav_padded, attention_masks, dse_ids, [spk_ids, gndr_ids]
+
+
+class CoughDetectionRatioBatchSampler(Sampler):
+    def __init__(
+        self,
+        cough_idx,
+        speech_idx,
+        noise_idx,
+        batch_size,
+        ratios=(0.5, 0.3, 0.2),
+        drop_last=True,
+    ):
+        self.cough_idx = cough_idx
+        self.speech_idx = speech_idx
+        self.noise_idx = noise_idx
+        self.batch_size = batch_size
+        self.ratios = ratios
+        self.drop_last = drop_last
+
+        self.n_cough = int(batch_size * ratios[0])
+        self.n_speech = int(batch_size * ratios[1])
+        self.n_noise = batch_size - self.n_cough - self.n_speech
+
+    def __iter__(self):
+        random.shuffle(self.cough_idx)
+        random.shuffle(self.speech_idx)
+        random.shuffle(self.noise_idx)
+
+        ptr_c, ptr_s, ptr_n = 0, 0, 0
+
+        while True:
+            if (
+                ptr_c + self.n_cough > len(self.cough_idx)
+                or ptr_s + self.n_speech > len(self.speech_idx)
+                or ptr_n + self.n_noise > len(self.noise_idx)
+            ):
+                if self.drop_last:
+                    break
+                else:
+                    ptr_c = ptr_s = ptr_n = 0
+
+            batch = (
+                self.cough_idx[ptr_c:ptr_c + self.n_cough]
+                + self.speech_idx[ptr_s:ptr_s + self.n_speech]
+                + self.noise_idx[ptr_n:ptr_n + self.n_noise]
+            )
+
+            random.shuffle(batch)
+
+            ptr_c += self.n_cough
+            ptr_s += self.n_speech
+            ptr_n += self.n_noise
+
+            yield batch
+
+    def __len__(self):
+        return min(
+            len(self.cough_idx) // self.n_cough,
+            len(self.speech_idx) // self.n_speech,
+            len(self.noise_idx) // self.n_noise,
+        )
+
+
+class CoughDiseaseBinaryBatchSampler(Sampler):
+    def __init__(
+        self,
+        positive_idx,
+        negative_idx,
+        batch_size,
+        ratio=0.5,
+        drop_last=True,
+    ):
+        """
+        Binary batch sampler for balanced 50/50 sampling.
+
+        Args:
+            positive_idx: List of indices for positive class (e.g., cough)
+            negative_idx: List of indices for negative class (e.g., non-cough)
+            batch_size: Total batch size
+            ratio: Ratio of positive samples in batch (default: 0.5 for 50/50)
+            drop_last: Whether to drop the last incomplete batch
+        """
+        self.positive_idx = positive_idx
+        self.negative_idx = negative_idx
+        self.batch_size = batch_size
+        self.ratio = ratio
+        self.drop_last = drop_last
+
+        self.n_positive = int(batch_size * ratio)
+        self.n_negative = batch_size - self.n_positive
+
+    def __iter__(self):
+        random.shuffle(self.positive_idx)
+        random.shuffle(self.negative_idx)
+
+        ptr_pos, ptr_neg = 0, 0
+
+        while True:
+            if (
+                ptr_pos + self.n_positive > len(self.positive_idx)
+                or ptr_neg + self.n_negative > len(self.negative_idx)
+            ):
+                if self.drop_last:
+                    break
+                else:
+                    # Reset pointers and reshuffle
+                    random.shuffle(self.positive_idx)
+                    random.shuffle(self.negative_idx)
+                    ptr_pos = ptr_neg = 0
+
+            batch = (
+                self.positive_idx[ptr_pos:ptr_pos + self.n_positive]
+                + self.negative_idx[ptr_neg:ptr_neg + self.n_negative]
+            )
+
+            random.shuffle(batch)
+
+            ptr_pos += self.n_positive
+            ptr_neg += self.n_negative
+
+            yield batch
+
+    def __len__(self):
+        return min(
+            len(self.positive_idx) // self.n_positive,
+            len(self.negative_idx) // self.n_negative,
+        )

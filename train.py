@@ -20,11 +20,12 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib import cm
 
-import commons, models, utils, losses
-from cough_datasets import CoughDatasets, CoughDatasetsCollate
+import commons, models, utils, losses, lightning_wrapper
+from cough_datasets import CoughDatasets, CoughDatasetsCollate, CoughDiseaseBinaryBatchSampler
 
 torch.set_float32_matmul_precision("medium")
 cmap = cm.get_cmap("viridis")
+
 #######################################################################
 parser = argparse.ArgumentParser()
 parser.add_argument("--init", action="store_true")
@@ -65,9 +66,9 @@ hps.data.ssccl_training = hps.train.ssccl_training
 df_train = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.train')
 df_test = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.test')
 
-print(df_train['db'].value_counts())
-print(df_train['disease_status'].value_counts())
-#df_train = df_train[~df_train['db'].isin([0, 1])]
+# print(df_train['db'].value_counts())
+# print(df_train['disease_status'].value_counts())
+# #df_train = df_train[~df_train['db'].isin([0, 1])]
 
 df_train = df_train.reset_index(drop=True)
 df_test = df_test.reset_index(drop=True)
@@ -76,6 +77,7 @@ df_train = df_train[hps.data.column_order]
 df_test = df_test[hps.data.column_order]
 
 collate_fn = CoughDatasetsCollate(hps.data.many_class)
+target_labels = df_train[hps.data.target_column]
 # =============================================================
 # SECTION: Model Setup
 # =============================================================
@@ -94,199 +96,24 @@ logger.info(f"✨ Tensorboard: http://100.101.198.75:{port}/#scalars&_smoothingW
 logger.info(f"======================================")
 
 hps.model.spk_dim = 0
-pool_net = getattr(models, hps.model.pooling_model)
-pool_model = pool_net(hps.model.feature_dim, **hps.model)
-shutil.copy2('./models.py', f'{hps.model_dir}/model_net.py.bak')
-
-# =============================================================
-# SECTION: Loop Setup
-# =============================================================
-
-class CoughDetectionRunner(L.LightningModule):
-    def __init__(self, model, hps, class_weights=[]):
-        super().__init__()
-        self.model = model
-        self.hps = hps
-        self.class_weights = class_weights
-
-        self.supcon_loss = losses.SupervisedContrastiveLoss()
-        self.center_loss = losses.CenterLoss(num_classes=hps.model.output_dim, feat_dim=256, lambda_c=0.01)
-
-        # =============================================================
-        # SECTION: Additional Setupo
-        # =============================================================
-        #ckpt = torch.load("/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/pretrained/encoder-operaGT.ckpt")
-        #self.model.load_state_dict(ckpt["state_dict"], strict=False)
-        if hps.model.pooling_model.split("_")[0] == "WavLMEncoder":
-            logger.info("Loaded Pretrained WavLM")
-            from transformers import AutoModel
-            ssl_model = AutoModel.from_pretrained("microsoft/wavlm-large")
-            self.model.feature_extractor.load_state_dict(ssl_model.feature_extractor.state_dict())
-            self.model.feature_extractor._freeze_parameters()
-            del ssl_model
-            torch.cuda.empty_cache()
-
-    def forward(self, x1, x2=None, attention_mask=None):
-        x = self.model(x1, x2=x2, attention_mask=attention_mask)
-        return x
-    
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam([
-            {"params": self.model.sscl_model.parameters(), "lr": 1e-5},
-            {"params": self.model.head.parameters(), "lr": self.hps.train.learning_rate},
-            {"params": self.center_loss.parameters(), "lr": self.hps.train.learning_rate},
-        ])
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=2)
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val/loss",
-            },
-        }
-
-    def on_after_backward(self):
-        norm_type = 2
-        total_norm = 0
-        parameters = list(filter(lambda p: p.grad is not None, self.model.parameters()))
-        for p in parameters:
-            param_norm = p.grad.data.norm(norm_type)
-            total_norm += param_norm.item() ** norm_type
-        total_norm = total_norm ** (1. / norm_type)
-        self.log("train/grad_norm", total_norm, sync_dist=True)
-
-    def training_step(self, batch, batch_idx):
-        _, audio1, audio2, attention_masks, dse_ids, _ = batch
-        out_model = self.forward(audio1, audio2, attention_mask=attention_masks)
-
-        tot_loss = []
-        if "disease_logits" in out_model:
-            ld = utils.many_loss_category(out_model["disease_logits"], dse_ids, loss_type=self.hps.train.loss_function, weights=self.class_weights)
-            tot_loss.append(ld[0])
-
-        if "loss" in out_model:
-            tot_loss.append(out_model["loss"])
-
-        if "embedding" in out_model:
-            tot_loss.append(self.supcon_loss(out_model["embedding"], dse_ids) * 0.03)
-            tot_loss.append(self.center_loss(out_model["embedding"], dse_ids) * 0.005)
-
-        loss = sum(tot_loss)
-        for idx_loss, now_loss in enumerate(tot_loss):
-            self.log(f"train/loss_{idx_loss}", now_loss, on_step=True, on_epoch=False, prog_bar=False, logger=True)
-
-        self.log("train/loss_step", loss, on_step=True, on_epoch=False, prog_bar=True, logger=True)
-        self.logger.experiment.add_scalars('loss', {'train': loss}, self.global_step)
-
-        if "pred" in out_model:
-            random_idx = torch.randint(0, out_model["pred"].size(0), (1,)).item()
-            
-            self.logger.experiment.add_image(
-                "pred_image",
-                utils.plot_spectrogram_to_numpy(out_model["pred"][random_idx].data.cpu().numpy().T),
-                global_step=self.global_step
-            )
-
-            self.logger.experiment.add_image(
-                "orig_image",
-                utils.plot_spectrogram_to_numpy(audio1[random_idx].data.cpu().numpy()),
-                global_step=self.global_step
-            )
-
-        return loss
-
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        lr = self.optimizers().param_groups[0]["lr"]
-        self.log("train/lr", lr, sync_dist=True)
-
-    def validation_step(self, batch, batch_idx):
-        _, audio1, audio2, attention_masks, dse_ids, _ = batch
-        out_model = self.forward(audio1, audio2, attention_mask=attention_masks)
-        
-        tot_loss = []
-        if "disease_logits" in out_model:
-            ld = utils.many_loss_category(out_model["disease_logits"], dse_ids, loss_type=self.hps.train.loss_function, weights=self.class_weights)
-            tot_loss.append(ld[0])
-
-        if "loss" in out_model:
-            tot_loss.append(out_model["loss"])
-
-        if "embedding" in out_model:
-            tot_loss.append(self.supcon_loss(out_model["embedding"], dse_ids) * 0.03)
-            tot_loss.append(self.center_loss(out_model["embedding"], dse_ids) * 0.005)
-
-        loss = sum(tot_loss)
-        self.logger.experiment.add_scalars('loss', {'valid': loss}, self.global_step)
-        self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
-
-    def on_test_epoch_start(self):
-        self.test_preds = []
-        self.test_labels = []
-
-    def test_step(self, batch, batch_idx):
-        _, audio1, audio2, attention_masks, dse_ids, _ = batch
-        dse_ids = dse_ids.float()
-        logits = self.forward(audio1, audio2, attention_mask=attention_masks)["disease_logits"]
-        
-        preds = torch.argmax(logits, dim=1)
-        labels = torch.argmax(dse_ids, dim=1)
-
-        self.test_preds.append(preds.cpu())
-        self.test_labels.append(labels.cpu())
-
-    def on_test_epoch_end(self):
-        preds = torch.cat(self.test_preds).numpy()
-        labels = torch.cat(self.test_labels).numpy()
-
-        cm = confusion_matrix(labels, preds)
-        n_classes = cm.shape[0]
-        class_labels = [f"Class {i+1}" for i in range(n_classes)]
-
-        acc = accuracy_score(labels, preds)
-        b_acc = balanced_accuracy_score(labels, preds)
-
-        sens = np.mean([
-            cm[i, i] / cm[i, :].sum()
-            for i in range(n_classes) if cm[i, :].sum() > 0
-        ])
-
-        spec = np.mean([
-            (cm.sum() - cm[i, :].sum() - cm[:, i].sum() + cm[i, i]) /
-            (cm.sum() - cm[i, :].sum())
-            for i in range(n_classes) if (cm.sum() - cm[i, :].sum()) > 0
-        ])
-
-        # Log metrics
-        self.log("test_acc", acc, sync_dist=True)
-        self.log("test_bacc", b_acc, sync_dist=True)
-        self.log("test_sens", sens, sync_dist=True)
-        self.log("test_spec", spec, sync_dist=True)
-
-        # Export confusion matrix if needed
-        if hasattr(self.hparams, "model_dir"):
-            plt.figure(figsize=(6, 5))
-            sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
-                        xticklabels=class_labels, yticklabels=class_labels)
-            plt.xlabel("Predicted")
-            plt.ylabel("Actual")
-            plt.title("Confusion Matrix")
-            plt.savefig(f"{self.hparams.model_dir}/result_cm.png")
-            plt.close()
-
-        return {
-            "acc": acc,
-            "bacc": b_acc,
-            "sens": sens,
-            "spec": spec,
-        }
-    
+if args.init:
+    pool_net = getattr(models, hps.model.pooling_model)
+    pool_model = pool_net(hps.model.feature_dim, **hps.model)
+    shutil.copy2('./models.py', f'{hps.model_dir}/model_net.py.bak')
+else:
+    import sys, importlib.util, shutil, tempfile
+    temp_path = tempfile.NamedTemporaryFile(suffix=".py", delete=False).name
+    shutil.copy(f"{model_dir}/model_net.py.bak", temp_path)
+    spec = importlib.util.spec_from_file_location("model_net", temp_path)
+    pool_model = importlib.util.module_from_spec(spec)
+    sys.modules["model_net"] = pool_model
+    spec.loader.exec_module(pool_model)
 # =============================================================
 # SECTION: Setup Logger, Dataloader
 # =============================================================
 fold_metrics = []
 fold_checkpoints = []
 
-target_labels = df_train[hps.data.target_column]
 if hps.train.use_Kfold:
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     splitter = skf.split(df_train, target_labels)
@@ -306,15 +133,23 @@ for fold, (train_idx, val_idx) in enumerate(splitter):
 
     train_fold = df_train.iloc[train_idx].reset_index(drop=True)
     val_fold = df_train.iloc[val_idx].reset_index(drop=True)
-    
+
+    positive_idx  = train_fold.index[train_fold[hps.data.target_column] == 1].tolist()
+    negative_idx = train_fold.index[train_fold[hps.data.target_column] == 0].tolist()
+
+    sampler = CoughDiseaseBinaryBatchSampler(
+        positive_idx,
+        negative_idx,
+        hps.train.batch_size,
+    )
+
     class_weights_tensor = utils.compute_class_weights(train_fold, hps.data.target_column)
     utils.compute_wav_stats(train_fold, "path_file", pickle_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle")
 
     train_dataset = CoughDatasets(train_fold.values, hps.data, wav_stats_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle", train=True)
     val_dataset = CoughDatasets(val_fold.values, hps.data, wav_stats_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle", train=False)
-
-    train_loader = DataLoader(train_dataset, num_workers=28, shuffle=True, batch_size=hps.train.batch_size,
-                              pin_memory=True, drop_last=True, collate_fn=collate_fn)
+    
+    train_loader = DataLoader(train_dataset, num_workers=28, batch_sampler=sampler, pin_memory=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size,
                             pin_memory=True, drop_last=True, collate_fn=collate_fn)
 
@@ -332,7 +167,7 @@ for fold, (train_idx, val_idx) in enumerate(splitter):
 
     tb_logger = TensorBoardLogger(save_dir=hps.model_dir, name=f"fold_{fold}", sub_dir="train")
     early_stopping = EarlyStopping(monitor="val/loss", patience=5, mode="min", verbose=False)
-    runner_lightning = CoughDetectionRunner(pool_model, hps=hps, class_weights=class_weights_tensor)
+    runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=class_weights_tensor)
     trainer = L.Trainer(
        max_epochs=1000,
        callbacks=[checkpoint_callback, early_stopping],
@@ -406,11 +241,11 @@ db_map = {
     5: "UK19Covid",
 }
 
-runner_lightning = CoughDetectionRunner(pool_model, hps=hps, class_weights=[])
-runner_lightning = CoughDetectionRunner.load_from_checkpoint(
+runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[])
+runner_lightning = lightning_wrapper.CoughClassificationRunner.load_from_checkpoint(
     os.path.join(hps.model_dir, "best_model.ckpt"),
     model=pool_model,
-    hps=hps
+    hps=hps, custom_logger=logger
 )
 runner_lightning.eval()
 trainer = L.Trainer(accelerator="gpu" if torch.cuda.is_available() else "cpu", devices="auto")
@@ -434,11 +269,18 @@ for db_type in df_test['db'].unique().tolist():
     val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size, pin_memory=True, drop_last=True, collate_fn=collate_fn)
     results = trainer.test(runner_lightning, dataloaders=val_loader)[0]
     with open(f"{model_dir}/result_summary.txt", "a") as f:
-        f.write(f"{db_map[db_type]} - Acc {results['test_acc']:.2f} | BalAcc {results['test_bacc']:.2f} | "
-            f"Sens {results['test_sens']:.2f} | Spec {results['test_spec']:.2f}\n")
+        f.write(
+            f"{db_map[db_type]} - "
+            f"Acc {results['test_acc']:.4f} | "
+            f"BalAcc {results['test_bacc']:.4f} | "
+            f"Sens {results['test_sens']:.4f} | "
+            f"Spec {results['test_spec']:.4f} | "
+            f"AUROC {results['test_auroc']:.4f} | "
+            f"pAUROC {results['test_pauroc']:.4f}\n"
+        )
 
 with open(f"{model_dir}/result_summary.txt", "a") as f:
-    f.write(f"=========================== Test Phase =============================\n")
+    f.write(f"\n=========================== Test Phase =============================\n")
 
 df_test = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.test')
 df_test = df_test.reset_index(drop=True)
@@ -449,8 +291,15 @@ for db_type in df_test['db'].unique().tolist():
     val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size, pin_memory=True, drop_last=True, collate_fn=collate_fn)
     results = trainer.test(runner_lightning, dataloaders=val_loader)[0]
     with open(f"{model_dir}/result_summary.txt", "a") as f:
-        f.write(f"{db_map[db_type]} - Acc {results['test_acc']:.2f} | BalAcc {results['test_bacc']:.2f} | "
-            f"Sens {results['test_sens']:.2f} | Spec {results['test_spec']:.2f}\n")
+        f.write(
+            f"{db_map[db_type]} - "
+            f"Acc {results['test_acc']:.4f} | "
+            f"BalAcc {results['test_bacc']:.4f} | "
+            f"Sens {results['test_sens']:.4f} | "
+            f"Spec {results['test_spec']:.4f} | "
+            f"AUROC {results['test_auroc']:.4f} | "
+            f"pAUROC {results['test_pauroc']:.4f}\n"
+        )
 
 df_test = pd.read_csv(f'/run/media/fourier/Data1/Pras/DatabaseLLM/cirdz/metadata_wavs_capped.csv')
 df_test = df_test.reset_index(drop=True)
@@ -459,5 +308,26 @@ val_dataset = CoughDatasets(df_test.values, hps.data, wav_stats_path=f"{hps.mode
 val_loader = DataLoader(val_dataset, num_workers=28, shuffle=False, batch_size=hps.train.batch_size, pin_memory=True, drop_last=True, collate_fn=collate_fn)
 results = trainer.test(runner_lightning, dataloaders=val_loader)[0]
 with open(f"{model_dir}/result_summary.txt", "a") as f:
-    f.write(f"CIRDZ - Acc {results['test_acc']:.2f} | BalAcc {results['test_bacc']:.2f} | "
-        f"Sens {results['test_sens']:.2f} | Spec {results['test_spec']:.2f}\n")
+    with open(f"{model_dir}/result_summary.txt", "a") as f:
+        f.write(
+            f"CIRDZ - "
+            f"Acc {results['test_acc']:.4f} | "
+            f"BalAcc {results['test_bacc']:.4f} | "
+            f"Sens {results['test_sens']:.4f} | "
+            f"Spec {results['test_spec']:.4f} | "
+            f"AUROC {results['test_auroc']:.4f} | "
+            f"pAUROC {results['test_pauroc']:.4f}\n"
+        )
+
+# =============================================================
+# SECTION: Cleaning
+# =============================================================
+if os.path.isfile(os.path.join(hps.model_dir, "best_model.ckpt")):
+    for name in os.listdir(hps.model_dir):
+        p = os.path.join(hps.model_dir, name)
+        if os.path.isdir(p) and name.startswith("fold_"):
+            shutil.rmtree(p)
+            print(f"Removed: {p}")
+else:
+    print("best_model.ckpt not found; no folders removed.")
+    

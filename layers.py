@@ -250,3 +250,42 @@ class CustomWalvmProjector(nn.Module):
 
         # optional: L2 normalize here or leave to loss function (we normalize in calc_cl)
         return out
+    
+
+class NetVLAD(nn.Module):
+    def __init__(self, feat_dim, num_clusters=8, normalize_input=True):
+        super().__init__()
+        self.feat_dim = feat_dim
+        self.num_clusters = num_clusters
+        self.normalize_input = normalize_input
+
+        self.clusters = nn.Parameter(torch.randn(num_clusters, feat_dim))
+        self.assignment = nn.Linear(feat_dim, num_clusters, bias=True)
+
+    def forward(self, x, lengths=None):
+        # x: [B, T, D]
+        B, T, D = x.shape
+
+        if self.normalize_input:
+            x = F.normalize(x, p=2, dim=-1)
+
+        soft_assign = self.assignment(x)  # [B, T, K]
+
+        if lengths is not None:
+            mask = torch.arange(T, device=x.device).unsqueeze(0) < lengths.unsqueeze(1)
+            mask = mask.float()  # [B, T, 1]
+            soft_assign = soft_assign.masked_fill(mask.unsqueeze(-1) == 0, -1e9)
+
+        soft_assign = F.softmax(soft_assign, dim=-1)  # [B, T, K]
+
+        x_exp = x.unsqueeze(2)                     # [B, T, 1, D]
+        c_exp = self.clusters.unsqueeze(0).unsqueeze(0)  # [1, 1, K, D]
+
+        residual = x_exp - c_exp                   # [B, T, K, D]
+        vlad = torch.sum(soft_assign.unsqueeze(-1) * residual, dim=1)  # [B, K, D]
+
+        vlad = F.normalize(vlad, p=2, dim=-1)
+        vlad = vlad.view(B, -1)                     # [B, K*D]
+        vlad = F.normalize(vlad, p=2, dim=-1)
+
+        return vlad

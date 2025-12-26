@@ -3,6 +3,7 @@ output/*/
 data/
 logs/
 logs_old/
+logs_old2/
 lightning_logs/
 preprocessed_data
 *.zip

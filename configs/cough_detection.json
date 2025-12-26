@@ -4,14 +4,15 @@
     "log_interval": 20,
     "seed": 1234,
     "epochs": 10000,
-    "learning_rate": 3e-5,
+    "learning_rate": 2e-4,
     "betas": [0.8, 0.99],
     "eps": 1e-9,
     "lr_decay": 0.999875,
-    "batch_size": 32,
-    "loss_function": "CE",
+    "batch_size": 24,
+    "loss_function": "BCE",
     "use_Kfold": false,
-    "mae_training": false
+    "mae_training": false,
+    "ssccl_training": false
   },
   "data": {
     "max_value_norm": false,
@@ -31,31 +32,40 @@
     "pad_types": "zeros",
     "rezize_size": [64, 256],
 
-    "acoustic_feature": true,
+    "acoustic_feature": false,
     "feature_type": "melspectogram",
+    "delta_feature": false,
 
-    "multimask_augment": true,
+    "multimask_augment": false,
     "tau": 0.10,
     "nu": 0.10,
     "num_masks": 4,
 
     "augment_data": true,
-    "augment_prob": 0.7,
+    "augment_prob": 0.4,
     "augment_rawboost": true,
     "add_noise": false,
 
     "cough_detection": true,
     "mix_audio": false,
-    "many_class": 2,
+    "many_class": 1,
 
     "db_path": "",
-    "metadata_csv": "cough_detection.csv",
+    "metadata_csv": "cough_ssl.csv",
     "target_column": "label",
-    "column_order": ["path_file", "label", "index_start", "index_end"]
+    "column_order": ["path_file", "label", "index_start", "index_end", "source"]
   }, 
   "model": {
-    "pooling_model": "Eff_MyOwn1",
-    "feature_dim": 128,
-    "output_dim": 2
+    "ssl_model_type": "wavlm",
+    "pooling_model": "PEFTWavlm_CoughDetection",
+    "feature_dim": 768,
+    "output_dim": 1,
+
+    "finetune_method": "lora",
+    "adapter_hidden_dim": 128,
+    "embedding_prompt_dim": 5,
+    "lora_rank": 32,
+    "lora_alpha": 64,
+    "target_modules": ["q_proj", "k_proj", "v_proj", "out_proj"]
   }
 }

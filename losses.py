@@ -292,7 +292,7 @@ class CenterLoss(nn.Module):
     """
     Center Loss (Wen et al. 2016)
     """
-    def __init__(self, num_classes=2, feat_dim=256, lambda_c=1.0):
+    def __init__(self, num_classes=2, feat_dim=1024, lambda_c=1.0):
         super().__init__()
         self.num_classes = num_classes
         self.feat_dim = feat_dim

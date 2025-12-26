@@ -95,7 +95,7 @@ class WavLMEncoderLayer(nn.Module):
 class WavLMWrapper(nn.Module):
     def __init__(
         self, 
-        model_config, 
+        model_config
     ):
         super(WavLMWrapper, self).__init__()
         self.config = model_config
@@ -108,7 +108,7 @@ class WavLMWrapper(nn.Module):
         self.backbone_model.freeze_feature_encoder()
         #state_dict = self.backbone_model.state_dict()
         
-        # 2. Read the model config
+        # 2. Read the model config 
         self.model_config = self.backbone_model.config
         self.model_config.finetune_method        = model_config.finetune_method
         self.model_config.adapter_hidden_dim     = model_config.adapter_hidden_dim
@@ -129,7 +129,7 @@ class WavLMWrapper(nn.Module):
         #     for name, p in self.backbone_model.named_parameters():
         #         if name in msg.missing_keys: p.requires_grad = True
         #         else: p.requires_grad = False
-        if self.config.finetune_method == "lora" or self.config.finetune_method == "combined":
+        if (self.config.finetune_method == "lora" or self.config.finetune_method == "combined"):
             lora_config = LoraConfig(
                 task_type=TaskType.FEATURE_EXTRACTION,
                 r=self.config.lora_rank,
@@ -162,6 +162,7 @@ class WavLMWrapper(nn.Module):
         
     def forward(self, x, attention_mask=None, grl_lambda=0.0):
         # 1. feature extraction and projections
+        x = x.squeeze(1)
         with torch.no_grad():
             x = self.backbone_model.feature_extractor(x)
             x = x.transpose(1, 2) # New version of huggingface
@@ -210,7 +211,7 @@ class WavLMWrapper(nn.Module):
         #     features = (features * masks.unsqueeze(-1)).sum(1) / length.unsqueeze(1)
         # else:
         #     features = torch.mean(features, dim=1)
-        out_model = self.model_pooling(features, attention_mask, grl_lambda=grl_lambda)
+        out_model = self.model_pooling(features, attention_mask)
         return out_model
         
     # From huggingface

@@ -4,13 +4,13 @@
     "log_interval": 20,
     "seed": 1234,
     "epochs": 10000,
-    "learning_rate": 1e-3,
+    "learning_rate": 5e-5,
     "betas": [0.8, 0.99],
     "eps": 1e-9,
     "lr_decay": 0.999875,
     "batch_size": 16,
-    "loss_function": "KLDivLoss",
-    "use_Kfold": false,
+    "loss_function": "CE",
+    "use_Kfold": true,
     "mae_training": false,
     "ssccl_training": false
   },
@@ -32,7 +32,7 @@
     "pad_types": "zero",
     "rezize_size": [64, 256],
 
-    "acoustic_feature": false,
+    "acoustic_feature": true,
     "feature_type": "melspectogram",
     "delta_feature": false,
 
@@ -46,7 +46,7 @@
     "augment_rawboost": false,
     "add_noise": false,
 
-    "mix_audio": true,
+    "mix_audio": false,
     "many_class": 2,
 
     "db_path": "",
@@ -55,15 +55,8 @@
     "column_order": ["path_file", "disease_status", "sex", "participant"]
   }, 
   "model": {
-    "pooling_model": "PEFTWavLM_Try1",
-    "feature_dim": 1024,
-    "output_dim": 2,
-
-    "finetune_method": "lora",
-    "adapter_hidden_dim": 128,
-    "embedding_prompt_dim": 5,
-    "lora_rank": 32,
-    "lora_alpha": 64,
-    "target_modules": ["q_proj", "k_proj", "v_proj", "out_proj"]
+    "pooling_model": "BiLSTMSelfAttClassifier",
+    "feature_dim": 64,
+    "output_dim": 2
   }
 }

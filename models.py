@@ -27,6 +27,23 @@ import modules
 import commons
 import layers
 
+from torch.autograd import Function
+
+class GradReverse(Function):
+    @staticmethod
+    def forward(ctx, x, lambda_):
+        ctx.lambda_ = lambda_
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.lambda_ * grad_output, None
+
+
+def grad_reverse(x, lambda_):
+    return GradReverse.apply(x, lambda_)
+
+
 ###########################################
 # OPERAGT_MAE
 ###########################################
@@ -498,15 +515,23 @@ class OPERAGT_MAE(nn.Module):
 
 
 class Opensmile_Attention(nn.Module):
-    def __init__(self, input_size, embed_dim=256, depth=4, heads=4, mlp_ratio=4, output_dim=2, **kwargs):
+    def __init__(self, input_size, embed_dim=256, depth=4, heads=4,
+                 mlp_ratio=4, output_dim=2, lstm_hidden=256, lstm_layers=2, **kwargs):
         super().__init__()
 
-        self.cnn = nn.Sequential(
-            nn.Conv1d(input_size, embed_dim, 5, padding=2),
-            nn.ReLU(),
-            nn.Conv1d(embed_dim, embed_dim, 5, padding=2),
-            nn.ReLU()
+        self.feature_gate = nn.Parameter(torch.ones(input_size))
+
+        # BiLSTM replaces CNN
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            batch_first=True,
+            bidirectional=True
         )
+
+        # Project BiLSTM output (2 * hidden) → transformer embed_dim
+        self.proj = nn.Linear(lstm_hidden * 2, embed_dim)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
@@ -523,14 +548,32 @@ class Opensmile_Attention(nn.Module):
         )
 
     def forward(self, x, attention_mask=None, return_attn=False, **kwargs):
-        h = self.cnn(x)         # [B, E, T]
-        h = h.transpose(1, 2)   # [B, T, E]
+        """
+        Expected x shape: [B, C=input_size, T]
+        Convert to [B, T, C] for LSTM.
+        """
+        x = x * self.feature_gate.view(1, -1, 1)   # [B, C, T]
+        x = x.transpose(1, 2)             # [B, T, C]
+        h, _ = self.lstm(x)               # [B, T, 2*hidden]
+        h = self.proj(h)                  # [B, T, E]
 
         t = self.transformer(h)
         w = torch.softmax(self.pool(t), dim=1)   # [B, T, 1]
         pooled = (w * t).sum(dim=1)              # [B, E]
         logits = self.head(pooled)
-        
+
+        # importance = model.feature_gate.detach().cpu()
+        # norm_imp = importance / importance.sum()
+
+        #attn = transformer_layer.self_attn.attn_output_weights   # [heads, B, T, T]
+        #attn_map = attn.mean(dim=0)   # [B, T, T]
+        #feature_contrib = torch.einsum("btt, bte -> bte", attn_map, hidden_states)
+        #feature_importance = feature_contrib.abs().mean(dim=1)   # [B, E]
+
+        #final_importance = (
+        #     feature_gate_norm * transformer_feature_importance_norm
+        # )
+
         return {
             "disease_logits": logits,
         }
@@ -605,7 +648,7 @@ class WavLMEncoder_MyOwn(nn.Module):
         )
 
 
-    def forward(self, x, attention_mask=None):
+    def forward(self, x, attention_mask=None, **kwargs):
         x = x.squeeze(1)
         extract_features = self.feature_extractor(x)
         extract_features = extract_features.transpose(1, 2)
@@ -748,6 +791,136 @@ class WavLMEncoder_MyOwnSCL(nn.Module):
             "loss": self.calc_cl(z1, z2),
         }
 
+
+class PEFTWavLM_Try1(nn.Module):
+    def __init__(self, input_size, output_dim, lora_rank, lora_alpha, target_modules, spk_dim, **kwargs):
+        super(PEFTWavLM_Try1, self).__init__()
+
+        from transformers import WavLMModel
+        from peft import get_peft_model, LoraConfig, TaskType
+
+        self.backbone_model = WavLMModel.from_pretrained(
+            "microsoft/wavlm-large",
+            output_hidden_states=True
+        )
+        self.backbone_model.freeze_feature_encoder()
+        
+        lora_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=0.1,
+            target_modules=target_modules,
+        )
+        self.backbone_model = get_peft_model(self.backbone_model, lora_config) 
+        
+        self.pooling = layers.AttentiveStatisticsPooling(input_size, attention_dim=128)
+        embed_dim = input_size * 2  # Since ASP outputs 2*input_size
+        # num_clusters = 8
+        # embed_dim = 256
+        # self.pooling = layers.NetVLAD(input_size, num_clusters=num_clusters)
+
+        self.proj = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, 256),
+            nn.GELU()
+        )
+
+        self.adv_head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 4)
+        )
+        self.classifier = nn.Linear(256, output_dim)
+
+    def calc_additional_loss(self, embeddings, labels):
+        # embeddings: [B, D]
+        # contrastive_loss
+        temperature = 0.7
+        if labels.dim() == 2:
+            labels = torch.argmax(labels, dim=1)
+
+        embeddings = F.normalize(embeddings, dim=1)
+        sim = torch.matmul(embeddings, embeddings.T) / temperature
+
+        labels = labels.unsqueeze(1)
+        mask = (labels == labels.T).float()
+
+        logits_mask = torch.ones_like(mask) - torch.eye(mask.size(0), device=mask.device)
+        mask = mask * logits_mask
+
+        exp_sim = torch.exp(sim) * logits_mask
+        log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-9)
+
+        mean_log_prob_pos = (mask * log_prob).sum(dim=1) / (mask.sum(dim=1) + 1e-9)
+        loss = -mean_log_prob_pos.mean()
+        return loss
+
+    def get_feat_extract_output_lengths(self, input_length):
+        """
+        Computes the output length of the convolutional layers
+        """
+        def _conv_out_length(input_length, kernel_size, stride):
+            # 1D convolutional layer output length formula taken
+            # from https://pytorch.org/docs/stable/generated/torch.nn.Conv1d.html
+            return (input_length - kernel_size) // stride + 1
+        for kernel_size, stride in zip(self.backbone_model.config.conv_kernel, self.backbone_model.config.conv_stride):
+            input_length = _conv_out_length(input_length, kernel_size, stride)
+        return input_length
+
+    def forward(self, x, attention_mask=None, **kwargs):
+        x = x.squeeze(1)
+        with torch.no_grad():
+            x = self.backbone_model.feature_extractor(x)
+            x = x.transpose(1, 2) # New version of huggingface
+            x, _ = self.backbone_model.feature_projection(x) # New version of huggingface
+
+        if attention_mask is not None:
+            length = commons.compute_length_from_mask(attention_mask.detach().cpu())
+            length = torch.tensor(length).cuda()
+
+        x = self.backbone_model.encoder(
+            x, output_hidden_states=True
+        )#.hidden_states
+        features = x.last_hidden_state # torch.Size([32, 24, 1024])
+
+        feature_embedding = self.pooling(features, length)
+        feature_embedding = self.proj(feature_embedding)
+        disease_logits = self.classifier(feature_embedding)
+
+        return {
+            "disease_logits": disease_logits,
+            "embedding": feature_embedding,
+        }
+
+
+class PEFTWavlm_CoughDetection(nn.Module):
+    def __init__(self, input_size, output_dim, spk_dim, **kwargs):
+        super(PEFTWavlm_CoughDetection, self).__init__()
+
+        self.pooling = layers.AttentiveStatisticsPooling(input_size, attention_dim=128)
+        embed_dim = input_size * 2  # Since ASP outputs 2*input_size
+        dropout = 0.1
+
+        self.proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.LayerNorm(embed_dim // 2),
+            nn.Dropout(dropout)
+        )
+        self.classifier = nn.Linear(embed_dim // 2, 1)
+
+    def forward(self, x, attention_mask=None, **kwargs):
+        feature_embedding = self.pooling(x)
+        
+        x_proj = self.proj(feature_embedding)
+        logits = self.classifier(x_proj).squeeze(-1)
+
+        return {
+            "disease_logits": logits,
+            "embedding": feature_embedding,
+        }
+
 class DownstreamWavLMEncoder_MyOwnSCL(nn.Module):
     def __init__(self, input_size, num_transformer_layers=12, output_dim=2, freeze_encoder=False, use_proj_output=True, **kwargs):
         super(DownstreamWavLMEncoder_MyOwnSCL, self).__init__()
@@ -795,13 +968,154 @@ class ResNet152Classifier(nn.Module):
         # Backbone provisioning
         from torchvision import models
         self.backbone = models.resnet152(weights=models.ResNet152_Weights.DEFAULT if pretrained else None)
+        self.backbone.conv1 = nn.Conv2d(
+            in_channels=1,
+            out_channels=self.backbone.conv1.out_channels,
+            kernel_size=self.backbone.conv1.kernel_size,
+            stride=self.backbone.conv1.stride,
+            padding=self.backbone.conv1.padding,
+            bias=self.backbone.conv1.bias
+        )
 
         # Replace final FC for downstream task alignment
         in_features = self.backbone.fc.in_features
         self.backbone.fc = nn.Linear(in_features, output_dim)
 
-    def forward(self, x, attention_mask=None):
+    def forward(self, x, attention_mask=None, **kwargs):
+        x = x.unsqueeze(1)
         disease_logits = self.backbone(x)
         return {
                 "disease_logits": disease_logits,
         }
+
+class BiLSTMMelClassifier(nn.Module):
+    def __init__(
+        self,
+        dummy_input,
+        feature_dim: int = 39,
+        hidden_size: int = 256,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        output_dim: int = 2
+        , **kwargs
+    ):
+        super().__init__()
+
+        self.lstm = nn.LSTM(
+            input_size=feature_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=True,
+            batch_first=True,
+        )
+
+        self.project = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, output_dim)
+        )
+
+    def forward(self, x, **kwargs):
+        """
+        x: (B, T, n_mels) mel-spectrogram frames
+        """
+        x = x.permute(0, 2, 1)
+        out, _ = self.lstm(x)           # (B, T, 2H)
+        out = out.mean(dim=1)           # temporal pooling
+        disease_logits = self.project(out)      # (B, num_classes)
+
+        return {
+                "disease_logits": disease_logits,
+        }
+
+class BiLSTMSelfAttClassifier(nn.Module):
+    def __init__(
+        self,
+        dummy,
+        feature_dim=39,
+        hidden_size=256,
+        num_layers=2,
+        dropout=0.1,
+        num_heads=4,
+        output_dim=2,
+        **kwargs
+    ):
+        super().__init__()
+
+        # -------------------------
+        # 1. BiLSTM backbone
+        # -------------------------
+        self.lstm = nn.LSTM(
+            input_size=feature_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=True,
+            batch_first=True,
+        )
+        lstm_dim = hidden_size * 2
+
+        # -------------------------
+        # 2. Self-attention block (stable: projection + LayerNorm)
+        # -------------------------
+        self.attn_norm = nn.LayerNorm(lstm_dim)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=lstm_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.attn_proj = nn.Sequential(
+            nn.Linear(lstm_dim, lstm_dim),
+            nn.Dropout(dropout)
+        )
+
+        # -------------------------
+        # 3. Statistics-attentive pooling
+        #    Outputs: [weighted_mean || weighted_std]
+        # -------------------------
+        self.pool_attn = nn.Sequential(
+            nn.Linear(lstm_dim, lstm_dim // 4),
+            nn.Tanh(),
+            nn.Linear(lstm_dim // 4, 1)
+        )
+        pooled_dim = lstm_dim * 2  # mean + std
+
+        # -------------------------
+        # 4. Classification head
+        # -------------------------
+        self.project = nn.Sequential(
+            nn.Linear(pooled_dim, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, output_dim)
+        )
+
+    def attentive_stats_pooling(self, x):
+        # x: (B, T, C)
+        attn_weights = torch.softmax(self.pool_attn(x), dim=1)  # (B, T, 1)
+        mean = torch.sum(attn_weights * x, dim=1)
+        var = torch.sum(attn_weights * (x - mean.unsqueeze(1)) ** 2, dim=1)
+        std = torch.sqrt(var + 1e-6)
+        return torch.cat([mean, std], dim=-1)
+
+    def forward(self, x, **kwargs):
+        x = x.permute(0, 2, 1)          # (B, T, F)
+
+        # BiLSTM
+        out, _ = self.lstm(x)           # (B, T, 2H)
+
+        # Self-attention block
+        normed = self.attn_norm(out)
+        attn_out, _ = self.self_attn(normed, normed, normed)
+        out = out + self.attn_proj(attn_out)  # residual
+
+        # Statistics-attentive pooling
+        pooled = self.attentive_stats_pooling(out)
+
+        # Classifier
+        logits = self.project(pooled)
+
+        return {"disease_logits": logits}
