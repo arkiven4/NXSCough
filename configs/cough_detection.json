@@ -19,9 +19,9 @@
     "mean_std_norm": true,
 
     "sampling_rate": 16000,
-    "filter_length": 1024,
-    "hop_length": 256,
-    "win_length": 1024,
+    "filter_length": 256,
+    "hop_length": 128,
+    "win_length": 256,
     "n_mel_channels": 128,
     "mel_fmin": 0.0,
     "mel_fmax": 8000.0,

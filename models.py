@@ -23,11 +23,14 @@ from functools import partial
 from timm.models.swin_transformer import SwinTransformerBlock
 from timm.models.vision_transformer import Block
 
+from s3prl.upstream.mockingjay.builder import PretrainedTransformer
+
 import modules
 import commons
 import layers
 
 from torch.autograd import Function
+
 
 class GradReverse(Function):
     @staticmethod
@@ -48,7 +51,6 @@ def grad_reverse(x, lambda_):
 # OPERAGT_MAE
 ###########################################
 
-
 class OPERAGT_MAE(nn.Module):
     def __init__(self, input_size, img_size=(256, 64), patch_size=4, mask_ratio=0.7,
                  contextual_depth=8, stride=10, temperature=.2, embed_dim=384, depth=12,
@@ -67,12 +69,14 @@ class OPERAGT_MAE(nn.Module):
         # --------------------------------------------------------------------------
         # MAE encoder specifics
         if use_custom_patch:
-            print(f'Use custom patch_emb with patch size: {patch_size}, stride: {stride}')
+            print(
+                f'Use custom patch_emb with patch size: {patch_size}, stride: {stride}')
             self.patch_embed = modules.PatchEmbed_new(
                 img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim, stride=stride)
         else:
             print('img_size:', img_size)
-            self.patch_embed = modules.PatchEmbed_org(img_size, patch_size, in_chans, embed_dim)
+            self.patch_embed = modules.PatchEmbed_org(
+                img_size, patch_size, in_chans, embed_dim)
         self.use_custom_patch = use_custom_patch
         num_patches = self.patch_embed.num_patches
         print('Using patch, patch number:', num_patches)
@@ -87,7 +91,8 @@ class OPERAGT_MAE(nn.Module):
         self.encoder_depth = depth
         self.contextual_depth = contextual_depth
         self.blocks = nn.ModuleList([
-            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
+            Block(embed_dim, num_heads, mlp_ratio,
+                  qkv_bias=True, norm_layer=norm_layer)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
@@ -138,11 +143,13 @@ class OPERAGT_MAE(nn.Module):
         else:
             # Transfomer
             self.decoder_blocks = nn.ModuleList([
-                Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
+                Block(decoder_embed_dim, decoder_num_heads,
+                      mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
                 for i in range(decoder_depth)])
 
         self.decoder_norm = norm_layer(decoder_embed_dim)
-        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * in_chans, bias=True)  # decoder to patch
+        self.decoder_pred = nn.Linear(
+            decoder_embed_dim, patch_size**2 * in_chans, bias=True)  # decoder to patch
 
         # --------------------------------------------------------------------------
         self.norm_pix_loss = norm_pix_loss
@@ -166,15 +173,21 @@ class OPERAGT_MAE(nn.Module):
 
         self.initialize_weights()
 
+        ckpt = torch.load(
+            "/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/pretrained/encoder-operaGT.ckpt", map_location="cpu")
+        self.load_state_dict(ckpt['state_dict'], strict=False)
+
     def initialize_weights(self):
         # initialize (and freeze) pos_embed by sin-cos embedding
         pos_embed = modules.get_2d_sincos_pos_embed_flexible(
             self.pos_embed.shape[-1], self.patch_embed.patch_hw, cls_token=True)
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        self.pos_embed.data.copy_(
+            torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         decoder_pos_embed = modules.get_2d_sincos_pos_embed_flexible(
             self.decoder_pos_embed.shape[-1], self.patch_embed.patch_hw, cls_token=True)
-        self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
+        self.decoder_pos_embed.data.copy_(
+            torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
 
         # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
         w = self.patch_embed.proj.weight.data
@@ -254,12 +267,14 @@ class OPERAGT_MAE(nn.Module):
         noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
 
         # sort noise for each sample
-        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
+        # ascend: small is keep, large is remove
+        ids_shuffle = torch.argsort(noise, dim=1)
         ids_restore = torch.argsort(ids_shuffle, dim=1)
 
         # keep the first subset
         ids_keep = ids_shuffle[:, :len_keep]
-        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+        x_masked = torch.gather(
+            x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
 
         # generate the binary mask: 0 is keep, 1 is remove
         mask = torch.ones([N, L], device=x.device)
@@ -293,13 +308,15 @@ class OPERAGT_MAE(nn.Module):
         # noise for mask in time
         noise_t = torch.rand(N, T, device=x.device)  # noise in [0, 1]
         # sort noise for each sample aling time
-        ids_shuffle_t = torch.argsort(noise_t, dim=1)  # ascend: small is keep, large is remove
+        # ascend: small is keep, large is remove
+        ids_shuffle_t = torch.argsort(noise_t, dim=1)
         ids_restore_t = torch.argsort(ids_shuffle_t, dim=1)
         ids_keep_t = ids_shuffle_t[:, :len_keep_t]
         # print('t:', ids_keep_t)
         # noise mask in freq
         noise_f = torch.rand(N, F, device=x.device)  # noise in [0, 1]
-        ids_shuffle_f = torch.argsort(noise_f, dim=1)  # ascend: small is keep, large is remove
+        # ascend: small is keep, large is remove
+        ids_shuffle_f = torch.argsort(noise_f, dim=1)
         ids_restore_f = torch.argsort(ids_shuffle_f, dim=1)
         ids_keep_f = ids_shuffle_f[:, :len_keep_f]
         # print('f:', ids_keep_f)
@@ -308,11 +325,13 @@ class OPERAGT_MAE(nn.Module):
         # mask in freq
         mask_f = torch.ones(N, F, device=x.device)
         mask_f[:, :len_keep_f] = 0
-        mask_f = torch.gather(mask_f, dim=1, index=ids_restore_f).unsqueeze(1).repeat(1, T, 1)  # N,T,F
+        mask_f = torch.gather(mask_f, dim=1, index=ids_restore_f).unsqueeze(
+            1).repeat(1, T, 1)  # N,T,F
         # mask in time
         mask_t = torch.ones(N, T, device=x.device)
         mask_t[:, :len_keep_t] = 0
-        mask_t = torch.gather(mask_t, dim=1, index=ids_restore_t).unsqueeze(1).repeat(1, F, 1).permute(0, 2, 1)  # N,T,F
+        mask_t = torch.gather(mask_t, dim=1, index=ids_restore_t).unsqueeze(
+            1).repeat(1, F, 1).permute(0, 2, 1)  # N,T,F
         mask = 1-(1-mask_t)*(1-mask_f)  # N, T, F
 
         # get masked x
@@ -326,7 +345,8 @@ class OPERAGT_MAE(nn.Module):
         assert ids_keep.min() >= 0, "Negative index found"
 
         # print(x.shape)
-        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+        x_masked = torch.gather(
+            x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
         # print('problem', x_masked)
         ids_restore = torch.argsort(id2res2.flatten(start_dim=1))
         mask = mask.flatten(start_dim=1)
@@ -348,24 +368,22 @@ class OPERAGT_MAE(nn.Module):
 
         # masking: length -> length * mask_ratio
         if mask_2d:
-            x, mask, ids_restore = self.random_masking_2d(x, mask_t_prob=self.mask_t_prob, mask_f_prob=self.mask_f_prob)
+            x, mask, ids_restore = self.random_masking_2d(
+                x, mask_t_prob=self.mask_t_prob, mask_f_prob=self.mask_f_prob)
             # print(x.shape)
         else:
             x, mask, ids_restore = self.random_masking(x, mask_ratio)
             # print(x.shape)
-        # print('x_mask:', x.shape)
-        # append cls token
-        # print('here')
-        # print(self.pos_embed)
-        # print(self.cls_token)
-        assert torch.isfinite(self.cls_token).all(), " prior cls_tokens contains NaNs or Infs"
+        assert torch.isfinite(self.cls_token).all(
+        ), " prior cls_tokens contains NaNs or Infs"
 
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         # print(cls_tokens.shape)
 
         # Check for NaNs or Infs
-        assert torch.isfinite(cls_tokens).all(), "cls_tokens contains NaNs or Infs"
+        assert torch.isfinite(cls_tokens).all(
+        ), "cls_tokens contains NaNs or Infs"
         assert torch.isfinite(x).all(), "x contains NaNs or Infs"
 
         torch.cuda.synchronize()
@@ -434,9 +452,12 @@ class OPERAGT_MAE(nn.Module):
         # print('decoder x:', x.shape)
 
         # append mask tokens to sequence
-        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
+        mask_tokens = self.mask_token.repeat(
+            x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
         x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
-        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
+        x_ = torch.gather(
+            # unshuffle
+            x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))
         x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
 
         # print('append mask x:', x.shape)
@@ -499,13 +520,16 @@ class OPERAGT_MAE(nn.Module):
         # print('return:', loss)
         return loss, self.unpatchify(target), self.unpatchify(pred)
 
-    def forward(self, imgs, attention_mask=None):
+    def forward(self, imgs, attention_mask=None, **kwargs):
         # torch.optim.Adam(self.parameters(), lr=1e-4)
         imgs = imgs.permute(0, 2, 1)  # .unsqueeze(1)
         # print(self.patch_embed.proj.weight.data)
-        emb_enc, mask, ids_restore, _ = self.forward_encoder(imgs, self.mask_ratio, mask_2d=self.mask_2d)
-        pred, _, _ = self.forward_decoder(emb_enc, ids_restore)  # [N, L, p*p*3]
-        loss_recon, target, pred = self.forward_loss(imgs, pred, mask, norm_pix_loss=self.norm_pix_loss)
+        emb_enc, mask, ids_restore, _ = self.forward_encoder(
+            imgs, self.mask_ratio, mask_2d=self.mask_2d)
+        pred, _, _ = self.forward_decoder(
+            emb_enc, ids_restore)  # [N, L, p*p*3]
+        loss_recon, target, pred = self.forward_loss(
+            imgs, pred, mask, norm_pix_loss=self.norm_pix_loss)
 
         return {
             "loss": loss_recon,
@@ -539,7 +563,8 @@ class Opensmile_Attention(nn.Module):
             dim_feedforward=embed_dim * mlp_ratio,
             batch_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=depth)
 
         self.pool = nn.Linear(embed_dim, 1)
         self.head = nn.Sequential(
@@ -565,12 +590,12 @@ class Opensmile_Attention(nn.Module):
         # importance = model.feature_gate.detach().cpu()
         # norm_imp = importance / importance.sum()
 
-        #attn = transformer_layer.self_attn.attn_output_weights   # [heads, B, T, T]
-        #attn_map = attn.mean(dim=0)   # [B, T, T]
-        #feature_contrib = torch.einsum("btt, bte -> bte", attn_map, hidden_states)
-        #feature_importance = feature_contrib.abs().mean(dim=1)   # [B, E]
+        # attn = transformer_layer.self_attn.attn_output_weights   # [heads, B, T, T]
+        # attn_map = attn.mean(dim=0)   # [B, T, T]
+        # feature_contrib = torch.einsum("btt, bte -> bte", attn_map, hidden_states)
+        # feature_importance = feature_contrib.abs().mean(dim=1)   # [B, E]
 
-        #final_importance = (
+        # final_importance = (
         #     feature_gate_norm * transformer_feature_importance_norm
         # )
 
@@ -585,7 +610,8 @@ class Eff_MyOwn1(nn.Module):
 
         self.cnn1 = torch.nn.Conv2d(1, 3, kernel_size=3)
         self.efficientnet = EfficientNet.from_name(
-            "efficientnet-b0", include_top=False, drop_connect_rate=0.1)  # [128, 1280, 1, 1]
+            # [128, 1280, 1, 1]
+            "efficientnet-b0", include_top=False, drop_connect_rate=0.1)
 
         self.dense = nn.Linear(1280, 512)
         self.dropout = nn.Dropout(0.1)
@@ -636,7 +662,8 @@ class WavLMEncoder_MyOwn(nn.Module):
             ) for _ in range(num_transformer_layers)
         ])
         self.final_layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
-        self.layer_weights = nn.Parameter(torch.ones(num_transformer_layers + 1))
+        self.layer_weights = nn.Parameter(
+            torch.ones(num_transformer_layers + 1))
         self.pooling = nn.AdaptiveAvgPool1d(1)
 
         # Classifiers
@@ -647,12 +674,12 @@ class WavLMEncoder_MyOwn(nn.Module):
             nn.Linear(embed_dim // 4, output_dim)
         )
 
-
     def forward(self, x, attention_mask=None, **kwargs):
         x = x.squeeze(1)
         extract_features = self.feature_extractor(x)
         extract_features = extract_features.transpose(1, 2)
-        hidden_states, extract_features = self.feature_projection(extract_features) # B, T, D
+        hidden_states, extract_features = self.feature_projection(
+            extract_features)  # B, T, D
 
         pos_conv_output = self.pos_conv_embed(hidden_states.transpose(1, 2))
         pos_conv_output = pos_conv_output.transpose(1, 2)
@@ -668,16 +695,19 @@ class WavLMEncoder_MyOwn(nn.Module):
         for layer in self.attention_layers:
             hidden_states = layer(hidden_states)
             layer_outputs.append(hidden_states)
-        
+
         hidden_states = self.final_layer_norm(hidden_states)
         layer_outputs[-1] = hidden_states
         layer_weights_normalized = torch.softmax(self.layer_weights, dim=0)
         weighted_hidden_states = torch.zeros_like(hidden_states)
         for i, layer_output in enumerate(layer_outputs):
-            weighted_hidden_states += layer_weights_normalized[i] * layer_output
-        
-        hidden_states = weighted_hidden_states.transpose(1, 2)  # [B, embed_dim, T]
-        feature_embedding = self.pooling(hidden_states).squeeze(-1)  # [B, embed_dim]
+            weighted_hidden_states += layer_weights_normalized[i] * \
+                layer_output
+
+        hidden_states = weighted_hidden_states.transpose(
+            1, 2)  # [B, embed_dim, T]
+        feature_embedding = self.pooling(
+            hidden_states).squeeze(-1)  # [B, embed_dim]
 
         disease_logits = self.disease_clf(feature_embedding)
 
@@ -718,15 +748,16 @@ class WavLMEncoder_MyOwnSCL(nn.Module):
             ) for _ in range(num_transformer_layers)
         ])
         self.final_layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
-        self.layer_weights = nn.Parameter(torch.ones(num_transformer_layers + 1))
+        self.layer_weights = nn.Parameter(
+            torch.ones(num_transformer_layers + 1))
 
-        #self.pooling = nn.AdaptiveAvgPool1d(1)
+        # self.pooling = nn.AdaptiveAvgPool1d(1)
         self.pooling = layers.AttentiveStatisticsPooling(embed_dim)
         embed_dim = embed_dim * 2
-        
+
         self.projector = layers.CustomWalvmProjector(
-            dim_in=embed_dim, 
-            dim_hidden=4096, 
+            dim_in=embed_dim,
+            dim_hidden=4096,
             dim_out=256
         )
 
@@ -747,12 +778,12 @@ class WavLMEncoder_MyOwnSCL(nn.Module):
 
         return (loss_12 + loss_21) * 0.5
 
-
     def forward_encoder(self, x, attention_mask=None):
         x = x.squeeze(1)
         extract_features = self.feature_extractor(x)
         extract_features = extract_features.transpose(1, 2)
-        hidden_states, extract_features = self.feature_projection(extract_features) # B, T, D
+        hidden_states, extract_features = self.feature_projection(
+            extract_features)  # B, T, D
 
         pos_conv_output = self.pos_conv_embed(hidden_states.transpose(1, 2))
         pos_conv_output = pos_conv_output.transpose(1, 2)
@@ -767,22 +798,25 @@ class WavLMEncoder_MyOwnSCL(nn.Module):
         for layer in self.attention_layers:
             hidden_states = layer(hidden_states)
             layer_outputs.append(hidden_states)
-        
+
         hidden_states = self.final_layer_norm(hidden_states)
         layer_outputs[-1] = hidden_states
 
         layer_weights_normalized = torch.softmax(self.layer_weights, dim=0)
         weighted_hidden_states = torch.zeros_like(hidden_states)
         for i, layer_output in enumerate(layer_outputs):
-            weighted_hidden_states += layer_weights_normalized[i] * layer_output
-        
-        #hidden_states = weighted_hidden_states.transpose(1, 2)  # [B, embed_dim, T]
-        hidden_states = weighted_hidden_states#.transpose(1, 2)  # [B, embed_dim, T]
+            weighted_hidden_states += layer_weights_normalized[i] * \
+                layer_output
 
-        feature_embedding = self.pooling(hidden_states).squeeze(-1)  # [B, embed_dim]
+        # hidden_states = weighted_hidden_states.transpose(1, 2)  # [B, embed_dim, T]
+        # .transpose(1, 2)  # [B, embed_dim, T]
+        hidden_states = weighted_hidden_states
+
+        feature_embedding = self.pooling(
+            hidden_states).squeeze(-1)  # [B, embed_dim]
         z = self.projector(feature_embedding)
         return feature_embedding, z
-    
+
     def forward(self, x, x2=None, attention_mask=None):
         _, z1 = self.forward_encoder(x)
         _, z2 = self.forward_encoder(x2)
@@ -804,7 +838,7 @@ class PEFTWavLM_Try1(nn.Module):
             output_hidden_states=True
         )
         self.backbone_model.freeze_feature_encoder()
-        
+
         lora_config = LoraConfig(
             task_type=TaskType.FEATURE_EXTRACTION,
             r=lora_rank,
@@ -812,50 +846,48 @@ class PEFTWavLM_Try1(nn.Module):
             lora_dropout=0.1,
             target_modules=target_modules,
         )
-        self.backbone_model = get_peft_model(self.backbone_model, lora_config) 
-        
-        self.pooling = layers.AttentiveStatisticsPooling(input_size, attention_dim=128)
-        embed_dim = input_size * 2  # Since ASP outputs 2*input_size
-        # num_clusters = 8
-        # embed_dim = 256
-        # self.pooling = layers.NetVLAD(input_size, num_clusters=num_clusters)
+        self.backbone_model = get_peft_model(self.backbone_model, lora_config)
 
-        self.proj = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, 256),
-            nn.GELU()
+        # self.pooling = layers.AttentiveStatisticsPooling(input_size, attention_dim=128)
+        # embed_dim = input_size * 2  # Since ASP outputs 2*input_size
+        # num_clusters = 4
+        # embed_dim = input_size * num_clusters
+        # self.pooling = layers.NetVLAD(num_clusters=num_clusters, dim=input_size, alpha=1.0)
+
+        # self.proj = nn.Sequential(
+        #     nn.LayerNorm(embed_dim),
+        #     nn.Linear(embed_dim, 1024),
+        #     nn.GELU()
+        # )
+        # self.classifier = nn.Linear(1024, output_dim)
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(input_size),
+            nn.Linear(input_size, 1)
         )
 
-        self.adv_head = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 4)
-        )
-        self.classifier = nn.Linear(256, output_dim)
-
-    def calc_additional_loss(self, embeddings, labels):
+    def disabled_calc_additional_loss(self, embeddings, labels):
         # embeddings: [B, D]
-        # contrastive_loss
-        temperature = 0.7
+        # lables: [B]
         if labels.dim() == 2:
             labels = torch.argmax(labels, dim=1)
 
-        embeddings = F.normalize(embeddings, dim=1)
-        sim = torch.matmul(embeddings, embeddings.T) / temperature
+        # -------------- contrastive_loss -------------------
+        # temperature = 0.7
+        # embeddings = F.normalize(embeddings, dim=1)
+        # sim = torch.matmul(embeddings, embeddings.T) / temperature
 
-        labels = labels.unsqueeze(1)
-        mask = (labels == labels.T).float()
+        # labels = labels.unsqueeze(1)
+        # mask = (labels == labels.T).float()
 
-        logits_mask = torch.ones_like(mask) - torch.eye(mask.size(0), device=mask.device)
-        mask = mask * logits_mask
+        # logits_mask = torch.ones_like(mask) - torch.eye(mask.size(0), device=mask.device)
+        # mask = mask * logits_mask
 
-        exp_sim = torch.exp(sim) * logits_mask
-        log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-9)
+        # exp_sim = torch.exp(sim) * logits_mask
+        # log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-9)
 
-        mean_log_prob_pos = (mask * log_prob).sum(dim=1) / (mask.sum(dim=1) + 1e-9)
-        loss = -mean_log_prob_pos.mean()
-        return loss
+        # mean_log_prob_pos = (mask * log_prob).sum(dim=1) / (mask.sum(dim=1) + 1e-9)
+        # loss = -mean_log_prob_pos.mean()
+        # return loss
 
     def get_feat_extract_output_lengths(self, input_length):
         """
@@ -873,20 +905,24 @@ class PEFTWavLM_Try1(nn.Module):
         x = x.squeeze(1)
         with torch.no_grad():
             x = self.backbone_model.feature_extractor(x)
-            x = x.transpose(1, 2) # New version of huggingface
-            x, _ = self.backbone_model.feature_projection(x) # New version of huggingface
+            x = x.transpose(1, 2)  # New version of huggingface
+            x, _ = self.backbone_model.feature_projection(
+                x)  # New version of huggingface
 
         if attention_mask is not None:
-            length = commons.compute_length_from_mask(attention_mask.detach().cpu())
+            length = commons.compute_length_from_mask(
+                attention_mask.detach().cpu())
             length = torch.tensor(length).cuda()
 
         x = self.backbone_model.encoder(
             x, output_hidden_states=True
-        )#.hidden_states
-        features = x.last_hidden_state # torch.Size([32, 24, 1024])
+        )  # .hidden_states
+        features = x.last_hidden_state  # torch.Size([32, 24, 1024])
 
-        feature_embedding = self.pooling(features, length)
-        feature_embedding = self.proj(feature_embedding)
+        # feature_embedding = self.pooling(features, length)
+        # feature_embedding = self.pooling(features.permute(0, 2, 1).unsqueeze(-1))
+        # feature_embedding = self.proj(feature_embedding)
+        feature_embedding = features.mean(dim=1)
         disease_logits = self.classifier(feature_embedding)
 
         return {
@@ -895,11 +931,148 @@ class PEFTWavLM_Try1(nn.Module):
         }
 
 
+class PEFTWavLM_SCCL(nn.Module):
+    def __init__(self, input_size, output_dim, lora_rank, lora_alpha, target_modules, spk_dim, lora_finetune, **kwargs):
+        super(PEFTWavLM_SCCL, self).__init__()
+
+        from transformers import WavLMModel
+        from peft import get_peft_model, LoraConfig, TaskType
+
+        self.backbone_model = WavLMModel.from_pretrained(
+            "microsoft/wavlm-large",
+            output_hidden_states=True
+        )
+        self.backbone_model.freeze_feature_encoder()
+
+        self.pooling = layers.AttentiveStatisticsPooling(
+            input_size, attention_dim=128)
+        embed_dim = input_size * 2  # Since ASP outputs 2*input_size
+
+        temp_ckpt = torch.load("logs/peftwavlm_ssccl_patient/best_model.ckpt")
+        raw_sd = temp_ckpt["state_dict"]
+        patched_sd = {}
+        for k, v in raw_sd.items():
+            patched_key = k[len("model."):] if k.startswith("model.") else k
+            patched_sd[patched_key] = v
+        # True for Test and First
+        self.load_state_dict(patched_sd, strict=False)
+
+        if lora_finetune:
+            lora_config = LoraConfig(
+                task_type=TaskType.FEATURE_EXTRACTION,
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=0.1,
+                target_modules=target_modules,
+            )
+            self.backbone_model = get_peft_model(
+                self.backbone_model, lora_config)
+
+        # self.projector = nn.Sequential(
+        #     nn.Linear(embed_dim, embed_dim),
+        #     nn.ReLU(),
+        #     nn.Linear(embed_dim, embed_dim),
+        # )
+        self.proj = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, 128),
+            nn.GELU()
+        )
+        self.classifier = nn.Linear(128, output_dim)
+
+    def disabled_calc_additional_loss(self, outputs, batch):
+        # ---------------------- Phase 1 --------------------------
+        # """
+        # z1, z2: (B, D)
+        # patient_ids: list[str] or tensor (B,)
+        # """
+        # _, _, _, _, dse_ids, [patient_ids, _] = batch
+        # z1 = outputs['z1']
+        # z2 = outputs['z2']
+
+        # temperature=0.07
+        # device = z1.device
+        # B = z1.size(0)
+
+        # z = torch.cat([z1, z2], dim=0)        # (2B, D)
+        # z = F.normalize(z, dim=1)
+
+        # patient_ids = torch.tensor(
+        #     [hash(p) for p in patient_ids],
+        #     device=device
+        # )
+        # patient_ids = patient_ids.repeat(2)   # (2B,)
+
+        # sim = torch.matmul(z, z.T) / temperature
+
+        # mask = torch.eye(2 * B, device=device).bool()
+        # sim.masked_fill_(mask, -1e9)
+
+        # pos_mask = patient_ids.unsqueeze(0) == patient_ids.unsqueeze(1)
+        # pos_mask = pos_mask & (~mask)
+
+        # exp_sim = torch.exp(sim)
+        # log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True))
+
+        # mean_log_prob_pos = (pos_mask * log_prob).sum(dim=1) / pos_mask.sum(dim=1).clamp(min=1)
+        # loss = -mean_log_prob_pos.mean()
+        # return loss
+        return 0
+
+    def get_feat_extract_output_lengths(self, input_length):
+        """
+        Computes the output length of the convolutional layers
+        """
+        def _conv_out_length(input_length, kernel_size, stride):
+            # 1D convolutional layer output length formula taken
+            # from https://pytorch.org/docs/stable/generated/torch.nn.Conv1d.html
+            return (input_length - kernel_size) // stride + 1
+        for kernel_size, stride in zip(self.backbone_model.config.conv_kernel, self.backbone_model.config.conv_stride):
+            input_length = _conv_out_length(input_length, kernel_size, stride)
+        return input_length
+
+    def _forward_encoder(self, x, attention_mask=None, **kwargs):
+        x = x.squeeze(1)
+        with torch.no_grad():
+            x = self.backbone_model.feature_extractor(x)
+            x = x.transpose(1, 2)  # New version of huggingface
+            x, _ = self.backbone_model.feature_projection(
+                x)  # New version of huggingface
+
+        length = None
+        if attention_mask is not None:
+            length = commons.compute_length_from_mask(
+                attention_mask.detach().cpu())
+            length = torch.tensor(length).cuda()
+
+        x = self.backbone_model.encoder(
+            x, output_hidden_states=True
+        )
+        features = x.last_hidden_state  # torch.Size([32, 24, 1024])
+
+        feature_embedding = self.pooling(features, length)
+        # feature_embedding = self.projector(feature_embedding)
+        return feature_embedding
+
+    def forward(self, x, x2, attention_mask=None, **kwargs):
+        z1 = self._forward_encoder(x, attention_mask=None)
+        # z2 = self._forward_encoder(x2, attention_mask=None)
+        feature_embedding = self.proj(z1)
+        disease_logits = self.classifier(feature_embedding)
+
+        return {
+            "disease_logits": disease_logits,
+            # "z1": z1,
+            # "z2": z2
+        }
+
+
 class PEFTWavlm_CoughDetection(nn.Module):
     def __init__(self, input_size, output_dim, spk_dim, **kwargs):
         super(PEFTWavlm_CoughDetection, self).__init__()
 
-        self.pooling = layers.AttentiveStatisticsPooling(input_size, attention_dim=128)
+        self.pooling = layers.AttentiveStatisticsPooling(
+            input_size, attention_dim=128)
         embed_dim = input_size * 2  # Since ASP outputs 2*input_size
         dropout = 0.1
 
@@ -912,7 +1085,7 @@ class PEFTWavlm_CoughDetection(nn.Module):
 
     def forward(self, x, attention_mask=None, **kwargs):
         feature_embedding = self.pooling(x)
-        
+
         x_proj = self.proj(feature_embedding)
         logits = self.classifier(x_proj).squeeze(-1)
 
@@ -921,13 +1094,17 @@ class PEFTWavlm_CoughDetection(nn.Module):
             "embedding": feature_embedding,
         }
 
+
 class DownstreamWavLMEncoder_MyOwnSCL(nn.Module):
-    def __init__(self, input_size, num_transformer_layers=12, output_dim=2, freeze_encoder=False, use_proj_output=True, **kwargs):
+    def __init__(
+            self, input_size, num_transformer_layers=12, output_dim=2, freeze_encoder=False, use_proj_output=True, **
+            kwargs):
         super(DownstreamWavLMEncoder_MyOwnSCL, self).__init__()
 
         self.use_proj_output = use_proj_output
         self.sscl_model = WavLMEncoder_MyOwnSCL(1000, 12, 2)
-        temp_ckpt = torch.load("/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/logs/wavlmencoder_scl_attentive/fold_0/pool_fold0_epoch=03.ckpt")
+        temp_ckpt = torch.load(
+            "/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/logs/wavlmencoder_scl_attentive/fold_0/pool_fold0_epoch=03.ckpt")
         raw_sd = temp_ckpt["state_dict"]
         patched_sd = {}
         for k, v in raw_sd.items():
@@ -947,7 +1124,7 @@ class DownstreamWavLMEncoder_MyOwnSCL(nn.Module):
             nn.Dropout(0.4),
             nn.Linear(in_dim // 2, output_dim)
         )
-    
+
     def forward(self, x, x2=None, attention_mask=None):
         out = self.sscl_model.forward_encoder(x)
         if self.use_proj_output:
@@ -961,13 +1138,220 @@ class DownstreamWavLMEncoder_MyOwnSCL(nn.Module):
             "disease_logits": disease_logits,
         }
 
+
+class PEFTQwen3_Try1(nn.Module):
+    def __init__(self, input_size, output_dim, lora_rank, lora_alpha, target_modules, spk_dim, **kwargs):
+        super(PEFTQwen3_Try1, self).__init__()
+
+        from peft import get_peft_model, LoraConfig, TaskType
+        from transformers import Qwen3OmniMoeThinkerForConditionalGeneration
+
+        # "target_modules": [ "q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2", "conv_out", "proj1", "proj2" ]
+        temp_model = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
+            "/run/media/fourier/Data1/Pras/pretrain_models/Qwen3-Omni-30B-A3B-Thinking",
+            torch_dtype="auto",
+            device_map="cpu"
+        )
+        self.audio_tower = temp_model.audio_tower
+        self.audio_tower.cuda()
+        del temp_model
+        import gc
+        import torch
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        self.audiotower_hidden_dim = self.audio_tower.config.output_dim
+        lora_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=0.1,
+            target_modules=target_modules,
+        )
+        self.audio_tower = get_peft_model(self.audio_tower, lora_config)
+
+        base_model = self.audio_tower.base_model.model
+        orig_forward = base_model.forward
+
+        TEXT_ONLY_KEYS = {
+            "inputs_embeds",
+            "labels",
+            "attention_mask",
+            "output_attentions",
+            "output_hidden_states",
+            "return_dict",
+            "decoder_input_ids",
+            "decoder_attention_mask",
+        }
+
+        def patched_forward(*args, **kwargs):
+            if "input_ids" in kwargs and "input_features" not in kwargs:
+                kwargs["input_features"] = kwargs.pop("input_ids")
+            else:
+                kwargs.pop("input_ids", None)
+
+            for k in TEXT_ONLY_KEYS:
+                kwargs.pop(k, None)
+            return orig_forward(*args, **kwargs)
+        base_model.forward = patched_forward
+
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(self.audiotower_hidden_dim),
+            nn.Linear(self.audiotower_hidden_dim, 1)
+        )
+
+    def after_cnn_len(self, L):
+        L = (L - 1) // 2 + 1
+        L = (L - 1) // 2 + 1
+        L = (L - 1) // 2 + 1
+        return L
+
+    def forward(self, input_features, attention_mask=None, **kwargs):
+        input_features = input_features.to(torch.bfloat16)
+        feature_attention_mask = attention_mask.long()
+        if feature_attention_mask is not None:
+            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+            input_features = input_features.permute(
+                0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
+        else:
+            audio_feature_lengths = None
+
+        feature_lens = audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(
+            -1)
+        audio_outputs = self.audio_tower(
+            input_features,
+            feature_lens=feature_lens,
+        )
+        audio_features = audio_outputs.last_hidden_state
+        post_lens = torch.tensor(
+            [self.after_cnn_len(l.item()) for l in feature_lens],
+            device=feature_lens.device
+        )
+
+        total = audio_features.size(0)
+        delta = total - post_lens.sum()
+        if delta != 0:
+            post_lens[-1] += delta
+
+        audio_features = audio_features.split(post_lens.tolist(), dim=0)
+        # audio_features = pad_sequence(audio_features, batch_first=True) # for Attentive Pooling
+        audio_features = torch.stack([x.mean(dim=0)
+                                     for x in audio_features], dim=0)
+        audio_features = audio_features.to(torch.float32)
+
+        disease_logits = self.classifier(audio_features)
+
+        return {
+            "disease_logits": disease_logits,
+        }
+
+
+class TERA_TryDownstream(nn.Module):
+    def __init__(self, input_size, output_dim, spk_dim, **kwargs):
+        super(TERA_TryDownstream, self).__init__()
+
+        options = {
+            "load_pretrain": "True",
+            "no_grad": "True",
+            "dropout": "default",
+            "spec_aug": "False",
+            "spec_aug_prev": "False",
+            "output_hidden_states": "True",
+            "permute_input": "False",
+        }
+        options["ckpt_file"] = "pretrained/tera_pretrained.pth"
+        options["select_layer"] = -1
+
+        pretrained_dict = torch.load(
+            "pretrained/tera_pretrained.pth", weights_only=False)
+        transformer_state = pretrained_dict['Transformer']
+
+        self.tera_model = PretrainedTransformer(options, inp_dim=-1)
+        self.tera_model.model.load_state_dict(transformer_state, strict=True)
+        for param in self.tera_model.parameters():
+            param.requires_grad = False
+        self.tera_model.eval()
+
+        self.pooling = layers.AttentiveStatisticsPooling(
+            self.tera_model.model_config.hidden_size, attention_dim=128)
+        embed_dim = self.tera_model.model_config.hidden_size * 2
+
+        self.projector = nn.Sequential(
+            nn.Linear(embed_dim, 256),
+            nn.LayerNorm(256),
+            nn.GELU()
+        )
+
+        self.tb_head = nn.Linear(256, 1)
+
+    def calc_additional_loss(self, outputs, batch):
+        """
+        z1, z2: (B, D)
+        patient_ids: list[str] or tensor (B,)
+        """
+        beta = 0.0
+        _, _, _, _, dse_ids, [_, _] = batch
+        if len(dse_ids.shape) == 2:
+            dse_ids = torch.argmax(dse_ids, dim=1)
+
+        labels = dse_ids
+        logits = outputs['disease_logits']
+
+        pi = 0.3  # 0.5 * (labels.mean().item())
+
+        def loss_fn(x):
+            return F.binary_cross_entropy_with_logits(
+                x, torch.ones_like(x), reduction="none"
+            )
+
+        def loss_fn_neg(x):
+            return F.binary_cross_entropy_with_logits(
+                x, torch.zeros_like(x), reduction="none"
+            )
+
+        pos = logits[labels == 1]   # unlabeled
+        neg = logits[labels == 0]   # clean negatives
+
+        if len(neg) == 0:
+            return torch.tensor(0.0, device=logits.device)
+
+        # Risk estimators
+        risk_neg = loss_fn_neg(neg).mean()
+        risk_pos = loss_fn(pos).mean() if len(pos) > 0 else 0.0
+        risk_unl = loss_fn_neg(pos).mean() if len(pos) > 0 else 0.0
+
+        # PU risk
+        risk = pi * risk_pos + risk_unl - pi * risk_neg
+
+        # Non-negative correction
+        return torch.clamp(risk, min=beta)
+
+    def forward(self, x, attention_mask=None, **kwargs):
+        x = x.squeeze(1)
+        # with torch.no_grad():
+        # Index 0 = Last Hidden, Index 1 All Transformwer
+        x = self.tera_model(x)[0]
+        x = torch.nan_to_num(x, nan=0.0)
+
+        feature_embedding = self.pooling(x)
+        feature_embedding = self.projector(feature_embedding)
+
+        disease_logits = self.tb_head(feature_embedding).squeeze(-1)
+        return {
+            "disease_logits": disease_logits,
+            "embedding": feature_embedding,
+        }
+
+
 class ResNet152Classifier(nn.Module):
     def __init__(self, dummy_input, output_dim=2, pretrained=True, **kwargs):
         super().__init__()
 
         # Backbone provisioning
         from torchvision import models
-        self.backbone = models.resnet152(weights=models.ResNet152_Weights.DEFAULT if pretrained else None)
+        self.backbone = models.resnet152(
+            weights=models.ResNet152_Weights.DEFAULT if pretrained else None)
         self.backbone.conv1 = nn.Conv2d(
             in_channels=1,
             out_channels=self.backbone.conv1.out_channels,
@@ -985,8 +1369,246 @@ class ResNet152Classifier(nn.Module):
         x = x.unsqueeze(1)
         disease_logits = self.backbone(x)
         return {
-                "disease_logits": disease_logits,
+            "disease_logits": disease_logits,
         }
+
+# ResNet(BasicBlock, [3, 4, 6, 3],
+#                   feat_dim=feat_dim,
+#                   embed_dim=embed_dim,
+#                   pooling_func=pooling_func,
+#                   two_emb_layer=two_emb_layer)
+
+
+class ResNet34ManualClassifier(nn.Module):
+    def __init__(
+        self,
+        dummy_input,
+        feature_dim: int = 39,
+        hidden_size: int = 256,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        use_tabular: bool = False,
+        output_dim: int = 2, **kwargs
+    ):
+        super().__init__()
+
+        block = getattr(modules, "BasicBlock")
+        num_blocks = [3, 4, 6, 3]
+        m_channels = 32
+
+        self.in_planes = m_channels
+        self.feature_dim = feature_dim
+        # Compute frequency downsampling after 3 stride-2 stages precisely:
+        # H_next = floor((H - 1) / 2) + 1 for k=3, p=1, s=2
+        def _downsample_freq(h: int, stages: int = 3) -> int:
+            for _ in range(stages):
+                h = (h - 1) // 2 + 1
+            return h
+        self.stats_dim = _downsample_freq(feature_dim) * m_channels * 8
+
+        self.conv1 = nn.Conv2d(1,
+                               m_channels,
+                               kernel_size=3,
+                               stride=1,
+                               padding=1,
+                               bias=False)
+        self.bn1 = nn.BatchNorm2d(m_channels)
+        self.layer1 = self._make_layer(block,
+                                       m_channels,
+                                       num_blocks[0],
+                                       stride=1)
+        self.layer2 = self._make_layer(block,
+                                       m_channels * 2,
+                                       num_blocks[1],
+                                       stride=2)
+        self.layer3 = self._make_layer(block,
+                                       m_channels * 4,
+                                       num_blocks[2],
+                                       stride=2)
+        self.layer4 = self._make_layer(block,
+                                       m_channels * 8,
+                                       num_blocks[3],
+                                       stride=2)
+
+        self.pool = modules.TSTP(in_dim=self.stats_dim * block.expansion)
+        self.pool_out_dim = self.pool.get_out_dim()
+
+        self.classifier = nn.Sequential(
+            nn.Linear(self.pool_out_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, output_dim)
+        )
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x, tabular_ids=None, **kwargs):
+        """
+        x: (B, n_mels, T) mel-spectrogram frames
+        """
+        x = x.unsqueeze_(1)
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+
+        stats = self.pool(out)
+        disease_logits = self.classifier(stats)
+
+        return {
+            "disease_logits": disease_logits,
+        }
+
+class TemporalAttention1D(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.query_conv = nn.Conv1d(channels, channels // 8, kernel_size=1)
+        self.key_conv   = nn.Conv1d(channels, channels // 8, kernel_size=1)
+        self.value_conv = nn.Conv1d(channels, channels, kernel_size=1)
+
+        self.gamma = nn.Parameter(torch.zeros(1))
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        """
+        x: (B, C, T)
+        """
+        B, C, T = x.size()
+
+        query = self.query_conv(x).permute(0, 2, 1)   # B, T, C'
+        key   = self.key_conv(x)                      # B, C', T
+        energy = torch.bmm(query, key)                # B, T, T
+        attention = self.softmax(energy)
+
+        value = self.value_conv(x)                    # B, C, T
+        out = torch.bmm(value, attention.permute(0, 2, 1))
+        out = out.view(B, C, T)
+
+        return self.gamma * out + x
+    
+class ChannelAttention1D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(1))
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        """
+        x: (B, C, T)
+        """
+        B, C, T = x.size()
+
+        proj_query = x.view(B, C, -1)          # B, C, T
+        proj_key   = x.view(B, C, -1).permute(0, 2, 1)  # B, T, C
+        energy = torch.bmm(proj_query, proj_key)        # B, C, C
+
+        energy_new = torch.max(energy, dim=-1, keepdim=True)[0] - energy
+        attention = self.softmax(energy_new)
+
+        out = torch.bmm(attention, proj_query)  # B, C, T
+        return self.gamma * out + x
+
+class ResNet34AttClassifier(nn.Module):
+    def __init__(
+        self,
+        dummy_input,
+        feature_dim: int = 39,
+        hidden_size: int = 256,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        use_tabular: bool = False,
+        output_dim: int = 2, **kwargs
+    ):
+        super().__init__()
+
+        block = getattr(modules, "BasicBlock")
+        num_blocks = [3, 4, 6, 3]
+        m_channels = 32
+
+        self.in_planes = m_channels
+        self.feature_dim = feature_dim
+        # Compute frequency downsampling after 3 stride-2 stages precisely:
+        # H_next = floor((H - 1) / 2) + 1 for k=3, p=1, s=2
+        def _downsample_freq(h: int, stages: int = 3) -> int:
+            for _ in range(stages):
+                h = (h - 1) // 2 + 1
+            return h
+        self.stats_dim = _downsample_freq(feature_dim) * m_channels * 8
+
+        self.conv1 = nn.Conv2d(1,
+                               m_channels,
+                               kernel_size=3,
+                               stride=1,
+                               padding=1,
+                               bias=False)
+        self.bn1 = nn.BatchNorm2d(m_channels)
+        self.layer1 = self._make_layer(block,
+                                       m_channels,
+                                       num_blocks[0],
+                                       stride=1)
+        self.layer2 = self._make_layer(block,
+                                       m_channels * 2,
+                                       num_blocks[1],
+                                       stride=2)
+        self.layer3 = self._make_layer(block,
+                                       m_channels * 4,
+                                       num_blocks[2],
+                                       stride=2)
+        self.layer4 = self._make_layer(block,
+                                       m_channels * 8,
+                                       num_blocks[3],
+                                       stride=2)
+
+        self.tam = TemporalAttention1D(256)
+        self.cam = ChannelAttention1D()
+
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        # self.pool = modules.TSTP(in_dim=self.stats_dim * block.expansion)
+        # self.pool_out_dim = self.pool.get_out_dim()
+
+        self.classifier = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, output_dim)
+        )
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x, tabular_ids=None, **kwargs):
+        """
+        x: (B, n_mels, T) mel-spectrogram frames
+        """
+        x = x.unsqueeze_(1)
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+
+        out = out.squeeze(-2)
+        out = self.tam(out) + self.cam(out)
+        stats = self.pool(out).squeeze(-1)
+        
+        disease_logits = self.classifier(stats)
+
+        return {
+            "disease_logits": disease_logits,
+        }
+
 
 class BiLSTMMelClassifier(nn.Module):
     def __init__(
@@ -996,8 +1618,8 @@ class BiLSTMMelClassifier(nn.Module):
         hidden_size: int = 256,
         num_layers: int = 2,
         dropout: float = 0.1,
-        output_dim: int = 2
-        , **kwargs
+        use_tabular: bool = False,
+        output_dim: int = 2, **kwargs
     ):
         super().__init__()
 
@@ -1010,25 +1632,68 @@ class BiLSTMMelClassifier(nn.Module):
             batch_first=True,
         )
 
-        self.project = nn.Sequential(
+        self.audio_project = nn.Sequential(
             nn.Linear(hidden_size * 2, hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, output_dim)
+            nn.Linear(hidden_size, 256)
         )
 
-    def forward(self, x, **kwargs):
+        self.use_tabular = use_tabular
+        if self.use_tabular:
+            self.tabular_encoder = nn.Sequential(
+                nn.Linear(4, 32),
+                nn.BatchNorm1d(32),
+                nn.ReLU(),
+                nn.Dropout(0.5),          # strong regularization (intentional)
+                nn.Linear(32, 64),
+                nn.ReLU(),
+            )
+
+            # Project tabular → audio space
+            self.tabular_project = nn.Linear(64, 256)
+
+            # Gate: decides how much tabular matters
+            self.gate = nn.Sequential(
+                nn.Linear(64, 256),
+                nn.Sigmoid()
+            )
+            fusion_dim = 256
+        else:
+            fusion_dim = 256
+
+        self.classifier = nn.Sequential(
+            nn.Linear(fusion_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, output_dim)
+        )
+
+    def forward(self, x, tabular_ids=None, **kwargs):
         """
-        x: (B, T, n_mels) mel-spectrogram frames
+        x: (B, n_mels, T) mel-spectrogram frames
         """
         x = x.permute(0, 2, 1)
-        out, _ = self.lstm(x)           # (B, T, 2H)
-        out = out.mean(dim=1)           # temporal pooling
-        disease_logits = self.project(out)      # (B, num_classes)
+        audio_feat, _ = self.lstm(x)           # (B, T, 2H)
+        audio_feat = audio_feat.mean(dim=1)           # temporal pooling
+        audio_feat = self.audio_project(audio_feat)      # (B, num_classes)
 
+        if self.use_tabular:
+            assert tabular_ids is not None
+
+            tab_feat = self.tabular_encoder(tabular_ids)   # (B, 64)
+            tab_proj = self.tabular_project(tab_feat)      # (B, 256)
+            gate = self.gate(tab_feat)                     # (B, 256)
+
+            fused = audio_feat + gate * tab_proj
+        else:
+            fused = audio_feat
+
+        disease_logits = self.classifier(fused)
         return {
-                "disease_logits": disease_logits,
+            "disease_logits": disease_logits,
         }
+
 
 class BiLSTMSelfAttClassifier(nn.Module):
     def __init__(
@@ -1119,3 +1784,67 @@ class BiLSTMSelfAttClassifier(nn.Module):
         logits = self.project(pooled)
 
         return {"disease_logits": logits}
+
+from torchvision.models.vision_transformer import VisionTransformer, vit_b_16
+import torch.nn.functional as F
+class ViTMel(nn.Module):
+    def __init__(
+        self,
+        input_size,
+        output_dim,
+        spk_dim,
+        embed_dim: int = 768,
+        patch_size: int = 16,
+        grl_lambda: float = 1.0,
+        dropout: float = 0.3,
+        **kwargs
+    ):
+        super().__init__()
+
+        # Use torchvision's ViT backbone (requires fixed-size patch, but variable time is fine with padding)
+        self.vit = vit_b_16(pretrained=True)
+        # Modify first conv layer for 1-channel input
+        self.vit.conv_proj = nn.Conv2d(1, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+        # Shared bottleneck
+        self.disease_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.LayerNorm(embed_dim // 2),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 2, output_dim),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x, attention_mask=None, **kwargs):
+        """
+        x: [B, 1, F, T] (mel-spectrogram, variable T)
+        """
+        x = x.unsqueeze(1)
+        _, _, _, T = x.shape
+        pad_T = (16 - (T % 16)) % 16
+        if pad_T > 0:
+            x = nn.functional.pad(x, (0, pad_T))
+
+        x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+        vit_out = self.vit._process_input(x)
+
+        # Extract tokens and class embedding
+        n = vit_out.shape[0]
+        cls_token = self.vit.class_token.expand(n, -1, -1)
+        vit_out = torch.cat((cls_token, vit_out), dim=1)
+        vit_out = self.vit.encoder(vit_out)
+        pooled = vit_out[:, 0]  # CLS token as global embedding
+
+        disease_logits = self.disease_head(pooled)
+        return {
+            "disease_logits": disease_logits,
+        }

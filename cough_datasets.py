@@ -66,8 +66,10 @@ class CoughDatasets(torch.utils.data.Dataset):
         self.pad_types = getattr(hparams, "pad_types", None)
         self.feature_type = getattr(hparams, "feature_type", None)
         self.delta_feature = getattr(hparams, "delta_feature", None)
+        self.deltadelta_feature = getattr(hparams, "deltadelta_feature", None)
         self.db_path = getattr(hparams, "db_path", None)
 
+        self.tabular_feature = getattr(hparams, "tabular_feature", False)
         self.augment_data = getattr(hparams, "augment_data", False)
         self.augment_rawboost = getattr(hparams, "augment_rawboost", False)
         self.augment_prob = getattr(hparams, "augment_prob", 0.6)
@@ -94,7 +96,7 @@ class CoughDatasets(torch.utils.data.Dataset):
                 augmentation_noises_labels_path="/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_noises_speechs_labels.tsv",
                 augmentation_rirs_directory=None,
                 augmentation_rirs_labels_path="/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_rirs_labels.tsv",
-                augmentation_window_size_secs=5.5, augmentation_probability=[0.3, 0.15, 0.2, 0.4, 0.0])  # 0.3, 0.15, 0.2, 0.4, 0.0
+                augmentation_window_size_secs=5.5, augmentation_probability=[0.3, 0.25, 0.2, 0.25, 0.0])  # 0.3, 0.15, 0.2, 0.4, 0.0
 
         if self.mean_std_norm:
             with open(wav_stats_path, 'rb') as f:
@@ -122,25 +124,7 @@ class CoughDatasets(torch.utils.data.Dataset):
                 #     hparams.n_mel_channels, hparams.sampling_rate, hparams.mel_fmin,
                 #     hparams.mel_fmax)
                 self.wav_transform = lambda wav: torch.tensor(
-                    librosa.power_to_db(
-                        librosa.feature.melspectrogram(
-                            y=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
-                            sr=hparams.sampling_rate,
-                            n_mels=hparams.n_mel_channels,
-                            fmin=hparams.mel_fmin,
-                            fmax=hparams.mel_fmax,
-                            n_fft=hparams.filter_length,
-                            hop_length=hparams.hop_length,
-                            power=2.0,
-                        ),
-                        ref=1.0,
-                    ),
-                    dtype=torch.float32,
-                )
-            elif hparams.feature_type == "melspectogram":
-                from gammatone.gtgram import gtgram
-                self.wav_transform = lambda wav: torch.tensor(
-                    gtgram(
+                    librosa.power_to_db(librosa.feature.melspectrogram(
                         y=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
                         sr=hparams.sampling_rate,
                         n_mels=hparams.n_mel_channels,
@@ -149,20 +133,48 @@ class CoughDatasets(torch.utils.data.Dataset):
                         n_fft=hparams.filter_length,
                         hop_length=hparams.hop_length,
                         power=2.0,
-                    ),
+                    ), ref=np.max),
                     dtype=torch.float32,
                 )
-            elif hparams.feature_type == "spectogram":
+            elif hparams.feature_type == "teramel": 
+                #(2048, 200, 800)
+                #n_fft, hop_length, win_length
                 self.wav_transform = lambda wav: torch.tensor(
-                    librosa.amplitude_to_db(
+                    np.log(librosa.feature.melspectrogram(
+                        y=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
+                        sr=hparams.sampling_rate,
+                        n_mels=hparams.n_mel_channels,
+                        n_fft=hparams.filter_length,
+                        hop_length=hparams.hop_length,
+                        win_length=hparams.win_length,
+                    ) + 1e-6),
+                    dtype=torch.float32,
+                )
+            elif hparams.feature_type == "gammmaspectogram": 
+                from gammatone.gtgram import gtgram
+                self.wav_transform = lambda wav: torch.tensor(
+                    np.log(gtgram(
+                        wave=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
+                        fs=hparams.sampling_rate,
+                        channels=hparams.n_mel_channels,
+                        f_min=hparams.mel_fmin,
+                        f_max=hparams.mel_fmax,
+                        window_time=hparams.filter_length / hparams.sampling_rate,
+                        hop_time=hparams.hop_length / hparams.sampling_rate, 
+                    ) + 1e-8),
+                    dtype=torch.float32,
+                )
+            elif hparams.feature_type == "spectogram": 
+                self.wav_transform = lambda wav: torch.tensor(
+                    librosa.power_to_db(
                         np.abs(
                             librosa.stft(
                                 y=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
                                 n_fft=hparams.filter_length,
                                 hop_length=hparams.hop_length
                             )
-                        ),
-                        ref=1.0,
+                        ) ** 2,
+                        ref=np.max,
                     ),
                     dtype=torch.float32
                 )
@@ -229,16 +241,22 @@ class CoughDatasets(torch.utils.data.Dataset):
         wav1, dse_id = self.get_audio(self.db_path + "/" + wavname, dse_id)
 
         if self.ssccl_training:
-            wav2, _ = self.get_audio(self.db_path + "/" + wavname)
+            wav2, _ = self.get_audio(self.db_path + "/" + wavname, always_augment=True)
         else:
             wav2 = torch.empty(0, dtype=wav1.dtype, device="cpu")
 
-        return (wavname, wav1, wav2, dse_id, int(spk_id), int(gndr_id))
+        if self.tabular_feature:
+            tabular = torch.from_numpy(audiopath_and_text[4:8].astype("float32")).reshape(1, -1)
+        else:
+            tabular = np.zeros((1, 4))
+            
+        return (wavname, wav1, wav2, dse_id, int(spk_id), int(gndr_id), tabular)
 
-    def get_audio(self, filename, dse_id=None, start_index=0, end_index=-1):
+    def get_audio(self, filename, dse_id=None, always_augment=False, start_index=0, end_index=-1):
         audio = utils.load_audio_sample(filename, self.sampling_rate, self.saming_length,
                                         self.desired_length, fade_samples_ratio=self.fade_samples_ratio,
                                         pad_types=self.pad_types)  # repeat zero
+        audio = audio - audio.mean(dim=-1, keepdim=True)
 
         if self.pad_types != "synthesis" and self.cough_detection:
             if audio.shape[-1] < end_index:
@@ -246,9 +264,11 @@ class CoughDatasets(torch.utils.data.Dataset):
             else:
                 audio = audio[:, start_index:end_index]
             # audio = audio[:, start_index:] if end_index == -1 else audio[:, start_index:end_index]
+            if audio.shape[-1] == 0:
+                print(audio.shape)
 
         if self.augment_data and self.train:
-            if random.uniform(0, 0.999) > 1 - self.augment_prob:
+            if random.random() < self.augment_prob or always_augment:
                 audio = self.data_augmentator(audio, self.sampling_rate)
 
         audio = audio.squeeze(0)
@@ -268,21 +288,23 @@ class CoughDatasets(torch.utils.data.Dataset):
         if dse_id != None:  # and self.train:
             audio, dse_id = self.mix_audio_sample(audio, dse_id)
 
-        if self.mean_std_norm:
-            audio = (audio - self.wav_mean) / (self.wav_std + 1e-6)
-        elif self.max_wav_value:
-            max_val = torch.max(torch.abs(audio))
-            audio = audio / max_val if max_val != 0 else audio
-
         if self.wav_transform != None:
             if self.feature_type == "opensmile":
                 audio = audio.numpy().reshape(-1)
 
             audio = self.wav_transform(audio)  # [80, 224]
             if self.delta_feature:
-                delta = torch.tensor(librosa.feature.delta(audio.numpy()), dtype=torch.float32)
-                delta2 = torch.tensor(librosa.feature.delta(audio.numpy(), order=2), dtype=torch.float32)
-                audio = torch.cat([audio, delta, delta2], dim=0)
+                audio_np = audio.detach().cpu().numpy()
+                delta = torch.from_numpy(
+                    librosa.feature.delta(audio_np)
+                ).to(audio.device, dtype=audio.dtype)
+                audio = torch.cat([audio, delta], dim=0)
+                if self.deltadelta_feature:
+                    delta2 = torch.from_numpy(
+                        librosa.feature.delta(audio_np, order=2)
+                    ).to(audio.device, dtype=audio.dtype)
+                    audio = torch.cat([audio, delta2], dim=0)
+                
 
             if self.multimask_augment == True and self.train == True:
                 audio = audio_processing.multi_mask_spectrogram(
@@ -302,6 +324,12 @@ class CoughDatasets(torch.utils.data.Dataset):
             #     audio = viridis_lut[idx]
             #     wav = audio.permute(2, 0, 1).float()
             #     audio = self.img_transform(audio)
+
+        if self.mean_std_norm:
+            audio = (audio - self.wav_mean) / (self.wav_std + 1e-6)
+        elif self.max_wav_value:
+            max_val = torch.max(torch.abs(audio))
+            audio = audio / max_val if max_val != 0 else audio
 
         audio = audio.unsqueeze(0)
         if self.mae_training == True:
@@ -356,10 +384,11 @@ class CoughDatasets(torch.utils.data.Dataset):
 
 
 class CoughDatasetsCollate:
-    def __init__(self, many_data=2, processor=None, sampling_rate=16000):
+    def __init__(self, many_data=2, many_tabular=4, processor=None, sampling_rate=16000):
         self.processor = processor
         self.sampling_rate = sampling_rate
         self.many_data = many_data
+        self.many_tabular = many_tabular
 
     def __call__(self, batch):
         lengths1 = torch.tensor([x[1].shape[-1] for x in batch])
@@ -382,9 +411,10 @@ class CoughDatasetsCollate:
         dse_ids = torch.zeros(bsz, self.many_data, dtype=torch.float32)
         spk_ids = torch.zeros(bsz, dtype=torch.long)
         gndr_ids = torch.zeros(bsz, dtype=torch.long)
+        tabular_ids = torch.zeros(bsz, self.many_tabular, dtype=torch.float32)
 
         for i, j in enumerate(idx):
-            name, wav1, wav2, dse, spk, gndr = batch[j]
+            name, wav1, wav2, dse, spk, gndr, tblr = batch[j]
             wav_names.append(name)
 
             wav_padded1[i, :, :wav1.shape[-1]] = wav1
@@ -395,8 +425,9 @@ class CoughDatasetsCollate:
             dse_ids[i] = dse
             spk_ids[i] = spk
             gndr_ids[i] = gndr
+            tabular_ids[i] = gndr
 
-        return wav_names, wav_padded1, wav_padded2, attention_masks, dse_ids, [spk_ids, gndr_ids]
+        return wav_names, wav_padded1, wav_padded2, attention_masks, dse_ids, [spk_ids, gndr_ids, tabular_ids]
 
 
 class CoughDatasetsProcessorCollate():
@@ -416,22 +447,29 @@ class CoughDatasetsProcessorCollate():
         """
         wav_name = [x[0] for x in batch]
         wavs = [x[1].squeeze().numpy() for x in batch]  # list[np.ndarray]
-        dse_ids = torch.stack([torch.tensor(x[2]).squeeze(0) for x in batch])
-        spk_ids = torch.stack([torch.tensor(x[3]) for x in batch])
-        gndr_ids = torch.stack([torch.tensor(x[4]) for x in batch])
+        dse_ids = torch.stack([x[3].squeeze(0) for x in batch])
+        spk_ids = torch.stack([torch.tensor(x[4]) for x in batch])
+        gndr_ids = torch.stack([torch.tensor(x[5]) for x in batch])
 
         audio_inputs = self.processor.feature_extractor(
             wavs,
             sampling_rate=self.sampling_rate,
             return_tensors="pt",
             # padding="max_length",
+            truncation = False, # ?
             return_attention_mask=True,
             padding=True
         )
         wav_padded = audio_inputs["input_features"]           # [B, n_mels, T]
-        attention_masks = audio_inputs["attention_mask"]   # [B, T]
+        attention_masks = audio_inputs["attention_mask"]      # [B, T]
+        
+        B, n_mels, T = wav_padded.shape
+        dummy_wav = torch.empty(
+            (B, n_mels, T),
+            dtype=wav_padded.dtype
+        )
 
-        return wav_name, wav_padded, attention_masks, dse_ids, [spk_ids, gndr_ids]
+        return wav_name, wav_padded, dummy_wav, attention_masks, dse_ids, [spk_ids, gndr_ids]
 
 
 class CoughDetectionRatioBatchSampler(Sampler):
@@ -559,3 +597,53 @@ class CoughDiseaseBinaryBatchSampler(Sampler):
             len(self.positive_idx) // self.n_positive,
             len(self.negative_idx) // self.n_negative,
         )
+
+
+from collections import defaultdict
+class PatientBatchSampler(Sampler):
+    def __init__(
+        self,
+        patient_ids,
+        patients_per_batch,
+        coughs_per_patient,
+        shuffle=True,
+        drop_last=True,
+    ):
+        self.patient_ids = patient_ids
+        self.P = patients_per_batch
+        self.K = coughs_per_patient
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+
+        self.pid2idx = defaultdict(list)
+        for idx, pid in enumerate(patient_ids):
+            self.pid2idx[pid].append(idx)
+
+        self.patients = list(self.pid2idx.keys())
+
+    def __iter__(self):
+        patients = self.patients.copy()
+        if self.shuffle:
+            random.shuffle(patients)
+
+        batch = []
+        selected_patients = []
+
+        for pid in patients:
+            idxs = self.pid2idx[pid]
+            if len(idxs) < self.K:
+                continue
+
+            batch.extend(random.sample(idxs, self.K))
+            selected_patients.append(pid)
+
+            if len(selected_patients) == self.P:
+                yield batch
+                batch = []
+                selected_patients = []
+
+        if len(batch) > 0 and not self.drop_last:
+            yield batch
+
+    def __len__(self):
+        return len(self.patients) // self.P

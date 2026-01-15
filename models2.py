@@ -93,71 +93,80 @@ class MyOwnQwen_CrossAttent(nn.Module):
 
 
     def forward(self, input_features, attention_mask=None, grl_lambda=0.0):
-
         device = input_features.device
-        attention_mask = attention_mask.long()
+        feature_attention_mask = attention_mask.long()
 
-        audio_feature_lengths = attention_mask.sum(1)
-        input_features = input_features.permute(0,2,1)[attention_mask.bool()].permute(1,0)
+        if feature_attention_mask is not None:
+            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+            input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
+        else:
+            audio_feature_lengths = None
 
-        audio_feat_lengths, audio_output_lengths = self.audio_tower._get_feat_extract_output_lengths(
-            audio_feature_lengths
+        feature_lens = audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
+        audio_outputs = self.audio_tower(
+            input_features,
+            feature_lens=feature_lens,
         )
+        audio_features = audio_outputs.last_hidden_state
 
-        x = self.audio_tower(
-            input_features=input_features,
-            feature_lens=audio_feature_lengths,
-            aftercnn_lens=audio_feat_lengths
-        ).last_hidden_state
+        # audio_feat_lengths, audio_output_lengths = self.audio_tower._get_feat_extract_output_lengths(
+        #     audio_feature_lengths
+        # )
 
-        x = x.split(audio_output_lengths.tolist(), dim=0)
-        x = pad_sequence(x, batch_first=True)
+        # x = self.audio_tower(
+        #     input_features=input_features,
+        #     feature_lens=audio_feature_lengths,
+        #     aftercnn_lens=audio_feat_lengths
+        # ).last_hidden_state
 
-        z = self.project_shared(x)
-        mask = make_pad_mask(audio_output_lengths, max_len=z.size(1), device=device)
+        # x = x.split(audio_output_lengths.tolist(), dim=0)
+        # x = pad_sequence(x, batch_first=True)
 
-        # latent streams
-        spk_latent = self.spk_proj(z)
-        gender_latent = self.gender_proj(z)
-        dis_latent = self.dis_proj(z)
+        # z = self.project_shared(x)
+        # mask = make_pad_mask(audio_output_lengths, max_len=z.size(1), device=device)
 
-        spk_stream = spk_latent + gender_latent
-        spk_ctx, dis_ctx = self.cross(spk_stream, dis_latent, a_mask=mask, b_mask=mask)
+        # # latent streams
+        # spk_latent = self.spk_proj(z)
+        # gender_latent = self.gender_proj(z)
+        # dis_latent = self.dis_proj(z)
 
-        # TOKEN-LEVEL EMISSIONS
-        spk_emissions = self.spk_head(spk_ctx)         # [B,T,spk_dim]
-        gender_emissions = self.gender_head(spk_ctx)   # [B,T,2]
-        dis_emissions = self.dis_head(dis_ctx)         # [B,T,out_dim]
+        # spk_stream = spk_latent + gender_latent
+        # spk_ctx, dis_ctx = self.cross(spk_stream, dis_latent, a_mask=mask, b_mask=mask)
 
-        outputs = {}
-        total_loss = 0.0
+        # # TOKEN-LEVEL EMISSIONS
+        # spk_emissions = self.spk_head(spk_ctx)         # [B,T,spk_dim]
+        # gender_emissions = self.gender_head(spk_ctx)   # [B,T,2]
+        # dis_emissions = self.dis_head(dis_ctx)         # [B,T,out_dim]
 
-        # KL ALIGNMENT
-        spk_logp = F.log_softmax(spk_emissions, -1)
-        dis_prob = F.softmax(dis_emissions, -1)
+        # outputs = {}
+        # total_loss = 0.0
 
-        shared_dim = min(spk_logp.size(-1), dis_prob.size(-1))
-        spk_proj = spk_logp[..., :shared_dim]
-        dis_proj = dis_prob[..., :shared_dim]
+        # # KL ALIGNMENT
+        # spk_logp = F.log_softmax(spk_emissions, -1)
+        # dis_prob = F.softmax(dis_emissions, -1)
 
-        kl_sym = 0.5 * (
-            F.kl_div(spk_proj, dis_proj, reduction='batchmean') +
-            F.kl_div(torch.log(dis_proj+1e-12), torch.exp(spk_proj), reduction='batchmean')
-        )
+        # shared_dim = min(spk_logp.size(-1), dis_prob.size(-1))
+        # spk_proj = spk_logp[..., :shared_dim]
+        # dis_proj = dis_prob[..., :shared_dim]
 
-        total_loss += self.kl_weight * kl_sym
-        outputs['kl_sym'] = kl_sym
+        # kl_sym = 0.5 * (
+        #     F.kl_div(spk_proj, dis_proj, reduction='batchmean') +
+        #     F.kl_div(torch.log(dis_proj+1e-12), torch.exp(spk_proj), reduction='batchmean')
+        # )
 
-        # POOLING HEADS
-        mask_f = mask.float().unsqueeze(-1)
-        pooled_spk = (spk_ctx * mask_f).sum(1) / (mask_f.sum(1)+1e-9)
-        pooled_dis = (dis_ctx * mask_f).sum(1) / (mask_f.sum(1)+1e-9)
+        # total_loss += self.kl_weight * kl_sym
+        # outputs['kl_sym'] = kl_sym
 
-        outputs['speaker_logits'] = self.utt_speaker_cls(pooled_spk)
-        outputs['gender_logits']  = self.utt_gender_cls(pooled_spk)
-        outputs['disease_logits'] = self.utt_disease_cls(pooled_dis)
+        # # POOLING HEADS
+        # mask_f = mask.float().unsqueeze(-1)
+        # pooled_spk = (spk_ctx * mask_f).sum(1) / (mask_f.sum(1)+1e-9)
+        # pooled_dis = (dis_ctx * mask_f).sum(1) / (mask_f.sum(1)+1e-9)
 
-        outputs["internal_loss"] = total_loss
+        # outputs['speaker_logits'] = self.utt_speaker_cls(pooled_spk)
+        # outputs['gender_logits']  = self.utt_gender_cls(pooled_spk)
+        # outputs['disease_logits'] = self.utt_disease_cls(pooled_dis)
+
+        # outputs["internal_loss"] = total_loss
 
         return outputs
 

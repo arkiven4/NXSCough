@@ -4,13 +4,14 @@
     "log_interval": 20,
     "seed": 1234,
     "epochs": 10000,
-    "learning_rate": 1e-3,
+    "learning_rate": 1e-4,
+    "weight_decay": 1e-4,
     "betas": [0.8, 0.99],
     "eps": 1e-9,
     "lr_decay": 0.999875,
-    "batch_size": 16,
-    "loss_function": "KLDivLoss",
-    "use_Kfold": false,
+    "batch_size": 24,
+    "loss_function": "BCE",
+    "use_Kfold": true,
     "mae_training": false,
     "ssccl_training": false
   },
@@ -20,10 +21,10 @@
     
     "sampling_rate": 16000,
     "filter_length": 1024,
-    "hop_length": 256,
-    "win_length": 1024,
-    "n_mel_channels": 64,
-    "mel_fmin": 0.0,
+    "hop_length": 160,
+    "win_length": 400,
+    "n_mel_channels": 80,
+    "mel_fmin": 50.0,
     "mel_fmax": 8000.0,
 
     "saming_length": true,
@@ -32,9 +33,11 @@
     "pad_types": "zero",
     "rezize_size": [64, 256],
 
-    "acoustic_feature": false,
-    "feature_type": "melspectogram",
+    "tabular_feature": true,
+    "acoustic_feature": true,
+    "feature_type": "gammmaspectogram",
     "delta_feature": false,
+    "deltadelta_feature": false,
 
     "multimask_augment": false,
     "tau": 0.10,
@@ -42,28 +45,30 @@
     "num_masks": 2,
 
     "augment_data": true,
-    "augment_prob": 0.4,
-    "augment_rawboost": false,
+    "augment_prob": 0.7,
+    "augment_rawboost": true,
     "add_noise": false,
 
-    "mix_audio": true,
+    "cough_detection": false,
+    "mix_audio": false,
     "many_class": 2,
 
     "db_path": "",
     "metadata_csv": "metadata.csv",
     "target_column": "disease_status",
-    "column_order": ["path_file", "disease_status", "sex", "participant"]
+    "column_order": ["path_file", "disease_status", "gender", "participant", "weight_loss", "hemoptysis", "night_sweats", "smoker"]
   }, 
   "model": {
-    "pooling_model": "PEFTWavLM_Try1",
-    "feature_dim": 1024,
-    "output_dim": 2,
+    "pooling_model": "ResNet34AttClassifier",
+    "use_tabular": false,
+    "feature_dim": 240,
+    "output_dim": 1,
 
-    "finetune_method": "lora",
+    "lora_finetune": true,
     "adapter_hidden_dim": 128,
     "embedding_prompt_dim": 5,
-    "lora_rank": 32,
-    "lora_alpha": 64,
-    "target_modules": ["q_proj", "k_proj", "v_proj", "out_proj"]
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "target_modules": [ "q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2", "conv_out", "proj1", "proj2" ]
   }
 }

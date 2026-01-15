@@ -1,6 +1,8 @@
 __pycache__
 output/*/
 data/
+logs_resulthesis/
+logs_newest/
 logs/
 logs_old/
 logs_old2/

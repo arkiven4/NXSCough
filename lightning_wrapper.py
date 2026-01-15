@@ -8,6 +8,7 @@ from sklearn.metrics import confusion_matrix, accuracy_score, balanced_accuracy_
 import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib import cm
+from peft import PeftModel
 
 import commons, models, utils, losses
 
@@ -37,13 +38,13 @@ class CoughClassificationRunner(L.LightningModule):
         trainable_percentage = 100 * trainable_params / total_params if total_params > 0 else 0
         self.custom_logger.info(f'Trainable params: {trainable_params} | Total params: {total_params} | Trainable%: {trainable_percentage:.2f}% | Size: {trainable_params/(1e6):.2f}M')
 
-    def forward(self, x1, x2=None, attention_mask=None):
-        x = self.model(x1, x2=x2, attention_mask=attention_mask)
+    def forward(self, x1, x2=None, attention_mask=None, tabular_ids=None):
+        x = self.model(x1, x2=x2, attention_mask=attention_mask, tabular_ids=tabular_ids)
         return x
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam([
-            {"params": self.model.parameters(), "lr": self.hps.train.learning_rate},
+        optimizer = torch.optim.AdamW([
+            {"params": self.model.parameters(), "lr": self.hps.train.learning_rate, "weight_decay": self.hps.train.weight_decay},
             #{"params": self.model.sscl_model.parameters(), "lr": 1e-5},
             #{"params": self.model.head.parameters(), "lr": self.hps.train.learning_rate},
             #{"params": self.center_loss.parameters(), "lr": self.hps.train.learning_rate},
@@ -56,6 +57,27 @@ class CoughClassificationRunner(L.LightningModule):
                 "monitor": "val/loss",
             },
         }
+    
+    # After training, the model have PEFT, but the ckpt dont have PEFT, so it will brreak
+    # def on_save_checkpoint(self, checkpoint):
+    #     import copy
+    #     temp_model = copy.deepcopy(self.model)
+    #     backbone = self.model.backbone_model
+    #     if not isinstance(backbone, PeftModel):
+    #         return
+    #     merged = self.model.backbone_model.merge_and_unload()
+    #     temp_model.backbone_model = merged
+    #     checkpoint["state_dict"] = temp_model.state_dict()
+
+    #     state_dict = checkpoint["state_dict"]
+    #     fixed_state_dict = {}
+    #     for k, v in state_dict.items():
+    #         k = k.replace(".base_model.model", "")
+    #         if not k.startswith("model."):
+    #             fixed_state_dict[f"model.{k}"] = v
+    #         else:
+    #             fixed_state_dict[k] = v
+    #     checkpoint["state_dict"] = fixed_state_dict
 
     def on_after_backward(self):
         norm_type = 2
@@ -68,8 +90,8 @@ class CoughClassificationRunner(L.LightningModule):
         self.log("train/grad_norm", total_norm, sync_dist=True)
 
     def training_step(self, batch, batch_idx):
-        _, audio1, audio2, attention_masks, dse_ids, _ = batch
-        out_model = self.forward(audio1, audio2, attention_mask=attention_masks)
+        _, audio1, audio2, attention_masks, dse_ids, [patient_ids, _, tabular_ids] = batch
+        out_model = self.forward(audio1, audio2, attention_mask=attention_masks, tabular_ids=tabular_ids)
 
         tot_loss = []
         if "disease_logits" in out_model:
@@ -77,7 +99,7 @@ class CoughClassificationRunner(L.LightningModule):
             tot_loss.append(ld[0])
             
         if hasattr(self.model, "calc_additional_loss"):
-            tot_loss.append(self.model.calc_additional_loss(out_model['embedding'], dse_ids) * 0.2)
+            tot_loss.append(self.model.calc_additional_loss(out_model, batch))
 
         if "loss" in out_model:
             tot_loss.append(out_model["loss"])
@@ -115,8 +137,8 @@ class CoughClassificationRunner(L.LightningModule):
         self.log("train/lr", lr, sync_dist=True)
 
     def validation_step(self, batch, batch_idx):
-        _, audio1, audio2, attention_masks, dse_ids, _ = batch
-        out_model = self.forward(audio1, audio2, attention_mask=attention_masks)
+        _, audio1, audio2, attention_masks, dse_ids, [patient_ids, _, tabular_ids] = batch
+        out_model = self.forward(audio1, audio2, attention_mask=attention_masks, tabular_ids=tabular_ids)
         
         tot_loss = []
         if "disease_logits" in out_model:
@@ -124,7 +146,7 @@ class CoughClassificationRunner(L.LightningModule):
             tot_loss.append(ld[0])
 
         if hasattr(self.model, "calc_additional_loss"):
-            tot_loss.append(self.model.calc_additional_loss(out_model['embedding'], dse_ids) * 0.2)
+            tot_loss.append(self.model.calc_additional_loss(out_model, batch))
 
         if "loss" in out_model:
             tot_loss.append(out_model["loss"])
@@ -143,13 +165,19 @@ class CoughClassificationRunner(L.LightningModule):
         self.test_logits = []
 
     def test_step(self, batch, batch_idx):
-        _, audio1, audio2, attention_masks, dse_ids, _ = batch
+        _, audio1, audio2, attention_masks, dse_ids, [_, _, tabular_ids] = batch
         dse_ids = dse_ids.float()
-        logits = self.forward(audio1, audio2, attention_mask=attention_masks)["disease_logits"]
+        logits = self.forward(audio1, audio2, attention_mask=attention_masks, tabular_ids=tabular_ids)["disease_logits"]
         
-        preds = torch.argmax(logits, dim=1)
-        labels = torch.argmax(dse_ids, dim=1)
+        if self.hps.train.loss_function == "BCE":
+            probs = torch.sigmoid(logits)     # [B]
+            preds = (probs >= 0.5).long()     # [B]
+        else:
+            preds = torch.argmax(logits, dim=1)
 
+        labels = torch.argmax(dse_ids, dim=1)
+        labels = (labels != 0).float() # TEMPORARY
+ 
         self.test_preds.append(preds.cpu())
         self.test_labels.append(labels.cpu())
         self.test_logits.append(logits.detach().cpu())
@@ -164,28 +192,32 @@ class CoughClassificationRunner(L.LightningModule):
         preds = torch.cat(self.test_preds).numpy()
         labels = torch.cat(self.test_labels).numpy()
         logits = torch.cat(self.test_logits)             
-        probs = torch.softmax(logits, dim=1)[:, 1].numpy()
+
+        if self.hps.train.loss_function == "BCE":
+            probs = logits
+        else:
+            probs = torch.softmax(logits, dim=1)[:, 1].numpy()
 
         # -----------------------------------------
         # Confusion Matrix + metrics
         # -----------------------------------------
         cm = confusion_matrix(labels, preds)
         n_classes = cm.shape[0]
-        class_labels = [f"Class {i+1}" for i in range(n_classes)]
+
+        # sanity check: binary only
+        assert cm.shape == (2, 2), f"Expected binary confusion matrix, got {cm.shape}"
+
+        TN, FP = cm[0, 0], cm[0, 1]
+        FN, TP = cm[1, 0], cm[1, 1]
 
         acc = accuracy_score(labels, preds)
-        b_acc = balanced_accuracy_score(labels, preds)
 
-        sens = np.mean([
-            cm[i, i] / cm[i, :].sum()
-            for i in range(n_classes) if cm[i, :].sum() > 0
-        ])
+        # clinical metrics
+        sens = TP / (TP + FN) if (TP + FN) > 0 else 0.0   # TB recall
+        spec = TN / (TN + FP) if (TN + FP) > 0 else 0.0   # non-TB recall
 
-        spec = np.mean([
-            (cm.sum() - cm[i, :].sum() - cm[:, i].sum() + cm[i, i]) /
-            (cm.sum() - cm[i, :].sum())
-            for i in range(n_classes) if (cm.sum() - cm[i, :].sum()) > 0
-        ])
+        # optional but valid
+        b_acc = 0.5 * (sens + spec)
 
         # -----------------------------------------
         # AUROC + KPI pAUROC (≥80% sens, ≥60% spec)

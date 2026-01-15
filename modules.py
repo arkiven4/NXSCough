@@ -206,6 +206,69 @@ class SELayer(nn.Module):
         return x * y.expand_as(x)
 
 # -----------------------------
+# ResnetManual module
+# -----------------------------
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_planes,
+                               planes,
+                               kernel_size=3,
+                               stride=stride,
+                               padding=1,
+                               bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes,
+                               planes,
+                               kernel_size=3,
+                               stride=1,
+                               padding=1,
+                               bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion * planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes,
+                          self.expansion * planes,
+                          kernel_size=1,
+                          stride=stride,
+                          bias=False), nn.BatchNorm2d(self.expansion * planes))
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+class TSTP(nn.Module):
+    """
+    Temporal statistics pooling, concatenate mean and std, which is used in
+    x-vector
+    Comment: simple concatenation can not make full use of both statistics
+    """
+
+    def __init__(self, in_dim=0, **kwargs):
+        super(TSTP, self).__init__()
+        self.in_dim = in_dim
+
+    def forward(self, x):
+        # The last dimension is the temporal axis
+        pooling_mean = x.mean(dim=-1)
+        pooling_std = torch.sqrt(torch.var(x, dim=-1) + 1e-7)
+        pooling_mean = pooling_mean.flatten(start_dim=1)
+        pooling_std = pooling_std.flatten(start_dim=1)
+        stats = torch.cat((pooling_mean, pooling_std), 1)
+        return stats
+
+    def get_out_dim(self):
+        self.out_dim = self.in_dim * 2
+        return self.out_dim
+
+# -----------------------------
 # Cross-attention module
 # -----------------------------
 class BidirectionalCrossAttention(nn.Module):

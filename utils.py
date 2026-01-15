@@ -1,4 +1,17 @@
-import argparse, gc, glob, json, logging, math, os, random, socket, string, subprocess, sys, hashlib, pickle
+import argparse
+import gc
+import glob
+import json
+import logging
+import math
+import os
+import random
+import socket
+import string
+import subprocess
+import sys
+import hashlib
+import pickle
 import librosa
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,6 +34,7 @@ logger = logging
 DEFAULT_MIN_BIN_WIDTH = 1e-3
 DEFAULT_MIN_BIN_HEIGHT = 1e-3
 DEFAULT_MIN_DERIVATIVE = 1e-3
+
 
 def piecewise_rational_quadratic_transform(
     inputs,
@@ -214,6 +228,7 @@ def rational_quadratic_spline(
 
         return outputs, logabsdet
 
+
 def get_free_port():
     s = socket.socket()
     s.bind(("", 0))
@@ -221,12 +236,14 @@ def get_free_port():
     s.close()
     return port
 
+
 def stratified_group_split(df, label_col='tb_status', group_col='participant', test_size=0.2, random_state=42):
     sgkf = StratifiedGroupKFold(n_splits=int(1/test_size), shuffle=True, random_state=random_state)
     for train_idx, val_idx in sgkf.split(df, df[label_col], df[group_col]):
         df_train = df.iloc[train_idx].reset_index(drop=True)
         df_val = df.iloc[val_idx].reset_index(drop=True)
         return df_train, df_val
+
 
 def CCC_loss(pred, lab, m_lab=None, v_lab=None, is_numpy=False):
     """
@@ -236,7 +253,7 @@ def CCC_loss(pred, lab, m_lab=None, v_lab=None, is_numpy=False):
     if is_numpy:
         pred = torch.Tensor(pred).float().cuda()
         lab = torch.Tensor(lab).float().cuda()
-    
+
     m_pred = torch.mean(pred, 0, keepdim=True)
     m_lab = torch.mean(lab, 0, keepdim=True)
 
@@ -251,197 +268,210 @@ def CCC_loss(pred, lab, m_lab=None, v_lab=None, is_numpy=False):
     s_pred = torch.std(pred, 0, unbiased=False)
     s_lab = torch.std(lab, 0, unbiased=False)
 
-    ccc = (2*corr*s_pred*s_lab) / (v_pred + v_lab + (m_pred[0]-m_lab[0])**2)    
+    ccc = (2*corr*s_pred*s_lab) / (v_pred + v_lab + (m_pred[0]-m_lab[0])**2)
     return ccc
+
 
 def CE_weight_category(pred, lab, weights, test=False):
     if test == False:
-      criterion = torch.nn.CrossEntropyLoss(weight=weights)
-      loss = criterion(pred, lab)
-      
-      # Convert logits to predicted class indices
-      pred_labels = torch.argmax(pred, dim=1).cpu().numpy()
-      lab = lab.cpu().numpy()
+        criterion = torch.nn.CrossEntropyLoss(weight=weights)
+        loss = criterion(pred, lab)
 
-      # Compute F1 scores and accuracy
-      f1_micro = f1_score(lab, pred_labels, average='micro')
-      f1_macro = f1_score(lab, pred_labels, average='macro')
-      accuracy = accuracy_score(lab, pred_labels)
+        # Convert logits to predicted class indices
+        pred_labels = torch.argmax(pred, dim=1).cpu().numpy()
+        lab = lab.cpu().numpy()
 
-      return loss, f1_micro, f1_macro, accuracy
+        # Compute F1 scores and accuracy
+        f1_micro = f1_score(lab, pred_labels, average='micro')
+        f1_macro = f1_score(lab, pred_labels, average='macro')
+        accuracy = accuracy_score(lab, pred_labels)
+
+        return loss, f1_micro, f1_macro, accuracy
     else:
-      # Convert logits to predicted class indices
-      pred_labels = pred.cpu().numpy()
-      lab = lab.cpu().numpy()
+        # Convert logits to predicted class indices
+        pred_labels = pred.cpu().numpy()
+        lab = lab.cpu().numpy()
 
-      # Compute F1 scores and accuracy
-      f1_micro = f1_score(lab, pred_labels, average='micro')
-      f1_macro = f1_score(lab, pred_labels, average='macro')
-      accuracy = accuracy_score(lab, pred_labels)
-      return f1_micro, f1_macro, accuracy
+        # Compute F1 scores and accuracy
+        f1_micro = f1_score(lab, pred_labels, average='micro')
+        f1_macro = f1_score(lab, pred_labels, average='macro')
+        accuracy = accuracy_score(lab, pred_labels)
+        return f1_micro, f1_macro, accuracy
+
 
 def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None):
-  assert os.path.isfile(checkpoint_path)
-  checkpoint_dict = torch.load(checkpoint_path, weights_only=True, map_location='cpu')
-  iteration = 1
-  if 'iteration' in checkpoint_dict.keys():
-    iteration = checkpoint_dict['iteration']
-  if 'learning_rate' in checkpoint_dict.keys():
-    learning_rate = checkpoint_dict['learning_rate']
-  if optimizer is not None and 'optimizer' in checkpoint_dict.keys():
-    optimizer.load_state_dict(checkpoint_dict['optimizer'])
-  if scheduler is not None and 'scheduler' in checkpoint_dict.keys():
-    scheduler.load_state_dict(checkpoint_dict['scheduler'])
-  saved_state_dict = checkpoint_dict['model']
-  if hasattr(model, 'module'):
-    state_dict = model.module.state_dict()
-  else:
-    state_dict = model.state_dict()
-  new_state_dict= {}
-  for k, v in state_dict.items():
-    try:
-      new_state_dict[k] = saved_state_dict[k]
-    except:
-      print("%s is not in the checkpoint" % k)
-      new_state_dict[k] = v
-  if hasattr(model, 'module'):
-    model.module.load_state_dict(new_state_dict)
-  else:
-    model.load_state_dict(new_state_dict)
-  logger.info("Loaded checkpoint '{}' (iteration {})" .format(
-    checkpoint_path, iteration))
+    assert os.path.isfile(checkpoint_path)
+    checkpoint_dict = torch.load(checkpoint_path, weights_only=True, map_location='cpu')
+    iteration = 1
+    if 'iteration' in checkpoint_dict.keys():
+        iteration = checkpoint_dict['iteration']
+    if 'learning_rate' in checkpoint_dict.keys():
+        learning_rate = checkpoint_dict['learning_rate']
+    if optimizer is not None and 'optimizer' in checkpoint_dict.keys():
+        optimizer.load_state_dict(checkpoint_dict['optimizer'])
+    if scheduler is not None and 'scheduler' in checkpoint_dict.keys():
+        scheduler.load_state_dict(checkpoint_dict['scheduler'])
+    saved_state_dict = checkpoint_dict['model']
+    if hasattr(model, 'module'):
+        state_dict = model.module.state_dict()
+    else:
+        state_dict = model.state_dict()
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        try:
+            new_state_dict[k] = saved_state_dict[k]
+        except:
+            print("%s is not in the checkpoint" % k)
+            new_state_dict[k] = v
+    if hasattr(model, 'module'):
+        model.module.load_state_dict(new_state_dict)
+    else:
+        model.load_state_dict(new_state_dict)
+    logger.info("Loaded checkpoint '{}' (iteration {})" .format(
+        checkpoint_path, iteration))
 
-  return model, optimizer, scheduler, learning_rate, iteration
+    return model, optimizer, scheduler, learning_rate, iteration
 
 
 def save_checkpoint(model, optimizer, scheduler, learning_rate, iteration, checkpoint_path):
-  logger.info("Saving model and optimizer state at iteration {} to {}".format(
-    iteration, checkpoint_path))
-  if hasattr(model, 'module'):
-    state_dict = model.module.state_dict()
-  else:
-    state_dict = model.state_dict()
-  torch.save({'model': state_dict,
-              'iteration': iteration,
-              'optimizer': optimizer.state_dict(),
-              'scheduler': scheduler.state_dict(),
-              'learning_rate': learning_rate}, checkpoint_path)
+    logger.info("Saving model and optimizer state at iteration {} to {}".format(
+        iteration, checkpoint_path))
+    if hasattr(model, 'module'):
+        state_dict = model.module.state_dict()
+    else:
+        state_dict = model.state_dict()
+    torch.save({'model': state_dict,
+                'iteration': iteration,
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'learning_rate': learning_rate}, checkpoint_path)
+
 
 def latest_checkpoint_path(dir_path, regex="G_*.pth"):
-  f_list = glob.glob(os.path.join(dir_path, regex))
-  f_list.sort(key=lambda f: int("".join(filter(str.isdigit, f))))
-  x = f_list[-1]
-  print(x)
-  return x
+    f_list = glob.glob(os.path.join(dir_path, regex))
+    f_list.sort(key=lambda f: int("".join(filter(str.isdigit, f))))
+    x = f_list[-1]
+    print(x)
+    return x
+
 
 def get_logger(model_dir, filename="train.log"):
-  global logger
-  logger = logging.getLogger(os.path.basename(model_dir))
-  logger.setLevel(logging.DEBUG)
-  
-  formatter = logging.Formatter("%(asctime)s\t%(name)s\t%(levelname)s\t%(message)s")
-  if not os.path.exists(model_dir):
-    os.makedirs(model_dir)
-  h = logging.FileHandler(os.path.join(model_dir, filename))
-  h.setLevel(logging.DEBUG)
-  h.setFormatter(formatter)
-  logger.addHandler(h)
-  return logger
+    global logger
+    logger = logging.getLogger(os.path.basename(model_dir))
+    logger.setLevel(logging.DEBUG)
+
+    formatter = logging.Formatter("%(asctime)s\t%(name)s\t%(levelname)s\t%(message)s")
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir)
+    h = logging.FileHandler(os.path.join(model_dir, filename))
+    h.setLevel(logging.DEBUG)
+    h.setFormatter(formatter)
+    logger.addHandler(h)
+    return logger
+
 
 def plot_emocoor_to_numpy(pitch, pitch_pred):
-  global MATPLOTLIB_FLAG
-  if not MATPLOTLIB_FLAG:
-    import matplotlib
-    matplotlib.use("Agg")
-    MATPLOTLIB_FLAG = True
-    mpl_logger = logging.getLogger('matplotlib')
-    mpl_logger.setLevel(logging.WARNING)
+    global MATPLOTLIB_FLAG
+    if not MATPLOTLIB_FLAG:
+        import matplotlib
+        matplotlib.use("Agg")
+        MATPLOTLIB_FLAG = True
+        mpl_logger = logging.getLogger('matplotlib')
+        mpl_logger.setLevel(logging.WARNING)
 
-  import matplotlib.pylab as plt
-  import numpy as np
-  
-  fig, ax = plt.subplots()
-  ax.scatter(pitch[:, 0], pitch[:, 1], label="Original")
-  ax.scatter(pitch_pred[:, 0], pitch_pred[:, 1], label="Prediction")
-  plt.tight_layout()
-  plt.legend(loc="upper left")
+    import matplotlib.pylab as plt
+    import numpy as np
 
-  fig.canvas.draw()
-  data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-  data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-  plt.close()
-  return data
+    fig, ax = plt.subplots()
+    ax.scatter(pitch[:, 0], pitch[:, 1], label="Original")
+    ax.scatter(pitch_pred[:, 0], pitch_pred[:, 1], label="Prediction")
+    plt.tight_layout()
+    plt.legend(loc="upper left")
+
+    fig.canvas.draw()
+    data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
+    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    plt.close()
+    return data
+
 
 def summarize(writer, global_step, scalars={}, histograms={}, images={}):
-  for k, v in scalars.items():
-    writer.add_scalar(k, v, global_step)
-  for k, v in histograms.items():
-    writer.add_histogram(k, v, global_step)
-  for k, v in images.items():
-    writer.add_image(k, v, global_step, dataformats='HWC')
+    for k, v in scalars.items():
+        writer.add_scalar(k, v, global_step)
+    for k, v in histograms.items():
+        writer.add_histogram(k, v, global_step)
+    for k, v in images.items():
+        writer.add_image(k, v, global_step, dataformats='HWC')
+
 
 def load_wav_to_torch(full_path):
-  sampling_rate, data = read(full_path)
-  return torch.FloatTensor(data.astype(np.float32)), sampling_rate
+    sampling_rate, data = read(full_path)
+    return torch.FloatTensor(data.astype(np.float32)), sampling_rate
+
 
 def get_hparams_from_file(config_path):
-  with open(config_path, "r") as f:
-    data = f.read()
-  config = json.loads(data)
+    with open(config_path, "r") as f:
+        data = f.read()
+    config = json.loads(data)
 
-  hparams =HParams(**config)
-  return hparams
+    hparams = HParams(**config)
+    return hparams
+
 
 def get_hparams_from_dir(model_dir):
-  config_save_path = os.path.join(model_dir, "config.json")
-  with open(config_save_path, "r") as f:
-    data = f.read()
-  config = json.loads(data)
+    config_save_path = os.path.join(model_dir, "config.json")
+    with open(config_save_path, "r") as f:
+        data = f.read()
+    config = json.loads(data)
 
-  hparams =HParams(**config)
-  hparams.model_dir = model_dir
-  return hparams
+    hparams = HParams(**config)
+    hparams.model_dir = model_dir
+    return hparams
+
 
 class HParams():
-  def __init__(self, **kwargs):
-    for k, v in kwargs.items():
-      if type(v) == dict:
-        v = HParams(**v)
-      self[k] = v
-    
-  def keys(self):
-    return self.__dict__.keys()
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            if type(v) == dict:
+                v = HParams(**v)
+            self[k] = v
 
-  def items(self):
-    return self.__dict__.items()
+    def keys(self):
+        return self.__dict__.keys()
 
-  def values(self):
-    return self.__dict__.values()
+    def items(self):
+        return self.__dict__.items()
 
-  def __len__(self):
-    return len(self.__dict__)
+    def values(self):
+        return self.__dict__.values()
 
-  def __getitem__(self, key):
-    return getattr(self, key)
+    def __len__(self):
+        return len(self.__dict__)
 
-  def __setitem__(self, key, value):
-    return setattr(self, key, value)
+    def __getitem__(self, key):
+        return getattr(self, key)
 
-  def __contains__(self, key):
-    return key in self.__dict__
+    def __setitem__(self, key, value):
+        return setattr(self, key, value)
 
-  def __repr__(self):
-    return self.__dict__.__repr__()
+    def __contains__(self, key):
+        return key in self.__dict__
+
+    def __repr__(self):
+        return self.__dict__.__repr__()
+
 
 def generate_random_code(length=3):
     chars = string.ascii_uppercase + string.digits
     return ''.join(random.choices(chars, k=length))
 
+
 def seed_from_path(path):
     h = hashlib.md5(path.encode()).hexdigest()
-    seed = int(h[:8], 16) 
+    seed = int(h[:8], 16)
     random.seed(seed)
     np.random.seed(seed)
+
 
 def cut_pad_sample_torchaudio(data, sample_rate, desired_length, pad_types='zero', right_pad_shift_sec=0.04):
     fade_samples_ratio = 6
@@ -452,7 +482,7 @@ def cut_pad_sample_torchaudio(data, sample_rate, desired_length, pad_types='zero
 
     if data.shape[-1] > target_duration:
         max_start = data.shape[-1] - target_duration
-        start = 0 #np.random.randint(0, max_start + 1)  # random start index
+        start = 0  # np.random.randint(0, max_start + 1)  # random start index
         data = data[..., start:start + target_duration]
     else:
         if pad_types == 'zero':
@@ -476,6 +506,7 @@ def apply_fade_in(audio, sr, sec=0.08):
     audio[:fade_len] *= fade
     return audio
 
+
 def apply_fade_out(audio, sr, sec=0.08):
     fade_len = int(sr * sec)
     fade_len = min(fade_len, len(audio))
@@ -483,11 +514,13 @@ def apply_fade_out(audio, sr, sec=0.08):
     audio[-fade_len:] *= fade
     return audio
 
+
 def speed_perturb(audio, factor_min=0.9, factor_max=1.1):
     factor = random.uniform(factor_min, factor_max)
     new_len = int(len(audio) / factor)
     out = resample(audio, new_len)
     return np.clip(out, -1.0, 1.0)
+
 
 def gain_perturb(audio, db_range):
     low, high = db_range
@@ -496,11 +529,13 @@ def gain_perturb(audio, db_range):
     out = audio * gain
     return np.clip(out, -1.0, 1.0)
 
+
 def generate_gap(sr, low=0.08, high=0.12, noise_gain=0.0001):
     gap_sec = random.uniform(low, high)
     gap_len = int(sr * gap_sec)
     noise = np.random.randn(gap_len) * noise_gain
     return np.clip(noise, -1.0, 1.0)
+
 
 def build_tail_segment(audio, sr):
     tail_gap = generate_gap(sr, low=0.15, high=0.4)
@@ -509,6 +544,7 @@ def build_tail_segment(audio, sr):
     tail = speed_perturb(tail)
     tail = gain_perturb(tail, (1.0, 6.0))
     return np.concatenate([tail_gap, tail], axis=0)
+
 
 def augment_and_merge(audio_original, path, sr, gain_db_set=[(-5.0, 0.0)]):
     seed_from_path(path)
@@ -544,37 +580,39 @@ def augment_and_merge(audio_original, path, sr, gain_db_set=[(-5.0, 0.0)]):
     return merged
 
 
-def load_audio_sample(file_path, db_sample_rate, is_saming_length, desired_length, fade_samples_ratio=6, pad_types='zero'):
+def load_audio_sample(
+        file_path, db_sample_rate, is_saming_length, desired_length, fade_samples_ratio=6, pad_types='zero'):
     data, sample_rate = librosa.load(file_path, sr=db_sample_rate)
     if sample_rate != db_sample_rate:
         raise ValueError("{} SR doesn't match target {} SR".format(sample_rate, db_sample_rate))
-    
+
     if is_saming_length:
-      data = torch.from_numpy(data).unsqueeze(0)
-      fade_samples = int(sample_rate / fade_samples_ratio)
-      fade = T.Fade(fade_in_len=fade_samples, fade_out_len=fade_samples, fade_shape='linear')
-      data = fade(data)
-      data = cut_pad_sample_torchaudio(data, sample_rate, desired_length, pad_types=pad_types)
+        data = torch.from_numpy(data).unsqueeze(0)
+        fade_samples = int(sample_rate / fade_samples_ratio)
+        fade = T.Fade(fade_in_len=fade_samples, fade_out_len=fade_samples, fade_shape='linear')
+        data = fade(data)
+        data = cut_pad_sample_torchaudio(data, sample_rate, desired_length, pad_types=pad_types)
 
     if pad_types == "synthesis":
-      data = augment_and_merge(data, path=file_path, sr=sample_rate)
-      
+        data = augment_and_merge(data, path=file_path, sr=sample_rate)
+
     return data if torch.is_tensor(data) else torch.from_numpy(data).unsqueeze(0)
+
 
 def plot_spectrogram_to_numpy(spectrogram):
     global MATPLOTLIB_FLAG
     if not MATPLOTLIB_FLAG:
-      import matplotlib
-      matplotlib.use("Agg")
-      MATPLOTLIB_FLAG = True
-      mpl_logger = logging.getLogger('matplotlib')
-      mpl_logger.setLevel(logging.WARNING)
+        import matplotlib
+        matplotlib.use("Agg")
+        MATPLOTLIB_FLAG = True
+        mpl_logger = logging.getLogger('matplotlib')
+        mpl_logger.setLevel(logging.WARNING)
     import matplotlib.pylab as plt
     import numpy as np
 
     fig, ax = plt.subplots()
     im = ax.imshow(spectrogram, aspect="auto", origin="lower",
-                    interpolation='none')
+                   interpolation='none')
     plt.colorbar(im, ax=ax)
     plt.xlabel("Frames")
     plt.ylabel("Channels")
@@ -592,6 +630,7 @@ def plot_spectrogram_to_numpy(spectrogram):
     plt.close()
     return torch.from_numpy(buf.copy()).permute(2, 0, 1).float() / 255.0
 
+
 def smoothing_tensorboard(values, weight=0.9):
     """EMA smoothing of a curve."""
     smoothed = []
@@ -602,10 +641,12 @@ def smoothing_tensorboard(values, weight=0.9):
         last = smoothed_val
     return smoothed
 
+
 def extract_scalar(log_dir, tag='loss/g/total'):
     ea = event_accumulator.EventAccumulator(log_dir)
     ea.Reload()
     return ea.Scalars(tag)
+
 
 def plot_loss_from_tensorboard(best_lost, train_log_dir, val_log_dir, tag='loss/g/total', save_path='loss_plot.png'):
     train_events = extract_scalar(train_log_dir, tag)
@@ -644,6 +685,7 @@ def plot_loss_from_tensorboard(best_lost, train_log_dir, val_log_dir, tag='loss/
     plt.savefig(save_path)
     plt.close()
 
+
 def orthogonality_loss(d_emb, s_emb):
     # penalize correlation between disease and speaker embedding per-sample
     # normalize to remove scale effect
@@ -652,6 +694,7 @@ def orthogonality_loss(d_emb, s_emb):
     # dot product per sample then squared mean
     dots = torch.sum(d * s, dim=1)  # (B,)
     return torch.mean(dots * dots)
+
 
 def compute_class_weights(df, target_col, device="cuda"):
     disease_codes = df[target_col].unique().tolist()
@@ -667,6 +710,77 @@ def compute_class_weights(df, target_col, device="cuda"):
     return torch.tensor(weights_list, device=device, dtype=torch.float)
 
 
+def compute_spectrogram_stats_from_dataset(df, hparams, pickle_path="spec_stats.pickle"):
+    """
+    Compute mean and std statistics on spectrograms/melspectrograms
+    by reusing the CoughDatasets class logic.
+    This ensures consistency - any changes to CoughDatasets will automatically
+    be reflected in the stats computation.
+    """
+    if os.path.exists(pickle_path):
+        with open(pickle_path, "rb") as f:
+            return pickle.load(f)
+
+    # Import here to avoid circular dependency
+    from cough_datasets import CoughDatasets
+    
+    # Create a modified hparams for stats computation:
+    # - Disable augmentation
+    # - Disable normalization
+    # - Keep everything else the same
+    stats_hparams = type('StatsHParams', (), {})()
+    for key in dir(hparams):
+        if not key.startswith('_'):
+            setattr(stats_hparams, key, getattr(hparams, key))
+    
+    # Disable augmentation and normalization for clean stats
+    stats_hparams.augment_data = False
+    stats_hparams.augment_rawboost = False
+    stats_hparams.mean_std_norm = False
+    stats_hparams.max_wav_value = None
+    stats_hparams.add_noise = False
+    stats_hparams.mix_audio = False
+    stats_hparams.multimask_augment = False
+    stats_hparams.train = False
+    
+    # Create a temporary dataset for stats computation
+    # We don't need wav_stats_path since we're not normalizing
+    temp_dataset = CoughDatasets(
+        df.values, 
+        stats_hparams, 
+        train=False,
+        wav_stats_path=None
+    )
+    
+    means, stds = [], []
+    
+    for idx in tqdm(range(len(temp_dataset)), desc="Computing Spectrogram Stats", unit="sample"):
+        try:
+            # Get the processed audio (spectrogram) without augmentation
+            item = temp_dataset[idx]
+            spec = item[1]  # wav1 is at index 1
+            
+            # Remove any extra dimensions and compute stats
+            if isinstance(spec, torch.Tensor):
+                means.append(spec.mean().item())
+                stds.append(spec.std().item())
+        except Exception as e:
+            print(f"Error processing index {idx}: {e}")
+            continue
+    
+    if len(means) == 0:
+        raise ValueError("No valid samples found for computing statistics")
+    
+    stats = {
+        "mean_db": float(np.mean(means)),
+        "std_db": float(np.mean(stds))
+    }
+    
+    with open(pickle_path, "wb") as f:
+        pickle.dump(stats, f)
+    
+    return stats
+
 def compute_wav_stats(df, path_col, pickle_path="wav_stats.pickle"):
     if os.path.exists(pickle_path):
         with open(pickle_path, "rb") as f:
@@ -680,6 +794,7 @@ def compute_wav_stats(df, path_col, pickle_path="wav_stats.pickle"):
             continue
         try:
             audio, _ = librosa.load(path, sr=None, mono=True)
+            audio = audio - np.mean(audio)
             means.append(np.mean(audio))
             stds.append(np.std(audio))
         except Exception:
@@ -706,16 +821,28 @@ def many_loss_category(pred, lab, loss_type="CE", test=False, weights=None):
         return f1_micro, f1_macro, accuracy
 
     if loss_type == "CE":
-        criterion = torch.nn.CrossEntropyLoss(weight=weights)
+        criterion = torch.nn.CrossEntropyLoss()  # weight=weights
         loss = criterion(pred, lab)
         return [loss]
     elif loss_type == "BCE":
         if len(lab.shape) == 2:
-           lab = lab.squeeze(-1)
+            # lab = lab.squeeze(-1)
+            lab = torch.argmax(lab, dim=1)
+            lab = (lab != 0).float() # Clustering
+
+        if len(pred.shape) == 2:
+            pred = pred.squeeze(-1)
+
         criterion = torch.nn.BCEWithLogitsLoss()
         loss = criterion(pred, lab)
         return [loss]
     elif loss_type == "KLDivLoss":
         criterion = losses.KLDivLoss()
+        loss = criterion(pred, lab)
+        return [loss]
+    elif loss_type == "HardTripletLoss":
+        criterion = losses.HardTripletLoss(margin=0.1).cuda()
+        if lab.dim() == 2:
+            lab = torch.argmax(lab, dim=1).long()
         loss = criterion(pred, lab)
         return [loss]

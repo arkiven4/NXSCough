@@ -4,35 +4,37 @@
     "log_interval": 20,
     "seed": 1234,
     "epochs": 10000,
-    "learning_rate": 1e-4,
+    "learning_rate": 5e-4,
     "betas": [0.8, 0.99],
     "eps": 1e-9,
     "lr_decay": 0.999875,
     "batch_size": 32,
     "loss_function": "CE",
     "use_Kfold": false,
-    "mae_training": true
+    "mae_training": true,
+    "ssccl_training": false
   },
   "data": {
     "max_wav_value": false,
     "mean_std_norm": true,
     
     "sampling_rate": 16000,
-    "filter_length": 1024,
+    "filter_length": 512,
     "hop_length": 256,
-    "win_length": 1024,
+    "win_length": 512,
     "n_mel_channels": 64,
     "mel_fmin": 0.0,
     "mel_fmax": 8000.0,
 
     "saming_length": false,
-    "desired_length": 0.5,
+    "desired_length": 0.55,
     "fade_samples_ratio": 16,
-    "pad_types": "synthesis",
+    "pad_types": "zeros",
     "rezize_size": [64, 256],
 
     "acoustic_feature": true,
     "feature_type": "melspectogram",
+    "delta_feature": false,
 
     "multimask_augment": false,
     "tau": 0.10,
@@ -40,16 +42,18 @@
     "num_masks": 4,
 
     "augment_data": true,
-    "augment_rawboost": true,
+    "augment_prob": 0.4,
+    "augment_rawboost": false,
     "add_noise": false,
 
+    "cough_detection": true,
     "mix_audio": false,
     "many_class": 2,
 
     "db_path": "",
-    "metadata_csv": "metadata_mae.csv",
-    "target_column": "disease_status",
-    "column_order": ["path_file", "disease_status", "sex", "participant"]
+    "metadata_csv": "cough_ssl.csv",
+    "target_column": "label",
+    "column_order": ["path_file", "label", "index_start", "index_end", "source"]
   }, 
   "model": {
     "pooling_model": "OPERAGT_MAE",

@@ -253,39 +253,58 @@ class CustomWalvmProjector(nn.Module):
     
 
 class NetVLAD(nn.Module):
-    def __init__(self, feat_dim, num_clusters=8, normalize_input=True):
-        super().__init__()
-        self.feat_dim = feat_dim
+    """NetVLAD layer implementation"""
+    # https://github.dev/lyakaap/NetVLAD-pytorch/blob/master/netvlad.py
+    def __init__(self, num_clusters=64, dim=128, alpha=100.0,
+                 normalize_input=True):
+        """
+        Args:
+            num_clusters : int
+                The number of clusters
+            dim : int
+                Dimension of descriptors
+            alpha : float
+                Parameter of initialization. Larger value is harder assignment.
+            normalize_input : bool
+                If true, descriptor-wise L2 normalization is applied to input.
+        """
+        super(NetVLAD, self).__init__()
         self.num_clusters = num_clusters
+        self.dim = dim
+        self.alpha = alpha
         self.normalize_input = normalize_input
+        self.conv = nn.Conv2d(dim, num_clusters, kernel_size=(1, 1), bias=True)
+        self.centroids = nn.Parameter(torch.rand(num_clusters, dim))
+        self._init_params()
 
-        self.clusters = nn.Parameter(torch.randn(num_clusters, feat_dim))
-        self.assignment = nn.Linear(feat_dim, num_clusters, bias=True)
+    def _init_params(self):
+        self.conv.weight = nn.Parameter(
+            (2.0 * self.alpha * self.centroids).unsqueeze(-1).unsqueeze(-1)
+        )
+        self.conv.bias = nn.Parameter(
+            - self.alpha * self.centroids.norm(dim=1)
+        )
 
-    def forward(self, x, lengths=None):
-        # x: [B, T, D]
-        B, T, D = x.shape
+    def forward(self, x):
+        B, C = x.shape[:2]
 
         if self.normalize_input:
-            x = F.normalize(x, p=2, dim=-1)
+            x = F.normalize(x, p=2, dim=1)  # across descriptor dim
 
-        soft_assign = self.assignment(x)  # [B, T, K]
+        # soft-assignment
+        soft_assign = self.conv(x).view(B, self.num_clusters, -1)
+        soft_assign = F.softmax(soft_assign, dim=1)
 
-        if lengths is not None:
-            mask = torch.arange(T, device=x.device).unsqueeze(0) < lengths.unsqueeze(1)
-            mask = mask.float()  # [B, T, 1]
-            soft_assign = soft_assign.masked_fill(mask.unsqueeze(-1) == 0, -1e9)
+        x_flatten = x.view(B, C, -1)
+        
+        # calculate residuals to each clusters
+        residual = x_flatten.expand(self.num_clusters, -1, -1, -1).permute(1, 0, 2, 3) - \
+            self.centroids.expand(x_flatten.size(-1), -1, -1).permute(1, 2, 0).unsqueeze(0)
+        residual *= soft_assign.unsqueeze(2)
+        vlad = residual.sum(dim=-1)
 
-        soft_assign = F.softmax(soft_assign, dim=-1)  # [B, T, K]
-
-        x_exp = x.unsqueeze(2)                     # [B, T, 1, D]
-        c_exp = self.clusters.unsqueeze(0).unsqueeze(0)  # [1, 1, K, D]
-
-        residual = x_exp - c_exp                   # [B, T, K, D]
-        vlad = torch.sum(soft_assign.unsqueeze(-1) * residual, dim=1)  # [B, K, D]
-
-        vlad = F.normalize(vlad, p=2, dim=-1)
-        vlad = vlad.view(B, -1)                     # [B, K*D]
-        vlad = F.normalize(vlad, p=2, dim=-1)
+        vlad = F.normalize(vlad, p=2, dim=2)  # intra-normalization
+        vlad = vlad.view(x.size(0), -1)  # flatten
+        vlad = F.normalize(vlad, p=2, dim=1)  # L2 normalize
 
         return vlad
