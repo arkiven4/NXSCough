@@ -201,7 +201,7 @@ class CoughClassificationRunner(L.LightningModule):
         # -----------------------------------------
         # Confusion Matrix + metrics
         # -----------------------------------------
-        cm = confusion_matrix(labels, preds)
+        cm = confusion_matrix(labels, preds, labels=[0, 1])
         n_classes = cm.shape[0]
 
         # sanity check: binary only
@@ -222,6 +222,8 @@ class CoughClassificationRunner(L.LightningModule):
         # -----------------------------------------
         # AUROC + KPI pAUROC (≥80% sens, ≥60% spec)
         # -----------------------------------------
+        #unique_labels = np.unique(labels)
+        #if unique_labels.size == 2:
         if n_classes == 2:
             auroc = roc_auc_score(labels, probs)
 

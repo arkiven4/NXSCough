@@ -3,9 +3,14 @@ output/*/
 data/
 logs_resulthesis/
 logs_newest/
+logs_phase1/
+logs_*/
 logs/
+logs2/
 logs_old/
 logs_old2/
+logs_thesisresult/
+logs_resnet/
 lightning_logs/
 preprocessed_data
 *.zip

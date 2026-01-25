@@ -12,6 +12,79 @@ from typing import Optional
 
 from timm.models.layers import to_2tuple
 
+
+class ReLU(nn.Hardtanh):
+
+    def __init__(self, inplace=False):
+        super(ReLU, self).__init__(0.0, 20.0, inplace)
+
+    def __repr__(self):
+        inplace_str = 'inplace' if self.inplace else ''
+        return self.__class__.__name__ + ' (' \
+            + inplace_str + ')'
+
+
+def conv1x1(in_planes, out_planes, stride=1):
+    "1x1 convolution without padding"
+    return nn.Conv2d(in_planes,
+                     out_planes,
+                     kernel_size=1,
+                     stride=stride,
+                     padding=0,
+                     bias=False)
+
+
+def conv3x3(in_planes, out_planes, stride=1):
+    "3x3 convolution with padding"
+    return nn.Conv2d(in_planes,
+                     out_planes,
+                     kernel_size=3,
+                     stride=stride,
+                     padding=1,
+                     bias=False)
+
+###########################################
+# Commons
+###########################################
+
+class AttentiveStatisticsPooling(nn.Module):
+    """
+    Attentive Statistics Pooling (ASP)
+
+    Input:
+        x: Tensor of shape (B, C, T)
+    Output:
+        pooled: Tensor of shape (B, 2C)
+    """
+    def __init__(self, channels, hidden_channels=128, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+
+        self.attention = nn.Sequential(
+            nn.Conv1d(channels, hidden_channels, kernel_size=1),
+            nn.ReLU(),
+            nn.BatchNorm1d(hidden_channels),
+            nn.Conv1d(hidden_channels, channels, kernel_size=1)
+        )
+
+    def forward(self, x):
+        # x: (B, C, T)
+
+        # Compute attention scores
+        attn_scores = self.attention(x)          # (B, C, T)
+        attn_weights = F.softmax(attn_scores, dim=2)
+
+        # Weighted mean
+        mean = torch.sum(attn_weights * x, dim=2)
+
+        # Weighted standard deviation
+        var = torch.sum(attn_weights * (x - mean.unsqueeze(2))**2, dim=2)
+        std = torch.sqrt(var.clamp(min=self.eps))
+
+        # Concatenate statistics
+        pooled = torch.cat([mean, std], dim=1)   # (B, 2C)
+        return pooled, attn_weights
+
 ###########################################
 # OPERAGT_MAE
 ###########################################
@@ -268,6 +341,88 @@ class TSTP(nn.Module):
         self.out_dim = self.in_dim * 2
         return self.out_dim
 
+class Resnet34Manual(nn.Module):
+    def __init__(self, feature_dim):
+        super(Resnet34Manual, self).__init__()
+
+        block = BasicBlock
+        num_blocks = [3, 4, 6, 3]
+        m_channels = 32
+
+        def _downsample_freq(h: int, stages: int = 3) -> int:
+            # Compute frequency downsampling after 3 stride-2 stages precisely:
+            # H_next = floor((H - 1) / 2) + 1 for k=3, p=1, s=2
+            for _ in range(stages):
+                h = (h - 1) // 2 + 1
+            return h
+        
+        self.in_planes = m_channels
+        self.feature_dim = feature_dim
+        self.stats_dim = _downsample_freq(feature_dim) * m_channels * 8
+
+        self.conv1 = nn.Conv2d(1,
+                               m_channels,
+                               kernel_size=3,
+                               stride=1,
+                               padding=1,
+                               bias=False)
+        self.bn1 = nn.BatchNorm2d(m_channels)
+        self.layer1 = self._make_layer(block,
+                                       m_channels,
+                                       num_blocks[0],
+                                       stride=1)
+        self.layer2 = self._make_layer(block,
+                                       m_channels * 2,
+                                       num_blocks[1],
+                                       stride=2)
+        self.layer3 = self._make_layer(block,
+                                       m_channels * 4,
+                                       num_blocks[2],
+                                       stride=2)
+        self.layer4 = self._make_layer(block,
+                                       m_channels * 8,
+                                       num_blocks[3],
+                                       stride=2)
+        self.pool = TSTP(in_dim=self.stats_dim * block.expansion)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x, tabular_ids=None, **kwargs):
+        """
+        x: (B, n_mels, T) mel-spectrogram frames
+        """
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)  # torch.Size([128, 256, 10, 7])
+        stats = self.pool(out)  # torch.Size([128, 5120])
+        return stats
+
+class TemporalStatsPooling(nn.Module):
+    def __init__(self, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Tensor of shape (B, T, D)
+
+        Returns:
+            Tensor of shape (B, 2D) -> [mean | std]
+        """
+        mean = x.mean(dim=1)
+        var = x.var(dim=1, unbiased=False)
+        std = torch.sqrt(var + self.eps)
+
+        return torch.cat([mean, std], dim=-1)
 # -----------------------------
 # Cross-attention module
 # -----------------------------

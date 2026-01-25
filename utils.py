@@ -580,8 +580,7 @@ def augment_and_merge(audio_original, path, sr, gain_db_set=[(-5.0, 0.0)]):
     return merged
 
 
-def load_audio_sample(
-        file_path, db_sample_rate, is_saming_length, desired_length, fade_samples_ratio=6, pad_types='zero'):
+def load_audio_sample(file_path, db_sample_rate, is_saming_length, desired_length, fade_samples_ratio=6, pad_types='zero', train=False):
     data, sample_rate = librosa.load(file_path, sr=db_sample_rate)
     if sample_rate != db_sample_rate:
         raise ValueError("{} SR doesn't match target {} SR".format(sample_rate, db_sample_rate))
@@ -590,11 +589,55 @@ def load_audio_sample(
         data = torch.from_numpy(data).unsqueeze(0)
         fade_samples = int(sample_rate / fade_samples_ratio)
         fade = T.Fade(fade_in_len=fade_samples, fade_out_len=fade_samples, fade_shape='linear')
-        data = fade(data)
         data = cut_pad_sample_torchaudio(data, sample_rate, desired_length, pad_types=pad_types)
-
+        data = fade(data)
+        
     if pad_types == "synthesis":
         data = augment_and_merge(data, path=file_path, sr=sample_rate)
+
+    # Random Centering Coughs
+    data = data.reshape(-1)
+    target_len = int(1.0 * sample_rate)
+    remaining = target_len - int(desired_length * sample_rate)
+
+    # center padding baseline
+    center_left = remaining // 2
+    center_right = remaining - center_left
+
+    if train:
+        # jitter window (±15% of total padding)
+        max_jitter = int(0.15 * remaining)
+
+        jitter = torch.randint(
+            low=-max_jitter,
+            high=max_jitter + 1,
+            size=(1,),
+            device=data.device
+        ).item()
+
+        left_pad_len = center_left + jitter
+        right_pad_len = remaining - left_pad_len
+
+        # safety clamp
+        left_pad_len = max(0, left_pad_len)
+        right_pad_len = max(0, right_pad_len)
+
+        # low-energy noise padding
+        noise_scale = 1e-4
+        left_pad = torch.randn(left_pad_len, device=data.device) * noise_scale
+        right_pad = torch.randn(right_pad_len, device=data.device) * noise_scale
+    else:
+        # validation / test: fully deterministic
+        left_pad_len = center_left
+        right_pad_len = center_right
+
+        # zero padding for strict reproducibility
+        left_pad = torch.zeros(left_pad_len, device=data.device)
+        right_pad = torch.zeros(right_pad_len, device=data.device)
+
+    # concatenate and restore shape
+    data = torch.cat([left_pad, data, right_pad], dim=0)
+    data = data.unsqueeze(0)
 
     return data if torch.is_tensor(data) else torch.from_numpy(data).unsqueeze(0)
 
@@ -710,12 +753,25 @@ def compute_class_weights(df, target_col, device="cuda"):
     return torch.tensor(weights_list, device=device, dtype=torch.float)
 
 
-def compute_spectrogram_stats_from_dataset(df, hparams, pickle_path="spec_stats.pickle"):
+def compute_spectrogram_stats_from_dataset(df, hparams, pickle_path="spec_stats.pickle", num_workers=10):
     """
     Compute mean and std statistics on spectrograms/melspectrograms
-    by reusing the CoughDatasets class logic.
+    by reusing the CoughDatasets class logic. Supports separate statistics
+    for raw, delta, and deltadelta features.
     This ensures consistency - any changes to CoughDatasets will automatically
     be reflected in the stats computation.
+    
+    Args:
+        df: DataFrame with audio file paths
+        hparams: Hyperparameters object
+        pickle_path: Path to save/load cached statistics
+        num_workers: Number of parallel workers for DataLoader (default: 8)
+    
+    Returns:
+        dict: Statistics dictionary with keys:
+            - "mean_db", "std_db": Raw feature statistics
+            - "mean_delta_db", "std_delta_db": Delta feature statistics (if enabled)
+            - "mean_deltadelta_db", "std_deltadelta_db": Deltadelta feature statistics (if enabled)
     """
     if os.path.exists(pickle_path):
         with open(pickle_path, "rb") as f:
@@ -723,6 +779,7 @@ def compute_spectrogram_stats_from_dataset(df, hparams, pickle_path="spec_stats.
 
     # Import here to avoid circular dependency
     from cough_datasets import CoughDatasets
+    from torch.utils.data import DataLoader
     
     # Create a modified hparams for stats computation:
     # - Disable augmentation
@@ -752,29 +809,101 @@ def compute_spectrogram_stats_from_dataset(df, hparams, pickle_path="spec_stats.
         wav_stats_path=None
     )
     
-    means, stds = [], []
+    # Use DataLoader with multiple workers for parallel processing
+    dataloader = DataLoader(
+        temp_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=False,
+        drop_last=False
+    )
     
-    for idx in tqdm(range(len(temp_dataset)), desc="Computing Spectrogram Stats", unit="sample"):
+    # Determine how to split features based on flags
+    has_delta = getattr(stats_hparams, 'delta_feature', False)
+    has_deltadelta = getattr(stats_hparams, 'deltadelta_feature', False)
+    
+    # Initialize lists for each feature component
+    means_raw, stds_raw = [], []
+    means_delta, stds_delta = [], []
+    means_deltadelta, stds_deltadelta = [], []
+    
+    for batch in tqdm(dataloader, desc="Computing Spectrogram Stats", unit="batch"):
         try:
             # Get the processed audio (spectrogram) without augmentation
-            item = temp_dataset[idx]
-            spec = item[1]  # wav1 is at index 1
+            spec = batch[1]  # wav1 is at index 1
             
             # Remove any extra dimensions and compute stats
             if isinstance(spec, torch.Tensor):
-                means.append(spec.mean().item())
-                stds.append(spec.std().item())
+                # spec shape: [batch, channels, features, time_steps]
+                # We split along the feature dimension (dim=2)
+                # Flatten to simplify: [batch * channels * time_steps, features]
+                spec_flat = spec.permute(0, 1, 3, 2).reshape(-1, spec.shape[2])  # [B*C*T, F]
+                
+                # Determine split strategy based on flags
+                if has_delta and has_deltadelta:
+                    # Split into 3 parts: raw, delta, deltadelta
+                    # Assuming feature dimension can be divided by 3
+                    num_features = spec_flat.shape[1]
+                    if num_features % 3 != 0:
+                        print(f"Warning: Feature dimension {num_features} not divisible by 3")
+                        continue
+                    
+                    split_size = num_features // 3
+                    spec_raw = spec_flat[:, :split_size]
+                    spec_delta = spec_flat[:, split_size:2*split_size]
+                    spec_deltadelta = spec_flat[:, 2*split_size:]
+                    
+                    means_raw.append(spec_raw.mean().item())
+                    stds_raw.append(spec_raw.std().item())
+                    means_delta.append(spec_delta.mean().item())
+                    stds_delta.append(spec_delta.std().item())
+                    means_deltadelta.append(spec_deltadelta.mean().item())
+                    stds_deltadelta.append(spec_deltadelta.std().item())
+                    
+                elif has_delta and not has_deltadelta:
+                    # Split into 2 parts: raw, delta
+                    num_features = spec_flat.shape[1]
+                    if num_features % 2 != 0:
+                        print(f"Warning: Feature dimension {num_features} not divisible by 2")
+                        continue
+                    
+                    split_size = num_features // 2
+                    spec_raw = spec_flat[:, :split_size]
+                    spec_delta = spec_flat[:, split_size:]
+                    
+                    means_raw.append(spec_raw.mean().item())
+                    stds_raw.append(spec_raw.std().item())
+                    means_delta.append(spec_delta.mean().item())
+                    stds_delta.append(spec_delta.std().item())
+                    
+                else:
+                    # Only raw features (no delta/deltadelta)
+                    means_raw.append(spec_flat.mean().item())
+                    stds_raw.append(spec_flat.std().item())
+                    
         except Exception as e:
-            print(f"Error processing index {idx}: {e}")
+            print(f"Error processing batch: {e}")
             continue
     
-    if len(means) == 0:
+    if len(means_raw) == 0:
         raise ValueError("No valid samples found for computing statistics")
     
+    # Build stats dictionary
     stats = {
-        "mean_db": float(np.mean(means)),
-        "std_db": float(np.mean(stds))
+        "mean_db": float(np.mean(means_raw)),
+        "std_db": float(np.mean(stds_raw))
     }
+    
+    # Add delta stats if enabled
+    if has_delta and len(means_delta) > 0:
+        stats["mean_delta_db"] = float(np.mean(means_delta))
+        stats["std_delta_db"] = float(np.mean(stds_delta))
+    
+    # Add deltadelta stats if enabled
+    if has_deltadelta and len(means_deltadelta) > 0:
+        stats["mean_deltadelta_db"] = float(np.mean(means_deltadelta))
+        stats["std_deltadelta_db"] = float(np.mean(stds_deltadelta))
     
     with open(pickle_path, "wb") as f:
         pickle.dump(stats, f)

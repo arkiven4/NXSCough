@@ -308,3 +308,63 @@ class NetVLAD(nn.Module):
         vlad = F.normalize(vlad, p=2, dim=1)  # L2 normalize
 
         return vlad
+
+class BasicBlockRes2Net(nn.Module):
+    expansion = 2
+    def __init__(self, in_planes, planes, stride=1, baseWidth=32, scale=2):
+        super(BasicBlockRes2Net, self).__init__()
+        width = int(math.floor(planes * (baseWidth / 64.0)))
+        self.conv1 = modules.conv1x1(in_planes, width * scale, stride)
+        self.bn1 = nn.BatchNorm2d(width * scale)
+        self.nums = scale - 1
+        convs = []
+        bns = []
+        for i in range(self.nums):
+            convs.append(modules.conv3x3(width, width))
+            bns.append(nn.BatchNorm2d(width))
+        self.convs = nn.ModuleList(convs)
+        self.bns = nn.ModuleList(bns)
+        self.relu = modules.ReLU(inplace=True)
+
+        self.conv3 = modules.conv1x1(width * scale, planes * self.expansion)
+        self.bn3 = nn.BatchNorm2d(planes * self.expansion)
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion * planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes,
+                          self.expansion * planes,
+                          kernel_size=1,
+                          stride=stride,
+                          bias=False), nn.BatchNorm2d(self.expansion * planes))
+        self.stride = stride
+        self.width = width
+        self.scale = scale
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        spx = torch.split(out, self.width, 1)
+        sp = spx[0]
+        for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
+            if i >= 1:
+                sp = sp + spx[i]
+            sp = conv(sp)
+            sp = self.relu(bn(sp))
+            if i == 0:
+                out = sp
+            else:
+                out = torch.cat((out, sp), 1)
+
+        out = torch.cat((out, spx[self.nums]), 1)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        residual = self.shortcut(x)
+        out += residual
+        out = self.relu(out)
+
+        return out
