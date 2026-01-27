@@ -11,6 +11,7 @@ logs_old/
 logs_old2/
 logs_thesisresult/
 logs_resnet/
+old_logs_nfft2048/
 lightning_logs/
 preprocessed_data
 *.zip

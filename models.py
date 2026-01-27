@@ -355,6 +355,7 @@ class BiLSTMClassifier(nn.Module):
         num_layers: int = 2,
         dropout: float = 0.1,
         use_tabular: bool = False,
+        fusion_type: str = "film",  # ["gating", "cross_attn", "film"]
         output_dim: int = 2, **kwargs
     ):
         super().__init__()
@@ -369,12 +370,6 @@ class BiLSTMClassifier(nn.Module):
         )
 
         self.pool = modules.TemporalStatsPooling()
-        # self.pool = nn.Sequential(
-        #     nn.Linear(hidden_size * 2, hidden_size * 2),
-        #     nn.Tanh(),
-        #     nn.Linear(hidden_size * 2, 1)
-        # )
-
         self.audio_project = nn.Sequential(
             nn.Linear(hidden_size * 4, hidden_size),  # * 2 normal, *4 TSP
             nn.ReLU(),
@@ -442,50 +437,6 @@ class BiLSTMClassifier(nn.Module):
             "disease_logits": disease_logits,
         }
 
-class BiLSTMAttClassifier(nn.Module):
-    def __init__(
-        self,
-        dummy_input,
-        feature_dim: int = 39,
-        hidden_size: int = 512,
-        num_layers: int = 2,
-        output_dim: int = 2, **kwargs
-    ):
-        super().__init__()
-
-        self.lstm = nn.LSTM(
-            input_size=feature_dim,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=0.2 if num_layers > 1 else 0.0,
-            bidirectional=True,
-            batch_first=True,
-        )
-
-        self.pool = modules.AttentiveStatisticsPooling(channels=hidden_size * 2)
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_size * 4, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, output_dim)
-        )
-
-    def forward(self, x, tabular_ids=None, **kwargs):
-        """
-        x: (B, n_mels, T) mel-spectrogram frames
-        """
-        x = x.permute(0, 2, 1)
-        audio_feat, _ = self.lstm(x)           # (B, T, 2H)
-        
-        audio_feat, attn_weights = self.pool(audio_feat.permute(0, 2, 1))
-        disease_logits = self.classifier(audio_feat)
-
-        return {
-            "disease_logits": disease_logits,
-            "attn_weights": attn_weights,
-        }
-
-
 class BiLSTMSelfAttASPClassifier(nn.Module):
     def __init__(
         self,
@@ -493,10 +444,18 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
         feature_dim: int = 39,
         hidden_size: int = 512,
         num_layers: int = 2,
-        output_dim: int = 2, **kwargs
+        output_dim: int = 2, 
+        use_tabular: bool = False,
+        fusion_type: str = "cross_attn",  # ["gating", "cross_attn", "film"]
+        **kwargs
     ):
         super().__init__()
+        
+        self.use_tabular = use_tabular
+        self.fusion_type = fusion_type
+        fusion_dim = 2048
 
+        # ========== AUDIO BACKBONE ==========
         self.lstm = nn.LSTM(
             input_size=feature_dim,
             hidden_size=hidden_size,
@@ -513,10 +472,38 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
             batch_first=True
         )
         self.norm = nn.LayerNorm(hidden_size * 2)
-
         self.pool = modules.AttentiveStatisticsPooling(channels=hidden_size * 2)
+
+        # ========== TABULAR PROJECTION ==========
+        if self.use_tabular:
+            print("------------- USE TABULAR --------------------")
+            self.tab_proj = nn.Sequential(
+                nn.Linear(4, fusion_dim),
+                nn.ReLU(),
+                nn.LayerNorm(fusion_dim)
+            )
+
+        # ========== FUSION MECHANISMS ==========
+        if self.use_tabular and fusion_type == "gating":
+            self.gate = nn.Sequential(
+                nn.Linear(fusion_dim, fusion_dim),
+                nn.Sigmoid()
+            )
+
+        if self.use_tabular and fusion_type == "film":
+            self.film = nn.Linear(fusion_dim, fusion_dim * 2)
+
+        if self.use_tabular and fusion_type == "cross_attn":
+            self.cross_attn = nn.MultiheadAttention(
+                embed_dim=fusion_dim,
+                num_heads=4,
+                batch_first=True
+            )
+            self.ca_norm = nn.LayerNorm(fusion_dim)
+
+        # ========== CLASSIFIER ==========
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_size * 4, 128),
+            nn.Linear(fusion_dim, 128),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(128, output_dim)
@@ -525,16 +512,42 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
     def forward(self, x, tabular_ids=None, **kwargs):
         """
         x: (B, n_mels, T) mel-spectrogram frames
+        tabular_ids: (B, tab_dim)
         """
+        # ===== AUDIO ENCODING =====
         x = x.permute(0, 2, 1)
         audio_feat, _ = self.lstm(x)           # (B, T, 2H)
-        
+
         self_attn_out, self_attn_weights = self.attn(audio_feat, audio_feat, audio_feat, need_weights=True)
         audio_feat = self.norm(audio_feat + self_attn_out)
         
-        audio_feat, asp_weights = self.pool(audio_feat.permute(0, 2, 1))
-        disease_logits = self.classifier(audio_feat)
+        audio_feat, asp_weights = self.pool(audio_feat.permute(0, 2, 1)) # torch.Size([128, 2048])
+        fused = audio_feat
 
+        # ===== HYBRID MODE =====
+        if self.use_tabular and tabular_ids is not None:
+            tab_feat = self.tab_proj(tabular_ids)
+
+            # ---- Dynamic Gating ----
+            if self.fusion_type == "gating":
+                alpha = self.gate(tab_feat)
+                fused = alpha * audio_feat + (1 - alpha) * tab_feat
+
+            # ---- FiLM ----
+            elif self.fusion_type == "film":
+                gamma, beta = self.film(tab_feat).chunk(2, dim=-1)
+                fused = gamma * audio_feat + beta
+
+            # ---- Cross-Attention ----
+            elif self.fusion_type == "cross_attn":
+                q = tab_feat.unsqueeze(1)     # (B, 1, D)
+                k = audio_feat.unsqueeze(1)   # (B, 1, D)
+                v = audio_feat.unsqueeze(1)
+
+                ca_out, ca_weights = self.cross_attn(q, k, v)
+                fused = self.ca_norm(audio_feat + ca_out.squeeze(1))
+
+        disease_logits = self.classifier(fused)
         return {
             "disease_logits": disease_logits,
             "self_attn_weights": self_attn_weights,
@@ -564,21 +577,12 @@ class PEFTWavLM_Try1(nn.Module):
         )
         self.backbone_model = get_peft_model(self.backbone_model, lora_config)
 
-        # self.pooling = layers.AttentiveStatisticsPooling(input_size, attention_dim=128)
-        # embed_dim = input_size * 2  # Since ASP outputs 2*input_size
-        # num_clusters = 4
-        # embed_dim = input_size * num_clusters
-        # self.pooling = layers.NetVLAD(num_clusters=num_clusters, dim=input_size, alpha=1.0)
-
-        # self.proj = nn.Sequential(
-        #     nn.LayerNorm(embed_dim),
-        #     nn.Linear(embed_dim, 1024),
-        #     nn.GELU()
-        # )
-        # self.classifier = nn.Linear(1024, output_dim)
+        self.pool = modules.AttentiveStatisticsPooling(channels=input_size)
         self.classifier = nn.Sequential(
-            nn.LayerNorm(input_size),
-            nn.Linear(input_size, 1)
+            nn.Linear(input_size * 2, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, output_dim)
         )
 
     def disabled_calc_additional_loss(self, embeddings, labels):
@@ -635,15 +639,13 @@ class PEFTWavLM_Try1(nn.Module):
         )  # .hidden_states
         features = x.last_hidden_state  # torch.Size([32, 24, 1024])
 
-        # feature_embedding = self.pooling(features, length)
-        # feature_embedding = self.pooling(features.permute(0, 2, 1).unsqueeze(-1))
-        # feature_embedding = self.proj(feature_embedding)
-        feature_embedding = features.mean(dim=1)
+        feature_embedding, asp_weights = self.pool(features.permute(0, 2, 1))
         disease_logits = self.classifier(feature_embedding)
 
         return {
             "disease_logits": disease_logits,
             "embedding": feature_embedding,
+            "asp_weights": asp_weights,
         }
     
 class PEFTQwen3_Try1(nn.Module):
@@ -703,9 +705,12 @@ class PEFTQwen3_Try1(nn.Module):
             return orig_forward(*args, **kwargs)
         base_model.forward = patched_forward
 
+        self.pool = modules.AttentiveStatisticsPooling(channels=self.audiotower_hidden_dim)
         self.classifier = nn.Sequential(
-            nn.LayerNorm(self.audiotower_hidden_dim),
-            nn.Linear(self.audiotower_hidden_dim, 1)
+            nn.Linear(self.audiotower_hidden_dim * 2, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, output_dim)
         )
 
     def after_cnn_len(self, L):
@@ -742,13 +747,15 @@ class PEFTQwen3_Try1(nn.Module):
             post_lens[-1] += delta
 
         audio_features = audio_features.split(post_lens.tolist(), dim=0)
-        # audio_features = pad_sequence(audio_features, batch_first=True) # for Attentive Pooling
-        audio_features = torch.stack([x.mean(dim=0)
-                                     for x in audio_features], dim=0)
+        audio_features = pad_sequence(audio_features, batch_first=True) # for Attentive Pooling
         audio_features = audio_features.to(torch.float32)
+        feature_embedding, asp_weights = self.pool(audio_features.permute(0, 2, 1))
+        # audio_features = torch.stack([x.mean(dim=0)
+        #                              for x in audio_features], dim=0)
 
-        disease_logits = self.classifier(audio_features)
+        disease_logits = self.classifier(feature_embedding)
 
         return {
             "disease_logits": disease_logits,
+            "asp_weights": asp_weights,
         }

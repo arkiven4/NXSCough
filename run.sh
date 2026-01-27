@@ -27,11 +27,14 @@ python train.py --init --model_name bilstmatt_gtgram --pooling_model BiLSTMSelfA
 python train.py --init --model_name bilstmatt_spectogram --pooling_model BiLSTMSelfAttASPClassifier --feature_type spectogram --feature_dim 1025 --batch_size 32 --config_path configs/general.json
 
 # SSL
-python train.py --init --model_name ssl_wavlm_peft --pooling_model PEFTWavLM_Try1 --feature_dim 1024 --config_path configs/general.json 
-python train.py --init --model_name ssl_qwen_peft --pooling_model PEFTQwen3_Try1 --feature_dim 1024 --config_path configs/general.json 
+"lora_rank": 64, "lora_alpha": 128,
+python train.py --init --model_name wavlmasp_peft --pooling_model PEFTWavLM_Try1 --feature_dim 1024 --config_path configs/general.json 
 
-python train.py --init --model_name bilstmselftattasp_gtgram --pooling_model BiLSTMSelfAttASPClassifier --feature_type gammmaspectogram --feature_dim 80 --config_path configs/general.json
+"lora_rank": 16, "lora_alpha": 32,
+python train.py --init --model_name qwenasp_peft --pooling_model PEFTQwen3_Try1 --feature_dim 1024 --config_path configs/general.json 
 
+
+python train.py --init --model_name bilstmseaspfilm_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel --feature_dim 80 --config_path configs/general.json
 
 # Main
 

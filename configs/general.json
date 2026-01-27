@@ -61,15 +61,15 @@
   }, 
   "model": {
     "pooling_model": "ResNet34ManualClassifier",
-    "use_tabular": false,
+    "use_tabular": true,
     "feature_dim": 240,
     "output_dim": 1,
 
     "lora_finetune": true,
     "adapter_hidden_dim": 128,
     "embedding_prompt_dim": 5,
-    "lora_rank": 32,
-    "lora_alpha": 64,
+    "lora_rank": 16,
+    "lora_alpha": 32,
     "target_modules": [ "q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2", "conv_out", "proj1", "proj2" ]
   }
 }
