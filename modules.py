@@ -85,6 +85,55 @@ class AttentiveStatisticsPooling(nn.Module):
         pooled = torch.cat([mean, std], dim=1)   # (B, 2C)
         return pooled, attn_weights
 
+class FrequencyAttention(nn.Module):
+    def __init__(self, freq_dim, reduction=8):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(freq_dim, freq_dim // reduction),
+            nn.ReLU(),
+            nn.Linear(freq_dim // reduction, freq_dim),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # x: (B, C, T, F)
+        attn = x.mean(dim=2)              # (B, C, F)
+        attn = self.fc(attn)              # (B, C, F)
+        attn = attn.unsqueeze(2)          # (B, C, 1, F)
+        return x * attn, attn
+    
+class FeatureFrontend(nn.Module):
+    def __init__(self, in_freq=80, out_dim=128):
+        super().__init__()
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=(3, 5), padding=(1, 2)),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+
+            nn.Conv2d(32, 64, kernel_size=(3, 5), padding=(1, 2)),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+        )
+
+        self.freq_attn = FrequencyAttention(freq_dim=in_freq)
+        self.proj = nn.Linear(64 * in_freq, out_dim)
+
+    def forward(self, x):
+        # x: (B, T, F)
+        B, T, F = x.shape
+
+        x = x.unsqueeze(1)               # (B, 1, T, F)
+        x = self.conv(x)                 # (B, 64, T, F)
+        x, attn_weights = self.freq_attn(x)
+
+        x = x.permute(0, 2, 1, 3)        # (B, T, 64, F)
+        x = x.reshape(B, T, -1)          # (B, T, 64*F)
+
+        x = self.proj(x)                 # (B, T, out_dim)
+        return x, attn_weights
+
+
 ###########################################
 # OPERAGT_MAE
 ###########################################

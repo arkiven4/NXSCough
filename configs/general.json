@@ -46,7 +46,7 @@
     "num_masks": 5,
 
     "augment_data": true,
-    "augment_prob": 0.5,
+    "augment_prob": 0.6,
     "augment_rawboost": true,
     "add_noise": false,
 
@@ -61,7 +61,7 @@
   }, 
   "model": {
     "pooling_model": "ResNet34ManualClassifier",
-    "use_tabular": true,
+    "use_tabular": false,
     "feature_dim": 240,
     "output_dim": 1,
 

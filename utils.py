@@ -24,6 +24,7 @@ from torchaudio import transforms as T
 from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 from scipy.signal import resample
 from tqdm import tqdm
+from sklearn.metrics import roc_curve
 
 import losses
 MATPLOTLIB_FLAG = False
@@ -975,3 +976,15 @@ def many_loss_category(pred, lab, loss_type="CE", test=False, weights=None):
             lab = torch.argmax(lab, dim=1).long()
         loss = criterion(pred, lab)
         return [loss]
+
+
+def optimize_threshold_youden(y_true, y_prob):
+    """
+    Returns optimal threshold maximizing Sens + Spec (Youden's J).
+    """
+    fpr, tpr, thresholds = roc_curve(y_true, y_prob)
+
+    youden_j = tpr - fpr
+    best_idx = np.argmax(youden_j)
+
+    return thresholds[best_idx]
