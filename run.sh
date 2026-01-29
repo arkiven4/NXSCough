@@ -26,7 +26,7 @@ python train.py --init --model_name wavlmasp_peft --pooling_model PEFTWavLM_Try1
 python train.py --init --model_name qwenasp_peft --pooling_model PEFTQwen3_Try1 --feature_dim 1024 --config_path configs/general.json 
 
 ############################################################### dev ###############################################################
-python train.py --init --model_name bilstmse_logmel --pooling_model BiLSTMSelfAttClassifier --feature_type logmel --feature_dim 80 --config_path configs/general.json
+python train.py --init --model_name bilstmmultimask_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel --feature_dim 80 --config_path configs/general.json
 # TODO SPECAUGMENT, and Mixup on same label
 
 #logs_nfft2048

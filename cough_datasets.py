@@ -380,35 +380,35 @@ class CoughDatasets(torch.utils.data.Dataset):
                 dse_id = dse_id.unsqueeze(0)
             return wav.squeeze(0), dse_id
 
-        r = np.array(random.random(), dtype=np.float32)
+        #r = np.array(random.random(), dtype=np.float32)
+        r = np.array(0.6 + 0.3 * random.random(), dtype=np.float32)
         eye = np.eye(self.nClasses)
 
         while True:
-            random_class = random.choices(
-                range(self.nClasses), weights=self.probs, k=1)[0]
-            if dse_id != random_class:
+            random_class = random.choices(range(self.nClasses), weights=self.probs, k=1)[0]
+            if dse_id == random_class: # We Want the class to same
                 sampled_row = self.audiopaths_and_text[
                     np.random.choice(
                         np.where(self.audiopaths_and_text[:, 1] == random_class)[0])
                 ]
                 dse_id_rand = sampled_row[1]
-                dse_id = (eye[dse_id] * r + eye[dse_id_rand]
-                          * (1 - r)).astype(np.float32)
-                dse_id = torch.from_numpy(dse_id).unsqueeze(0)
+                #dse_id = (eye[dse_id] * r + eye[dse_id_rand] * (1 - r)).astype(np.float32)
+                #dse_id = torch.from_numpy(dse_id).unsqueeze(0)
                 break
 
-        wav_rand, _ = self.get_audio(
-            os.path.join(self.db_path, sampled_row[0]))
+        wav_rand = utils.load_audio_sample(os.path.join(self.db_path, sampled_row[0]), self.sampling_rate, self.saming_length,
+                                        self.desired_length, fade_samples_ratio=self.fade_samples_ratio,
+                                        pad_types=self.pad_types, train=self.train)  # repeat zero
+        wav_rand = wav_rand - wav_rand.mean(dim=-1, keepdim=True)
 
         sound1 = wav.squeeze(0).numpy()
-        sound2 = wav_rand.squeeze(0, 1).numpy()
+        sound2 = wav_rand.squeeze(0).numpy()
         size = min(len(sound1), len(sound2))
 
         sound1 = sound1[:size]
         sound2 = sound2[:size]
 
-        mixed = audio_processing.mix(
-            sound1, sound2, r, self.sampling_rate).astype(np.float32)
+        mixed = audio_processing.mix(sound1, sound2, r, self.sampling_rate).astype(np.float32)
         wav = torch.from_numpy(mixed)
 
         return wav, dse_id

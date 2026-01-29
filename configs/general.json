@@ -40,13 +40,13 @@
     "delta_feature": false,
     "deltadelta_feature": false,
 
-    "multimask_augment": false,
+    "multimask_augment": true,
     "tau": 0.10,
     "nu": 0.10,
-    "num_masks": 5,
+    "num_masks": 6,
 
     "augment_data": true,
-    "augment_prob": 0.6,
+    "augment_prob": 0.7,
     "augment_rawboost": true,
     "add_noise": false,
 

@@ -392,12 +392,19 @@ def write_results_to_file(filename, results_dict, model_dir, db_map=None):
             )
 
 
-def cleanup_fold_directories(model_dir):
+def cleanup_fold_directories(model_dir, best_fold_idx=None):
     """Remove fold directories after best model is saved."""
     if os.path.isfile(os.path.join(model_dir, "best_model.ckpt")):
+        keep_name = None
+        if best_fold_idx is not None:
+            keep_name = f"fold_{best_fold_idx}"
+
         for name in os.listdir(model_dir):
             p = os.path.join(model_dir, name)
             if os.path.isdir(p) and name.startswith("fold_"):
+                if keep_name is not None and name == keep_name:
+                    print(f"Kept: {p}")
+                    continue
                 shutil.rmtree(p)
                 print(f"Removed: {p}")
     else:
@@ -639,7 +646,7 @@ def main(cli_args=None):
     # =============================================================
     # SECTION: Cleaning
     # =============================================================
-    cleanup_fold_directories(hps.model_dir)
+    cleanup_fold_directories(hps.model_dir, best_fold_idx)
 
 
 if __name__ == "__main__":

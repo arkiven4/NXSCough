@@ -23,7 +23,7 @@ from functools import partial
 from timm.models.swin_transformer import SwinTransformerBlock
 from timm.models.vision_transformer import Block
 
-from s3prl.upstream.mockingjay.builder import PretrainedTransformer
+# from s3prl.upstream.mockingjay.builder import PretrainedTransformer
 
 import modules
 import commons
@@ -435,134 +435,6 @@ class BiLSTMClassifier(nn.Module):
         disease_logits = self.classifier(fused)
         return {
             "disease_logits": disease_logits,
-        }
-
-class BiLSTMSelfAttClassifier(nn.Module):
-    def __init__(
-        self,
-        dummy_input,
-        feature_dim: int = 39,
-        hidden_size: int = 512,
-        num_layers: int = 2,
-        output_dim: int = 2, 
-        use_tabular: bool = False,
-        fusion_type: str = "film",  # ["gating", "cross_attn", "film"]
-        **kwargs
-    ):
-        super().__init__()
-        
-        self.use_tabular = use_tabular
-        self.fusion_type = fusion_type
-        fusion_dim = 2048
-
-        # ========== AUDIO BACKBONE ==========
-        # self.frontend = modules.FeatureFrontend(in_freq=feature_dim, out_dim=int(feature_dim * 1.6))
-        # feature_dim = int(feature_dim * 1.6)
-
-        self.lstm = nn.LSTM(
-            input_size=feature_dim,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=0.2 if num_layers > 1 else 0.0,
-            bidirectional=True,
-            batch_first=True,
-        )
-
-        self.attn = nn.MultiheadAttention(
-            embed_dim=hidden_size * 2,
-            num_heads=4,
-            dropout=0.1,
-            batch_first=True
-        )
-        self.norm = nn.LayerNorm(hidden_size * 2)
-        #self.pool = modules.AttentiveStatisticsPooling(channels=hidden_size * 2)
-        self.pool = modules.TemporalStatsPooling()
-
-        # ========== TABULAR PROJECTION ==========
-        if self.use_tabular:
-            print("------------- USE TABULAR --------------------")
-            self.tab_proj = nn.Sequential(
-                nn.Linear(4, fusion_dim),
-                nn.ReLU(),
-                nn.LayerNorm(fusion_dim)
-            )
-
-        # ========== FUSION MECHANISMS ==========
-        if self.use_tabular and fusion_type == "gating":
-            self.gate = nn.Sequential(
-                nn.Linear(fusion_dim, fusion_dim),
-                nn.Sigmoid()
-            )
-
-        if self.use_tabular and fusion_type == "film":
-            self.film = nn.Linear(fusion_dim, fusion_dim * 2)
-
-        if self.use_tabular and fusion_type == "cross_attn":
-            self.cross_attn = nn.MultiheadAttention(
-                embed_dim=fusion_dim,
-                num_heads=4,
-                batch_first=True
-            )
-            self.ca_norm = nn.LayerNorm(fusion_dim)
-
-        # ========== CLASSIFIER ==========
-        self.classifier = nn.Sequential(
-            nn.Linear(fusion_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, output_dim)
-        )
-
-    def forward(self, x, tabular_ids=None, train=False, **kwargs):
-        """
-        x: (B, n_mels, T) mel-spectrogram frames
-        tabular_ids: (B, tab_dim)
-        """
-        # ===== AUDIO ENCODING =====
-        x = x.permute(0, 2, 1)
-        #x, freq_weights = self.frontend(x)
-        audio_feat, _ = self.lstm(x)           # (B, T, 2H)
-
-        self_attn_out, self_attn_weights = self.attn(audio_feat, audio_feat, audio_feat, need_weights=True)
-        audio_feat = self.norm(audio_feat + self_attn_out)
-        
-        audio_feat = self.pool(audio_feat) # torch.Size([128, 2048])
-        fused = audio_feat
-
-        # ===== HYBRID MODE =====
-        if self.use_tabular and tabular_ids is not None:
-            tab_feat = self.tab_proj(tabular_ids)
-
-            if self.training:
-                r = torch.rand(1, device=audio_feat.device)
-                if r < 0.2:
-                    audio_feat = torch.zeros_like(audio_feat)
-                elif r < 0.2 + 0.2:
-                    tab_feat = torch.zeros_like(tab_feat)
-
-            # ---- Dynamic Gating ----
-            if self.fusion_type == "gating":
-                alpha = self.gate(tab_feat)
-                fused = alpha * audio_feat + (1 - alpha) * tab_feat
-
-            # ---- FiLM ----
-            elif self.fusion_type == "film":
-                gamma, beta = self.film(tab_feat).chunk(2, dim=-1)
-                fused = gamma * audio_feat + beta
-
-            # ---- Cross-Attention ----
-            elif self.fusion_type == "cross_attn":
-                q = tab_feat.unsqueeze(1)     # (B, 1, D)
-                k = audio_feat.unsqueeze(1)   # (B, 1, D)
-                v = audio_feat.unsqueeze(1)
-
-                ca_out, ca_weights = self.cross_attn(q, k, v)
-                fused = self.ca_norm(audio_feat + ca_out.squeeze(1))
-
-        disease_logits = self.classifier(fused)
-        return {
-            "disease_logits": disease_logits,
-            "self_attn_weights": self_attn_weights,
         }
 
 class BiLSTMSelfAttASPClassifier(nn.Module):
