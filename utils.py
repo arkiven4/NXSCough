@@ -580,6 +580,49 @@ def augment_and_merge(audio_original, path, sr, gain_db_set=[(-5.0, 0.0)]):
     merged = np.concatenate([audio_faded, sec_segment], axis=0)
     return merged
 
+def random_place_cough(
+    data: torch.Tensor,
+    sample_rate: int,
+    target_sec: float = 1.0,
+    min_left_sec: float = 0.1,
+    train: bool = True,
+    noise_scale: float = 1e-4,
+):
+    data = data.reshape(-1)
+
+    target_len = int(target_sec * sample_rate)
+    cough_len = data.shape[0]
+    remaining = target_len - cough_len
+
+    min_left = int(min_left_sec * sample_rate)
+
+    if train:
+        low = min_left if remaining > min_left else 0
+        high = remaining + 1 if remaining > 0 else 1
+
+        left_pad_len = torch.randint(
+            low=low,
+            high=high,
+            size=(1,),
+            device=data.device,
+        ).item()
+
+        pad = lambda n: torch.randn(n, device=data.device) * noise_scale
+    else:
+        left_pad_len = max(min_left, remaining // 2)
+        pad = lambda n: torch.zeros(n, device=data.device)
+
+    data = torch.cat(
+        [
+            pad(max(0, left_pad_len)),
+            data,
+            pad(max(0, target_len - left_pad_len - cough_len)),
+        ],
+        dim=0,
+    )
+
+    return data[:target_len]
+
 
 def load_audio_sample(file_path, db_sample_rate, is_saming_length, desired_length, fade_samples_ratio=6, pad_types='zero', train=False):
     data, sample_rate = librosa.load(file_path, sr=db_sample_rate)
@@ -596,48 +639,7 @@ def load_audio_sample(file_path, db_sample_rate, is_saming_length, desired_lengt
     if pad_types == "synthesis":
         data = augment_and_merge(data, path=file_path, sr=sample_rate)
 
-    # Random Centering Coughs
-    data = data.reshape(-1)
-    target_len = int(1.0 * sample_rate)
-    remaining = target_len - int(desired_length * sample_rate)
-
-    # center padding baseline
-    center_left = remaining // 2
-    center_right = remaining - center_left
-
-    if train:
-        # jitter window (±15% of total padding)
-        max_jitter = int(0.15 * remaining)
-
-        jitter = torch.randint(
-            low=-max_jitter,
-            high=max_jitter + 1,
-            size=(1,),
-            device=data.device
-        ).item()
-
-        left_pad_len = center_left + jitter
-        right_pad_len = remaining - left_pad_len
-
-        # safety clamp
-        left_pad_len = max(0, left_pad_len)
-        right_pad_len = max(0, right_pad_len)
-
-        # low-energy noise padding
-        noise_scale = 1e-4
-        left_pad = torch.randn(left_pad_len, device=data.device) * noise_scale
-        right_pad = torch.randn(right_pad_len, device=data.device) * noise_scale
-    else:
-        # validation / test: fully deterministic
-        left_pad_len = center_left
-        right_pad_len = center_right
-
-        # zero padding for strict reproducibility
-        left_pad = torch.zeros(left_pad_len, device=data.device)
-        right_pad = torch.zeros(right_pad_len, device=data.device)
-
-    # concatenate and restore shape
-    data = torch.cat([left_pad, data, right_pad], dim=0)
+    data = random_place_cough(data, sample_rate, target_sec=1.5, train=train)
     data = data.unsqueeze(0)
 
     return data if torch.is_tensor(data) else torch.from_numpy(data).unsqueeze(0)

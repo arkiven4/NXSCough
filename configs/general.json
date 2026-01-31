@@ -35,7 +35,7 @@
     "rezize_size": [64, 256],
 
     "tabular_feature": true,
-    "acoustic_feature": true,
+    "acoustic_feature": false,
     "feature_type": "gammmaspectogram",
     "delta_feature": false,
     "deltadelta_feature": false,
