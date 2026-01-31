@@ -27,7 +27,9 @@ python train.py --init --model_name qwenasp_peft --pooling_model PEFTQwen3_Try1 
 
 ############################################################### dev ###############################################################
 python train.py --init --model_name bilstmmultimask_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel --feature_dim 80 --config_path configs/general.json
+python train.py --init --model_name resnet34multimask_logmel --pooling_model ResNet34ManualClassifier --feature_type logmel --feature_dim 80 --config_path configs/general.json
 # TODO SPECAUGMENT, and Mixup on same label
+# TODO Fix Speaker Leakage in test
 
 #logs_nfft2048
 python train.py --eval --model_name resnet34re_logmel
