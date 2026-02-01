@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import warnings
+import glob
 
 # Third-party imports
 import librosa
@@ -295,10 +296,11 @@ def select_best_fold(fold_metrics, fold_checkpoints, model_dir, logger):
     return best_fold_idx, production_path
 
 
-def save_fold_info(best_fold_idx, fold_metrics, model_dir):
+def save_fold_info(best_fold_idx, fold_metrics, fold_thresholds, model_dir):
     """Save fold information to pickle file."""
     payload = {
         "best_fold_idx": best_fold_idx,
+        "best_threshold": fold_thresholds[best_fold_idx],
         "fold_metrics": fold_metrics,
     }
     
@@ -312,7 +314,7 @@ def load_fold_info(model_dir):
     if os.path.exists(info_path):
         with open(info_path, "rb") as f:
             return pickle.load(f)
-    return {"best_fold_idx": 0, "fold_metrics": []}
+    return {"best_fold_idx": 0, "best_threshold": 0.0, "fold_metrics": []}
 
 
 def rotate_result_summary(model_dir):
@@ -399,10 +401,14 @@ def cleanup_fold_directories(model_dir, best_fold_idx=None):
         if best_fold_idx is not None:
             keep_name = f"fold_{best_fold_idx}"
 
+        # 9.ckpt
         for name in os.listdir(model_dir):
             p = os.path.join(model_dir, name)
             if os.path.isdir(p) and name.startswith("fold_"):
                 if keep_name is not None and name == keep_name:
+                    ckpts = glob.glob(os.path.join(p, "*.ckpt"))
+                    for ckpt in ckpts:
+                        os.remove(ckpt)
                     print(f"Kept: {p}")
                     continue
                 shutil.rmtree(p)
@@ -483,6 +489,7 @@ def main(cli_args=None):
     # =============================================================
     fold_metrics = []
     fold_checkpoints = []
+    fold_thresholds = []
 
     if not args.eval:
         splitter, num_folds = create_data_split(df_train, target_labels, use_kfold=hps.train.use_Kfold)
@@ -521,23 +528,27 @@ def main(cli_args=None):
                 default_root_dir=hps.model_dir
             )
             trainer.fit(runner_lightning, train_dataloaders=train_loader, val_dataloaders=val_loader)
-            results = trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
+            runner_lightning.calibrate_threshold = True
+            trainer.test(runner_lightning, dataloaders=val_loader)[0]
+            runner_lightning.calibrate_threshold = False
 
+            results = trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
             if results:
                 current_bacc = results[0].get('test_bacc', 0.0)
                 logger.info(f"Fold {fold+1} Balanced Accuracy: {current_bacc:.4f}")
                 fold_metrics.append(current_bacc)
                 fold_checkpoints.append(checkpoint_callback.best_model_path)
+                fold_thresholds.append(runner_lightning.probs_threshold)
 
     if not args.eval and hps.train.use_Kfold:
         best_fold_idx, production_path = select_best_fold(fold_metrics, fold_checkpoints, hps.model_dir, logger)
-        save_fold_info(best_fold_idx, fold_metrics, hps.model_dir)
+        save_fold_info(best_fold_idx, fold_metrics, fold_thresholds, hps.model_dir)
     elif not args.eval:
         best_fold_idx = 0
         best_model_path = fold_checkpoints[best_fold_idx]
         production_path = os.path.join(hps.model_dir, "best_model.ckpt")
         shutil.copy2(best_model_path, production_path)
-        save_fold_info(best_fold_idx, fold_metrics, hps.model_dir)
+        save_fold_info(best_fold_idx, fold_metrics, fold_thresholds, hps.model_dir)
     else:
         # In eval mode, load best_fold_idx from existing info_fold.pkl
         info_fold_data = load_fold_info(hps.model_dir)
@@ -566,28 +577,29 @@ def main(cli_args=None):
     info_fold = load_fold_info(hps.model_dir)
     best_fold_idx = info_fold["best_fold_idx"]
     fold_metrics = info_fold["fold_metrics"]
+    runner_lightning.probs_threshold = info_fold['best_threshold']
 
     ###### Calibrate Threshold or Load if Exist
-    if os.path.exists(os.path.join(model_dir, "probs_threshold.pkl")):
-        with open(os.path.join(model_dir, "probs_threshold.pkl"), "rb") as f:
-            runner_lightning.probs_threshold = pickle.load(f)['probs_threshold']
-    else:
-        splitter, num_folds = create_data_split(df_train, target_labels, use_kfold=hps.train.use_Kfold)
-        train_idx, val_idx = list(splitter)[best_fold_idx]
+    # if os.path.exists(os.path.join(model_dir, "probs_threshold.pkl")):
+    #     with open(os.path.join(model_dir, "probs_threshold.pkl"), "rb") as f:
+    #         runner_lightning.probs_threshold = pickle.load(f)['probs_threshold']
+    # else:
+    #     splitter, num_folds = create_data_split(df_train, target_labels, use_kfold=hps.train.use_Kfold)
+    #     train_idx, val_idx = list(splitter)[best_fold_idx]
 
-        train_fold = df_train.iloc[train_idx].reset_index(drop=True)
-        val_fold = df_train.iloc[val_idx].reset_index(drop=True)
-        train_loader, val_loader = prepare_fold_data(train_fold, val_fold, hps, best_fold_idx, collate_fn)
+    #     train_fold = df_train.iloc[train_idx].reset_index(drop=True)
+    #     val_fold = df_train.iloc[val_idx].reset_index(drop=True)
+    #     train_loader, val_loader = prepare_fold_data(train_fold, val_fold, hps, best_fold_idx, collate_fn)
 
-        runner_lightning.calibrate_threshold = True
-        results = trainer.test(runner_lightning, dataloaders=val_loader)[0]
-        runner_lightning.calibrate_threshold = False
+    #     runner_lightning.calibrate_threshold = True
+    #     results = trainer.test(runner_lightning, dataloaders=val_loader)[0]
+    #     runner_lightning.calibrate_threshold = False
         
-        payload = {
-            "probs_threshold": runner_lightning.probs_threshold,
-        }
-        with open(os.path.join(model_dir, "probs_threshold.pkl"), "wb") as f:
-            pickle.dump(payload, f)
+    #     payload = {
+    #         "probs_threshold": runner_lightning.probs_threshold,
+    #     }
+    #     with open(os.path.join(model_dir, "probs_threshold.pkl"), "wb") as f:
+    #         pickle.dump(payload, f)
 
     ############################################# Overall Report #########################################################
     with open(f"{model_dir}/result_overall.txt", "w") as f:

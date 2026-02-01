@@ -11,6 +11,9 @@ from efficientnet_pytorch import EfficientNet
 from torch.nn.utils.rnn import pad_sequence
 from torchcrf import CRF
 import numpy as np
+import gc
+import torch
+
 
 import torchvision
 from transformers import AutoConfig, AutoFeatureExtractor
@@ -770,3 +773,131 @@ class PEFTQwen3_Try1(nn.Module):
             "disease_logits": disease_logits,
             "asp_weights": asp_weights,
         }
+    
+
+class AST_Try1(nn.Module):
+    def __init__(self, input_size, output_dim, lora_rank, lora_alpha, target_modules, spk_dim, **kwargs):
+        super(AST_Try1, self).__init__()
+
+        from transformers import ASTForAudioClassification
+        temp_model = ASTForAudioClassification.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
+        self.audio_tower = temp_model.audio_spectrogram_transformer
+        self.audio_tower.cuda()
+        self.model_config = temp_model.config
+        del self.model_config.label2id
+        del self.model_config.id2label
+        del temp_model
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        self.layernorm = nn.LayerNorm(self.model_config.hidden_size, eps=self.model_config.layer_norm_eps)
+        self.classifier = nn.Linear(self.model_config.hidden_size, 1)
+
+    def forward(self, input_features, attention_mask=None, **kwargs):
+        input_features = input_features.permute(0, 2, 1)
+        pooled_output = self.audio_tower(input_values=input_features).pooler_output
+        disease_logits = self.classifier(pooled_output)
+
+        return {
+            "disease_logits": disease_logits,
+        }
+    
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TemporalAttention(nn.Module):
+    """
+    Additive attention over time.
+    Input: (B, T, D)
+    Output: (B, D), (B, T)
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.attn = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.Tanh(),
+            nn.Linear(dim, 1, bias=False)
+        )
+
+    def forward(self, x, mask=None):
+        # x: (B, T, D)
+        scores = self.attn(x).squeeze(-1)  # (B, T)
+
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e9)
+
+        weights = F.softmax(scores, dim=1)  # (B, T)
+        pooled = torch.sum(x * weights.unsqueeze(-1), dim=1)  # (B, D)
+        return pooled, weights
+
+
+class CNN_BiLSTM_Attention(nn.Module):
+    def __init__(
+        self,
+        n_mels: int,
+        num_classes: int = 1,
+        lstm_hidden: int = 256,
+        lstm_layers: int = 1,
+        cnn_channels=(1, 32, 64),
+        pool_kernel=(2, 2),
+        dense_dim: int = 256,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+
+        # CNN
+        self.conv1 = nn.Conv2d(cnn_channels[0], cnn_channels[1], 3, padding=1)
+        self.conv2 = nn.Conv2d(cnn_channels[1], cnn_channels[2], 3, padding=1)
+        self.pool = nn.MaxPool2d(pool_kernel)
+
+        freq_after_pool = n_mels // (pool_kernel[0] ** 2)
+        cnn_out_dim = cnn_channels[2] * freq_after_pool
+
+        # Dim reduction
+        self.dense = nn.Linear(cnn_out_dim, dense_dim)
+
+        # BiLSTM
+        self.bilstm = nn.LSTM(
+            input_size=dense_dim,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        # Attention pooling
+        self.attention = TemporalAttention(lstm_hidden * 2)
+
+        # Output head
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(lstm_hidden * 2, num_classes),
+        )
+
+    def forward(self, x, mask=None):
+        """
+        x: (B, n_mels, T)
+        mask: (B, T') optional, after CNN pooling
+        """
+        x = x.unsqueeze(1)  # (B, 1, n_mels, T)
+
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        # (B, C, F', T')
+
+        x = x.permute(0, 3, 1, 2).contiguous()
+        B, T, C, F = x.shape
+        x = x.view(B, T, C * F)
+
+        x = F.relu(self.dense(x))
+
+        x, _ = self.bilstm(x)
+
+        # Attention pooling over time
+        x, attn_weights = self.attention(x, mask)
+
+        x = self.classifier(x)
+        return x, attn_weights

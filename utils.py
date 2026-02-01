@@ -639,7 +639,7 @@ def load_audio_sample(file_path, db_sample_rate, is_saming_length, desired_lengt
     if pad_types == "synthesis":
         data = augment_and_merge(data, path=file_path, sr=sample_rate)
 
-    data = random_place_cough(data, sample_rate, target_sec=1.5, train=train)
+    data = random_place_cough(data, sample_rate, target_sec=1, train=train)
     data = data.unsqueeze(0)
 
     return data if torch.is_tensor(data) else torch.from_numpy(data).unsqueeze(0)
@@ -794,13 +794,13 @@ def compute_spectrogram_stats_from_dataset(df, hparams, pickle_path="spec_stats.
             setattr(stats_hparams, key, getattr(hparams, key))
     
     # Disable augmentation and normalization for clean stats
+    stats_hparams.multimask_augment = False
     stats_hparams.augment_data = False
     stats_hparams.augment_rawboost = False
     stats_hparams.mean_std_norm = False
     stats_hparams.max_wav_value = None
     stats_hparams.add_noise = False
     stats_hparams.mix_audio = False
-    stats_hparams.multimask_augment = False
     stats_hparams.train = False
     
     # Create a temporary dataset for stats computation

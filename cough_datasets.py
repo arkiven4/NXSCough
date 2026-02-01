@@ -78,6 +78,7 @@ class CoughDatasets(torch.utils.data.Dataset):
         self.augment_rawboost = getattr(hparams, "augment_rawboost", False)
         self.augment_prob = getattr(hparams, "augment_prob", 0.6)
         self.multimask_augment = getattr(hparams, "multimask_augment", False)
+        self.multimask_prob = getattr(hparams, "multimask_prob", False)
         self.fade_samples_ratio = getattr(hparams, "fade_samples_ratio", 0.0)
         self.add_noise = getattr(hparams, "add_noise", False)
         self.mix_audio = getattr(hparams, "mix_audio", False)
@@ -178,6 +179,13 @@ class CoughDatasets(torch.utils.data.Dataset):
                     ),
                     dtype=torch.float32
                 )
+            elif hparams.feature_type == "fbank_ast":
+                from transformers import AutoFeatureExtractor
+                feature_extractor_ast = AutoFeatureExtractor.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
+                #feature_extractor_ast.max_length = 150
+                self.wav_transform = lambda wav: (
+                    feature_extractor_ast(wav.squeeze(0), sampling_rate=self.sampling_rate, return_tensors="pt")['input_values'][0].T
+                )
             elif hparams.feature_type == "opensmile":
                 self.scaler = joblib.load(
                     "precomputed_stats/opensmile_global_scaler.pkl")
@@ -221,6 +229,10 @@ class CoughDatasets(torch.utils.data.Dataset):
         audio = utils.load_audio_sample(filename, self.sampling_rate, self.saming_length, self.desired_length, fade_samples_ratio=self.fade_samples_ratio,
                                         pad_types=self.pad_types, train=self.train)  # repeat zero
         audio = audio - audio.mean(dim=-1, keepdim=True)
+        
+        peak = audio.abs().max()
+        audio = audio / (peak + 1e-8)
+        audio = torch.tanh(audio)
 
         if self.pad_types != "synthesis" and self.cough_detection:
             if audio.shape[-1] < end_index:
@@ -260,10 +272,11 @@ class CoughDatasets(torch.utils.data.Dataset):
                 audio = (audio - mean) / (std + 1e-6)
 
             if self.multimask_augment and self.train:
-                audio = audio_processing.multi_mask_spectrogram(
-                    audio, tau=int(audio.shape[1] * self.tau),
-                    nu=int(audio.shape[0] * self.nu),
-                    num_masks=self.num_masks)  # T, F
+                if random.random() < self.multimask_prob:
+                    audio = audio_processing.multi_mask_spectrogram(
+                        audio, tau=int(audio.shape[1] * self.tau),
+                        nu=int(audio.shape[0] * self.nu),
+                        num_masks=self.num_masks)  # T, F
 
             # Compute and normalize delta and deltadelta features separately
             if self.delta_feature:
@@ -349,6 +362,10 @@ class CoughDatasets(torch.utils.data.Dataset):
         mixed = audio_processing.mix(
             sound1, sound2, r, self.sampling_rate).astype(np.float32)
         wav = torch.from_numpy(mixed)
+
+        peak = wav.abs().max()
+        wav = wav / (peak + 1e-8)
+        wav = torch.tanh(wav)
 
         return wav, dse_id
 

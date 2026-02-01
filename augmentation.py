@@ -163,7 +163,11 @@ class DataAugmentator:
             else rir_relpath
         )
 
-        rir_wav, rir_sample_rate = self.load_audio_safe(path)
+        try:
+            rir_wav, rir_sample_rate = self.load_audio_safe(path)
+        except:
+            return audio
+        
         if rir_wav.numel() == 0 or rir_wav.abs().max() < 1e-6:
             return audio
 
@@ -290,7 +294,11 @@ class DataAugmentator:
         else:
             path = background_audio_name
         
-        noise, noise_sample_rate = self.load_audio_safe(path)
+        try:
+            noise, noise_sample_rate = self.load_audio_safe(path)
+        except:
+            return audio
+        
         if noise.numel() == 0 or torch.max(torch.abs(noise)) < 1e-8:
             print(f"Warning: Silent or empty noise file {path}, returning original audio")
             return audio
