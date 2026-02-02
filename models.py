@@ -474,7 +474,7 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
         self.attn = nn.MultiheadAttention(
             embed_dim=hidden_size * 2,
             num_heads=4,
-            dropout=0.1,
+            dropout=0.3,
             batch_first=True
         )
         self.norm = nn.LayerNorm(hidden_size * 2)
@@ -511,7 +511,7 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
         self.classifier = nn.Sequential(
             nn.Linear(fusion_dim, 128),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.3),
             nn.Linear(128, output_dim)
         )
 
@@ -803,10 +803,6 @@ class AST_Try1(nn.Module):
         return {
             "disease_logits": disease_logits,
         }
-    
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 class TemporalAttention(nn.Module):
     """
@@ -837,14 +833,14 @@ class TemporalAttention(nn.Module):
 class CNN_BiLSTM_Attention(nn.Module):
     def __init__(
         self,
-        n_mels: int,
-        num_classes: int = 1,
-        lstm_hidden: int = 256,
-        lstm_layers: int = 1,
+        dummy_input,
+        feature_dim: int = 39,
+        hidden_size: int = 256,
+        num_layers: int = 1,
+        output_dim: int = 2, 
         cnn_channels=(1, 32, 64),
         pool_kernel=(2, 2),
-        dense_dim: int = 256,
-        dropout: float = 0.3,
+        **kwargs
     ):
         super().__init__()
 
@@ -853,31 +849,31 @@ class CNN_BiLSTM_Attention(nn.Module):
         self.conv2 = nn.Conv2d(cnn_channels[1], cnn_channels[2], 3, padding=1)
         self.pool = nn.MaxPool2d(pool_kernel)
 
-        freq_after_pool = n_mels // (pool_kernel[0] ** 2)
+        freq_after_pool = feature_dim // (pool_kernel[0] ** 2)
         cnn_out_dim = cnn_channels[2] * freq_after_pool
 
         # Dim reduction
-        self.dense = nn.Linear(cnn_out_dim, dense_dim)
+        self.dense = nn.Linear(cnn_out_dim, hidden_size)
 
         # BiLSTM
         self.bilstm = nn.LSTM(
-            input_size=dense_dim,
-            hidden_size=lstm_hidden,
-            num_layers=lstm_layers,
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
             batch_first=True,
             bidirectional=True,
         )
 
         # Attention pooling
-        self.attention = TemporalAttention(lstm_hidden * 2)
+        self.attention = TemporalAttention(hidden_size * 2)
 
         # Output head
         self.classifier = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(lstm_hidden * 2, num_classes),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_size * 2, output_dim),
         )
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, **kwargs):
         """
         x: (B, n_mels, T)
         mask: (B, T') optional, after CNN pooling
@@ -889,15 +885,17 @@ class CNN_BiLSTM_Attention(nn.Module):
         # (B, C, F', T')
 
         x = x.permute(0, 3, 1, 2).contiguous()
-        B, T, C, F = x.shape
-        x = x.view(B, T, C * F)
+        B, T, C, Freq = x.shape
+        x = x.view(B, T, C * Freq)
 
         x = F.relu(self.dense(x))
-
         x, _ = self.bilstm(x)
 
         # Attention pooling over time
         x, attn_weights = self.attention(x, mask)
 
-        x = self.classifier(x)
-        return x, attn_weights
+        disease_logits = self.classifier(x)
+        return {
+            "disease_logits": disease_logits,
+            "attn_weights": attn_weights,
+        }

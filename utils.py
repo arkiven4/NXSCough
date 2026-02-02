@@ -986,7 +986,39 @@ def optimize_threshold_youden(y_true, y_prob):
     """
     fpr, tpr, thresholds = roc_curve(y_true, y_prob)
 
-    youden_j = tpr - fpr
-    best_idx = np.argmax(youden_j)
+    # youden_j = tpr - fpr
+    # best_idx = np.argmax(youden_j)
+
+    specificity = 1 - fpr
+    gap = np.abs(tpr - specificity)
+    best_idx = np.argmin(gap)
 
     return thresholds[best_idx]
+
+
+def optimize_threshold_partial_auc_with_fallback(
+    y_true,
+    y_prob,
+    min_tpr=0.80,
+    min_spec=0.60
+):
+    fpr, tpr, thresholds = roc_curve(y_true, y_prob)
+    spec = 1 - fpr
+
+    sens_v = np.maximum(0.80 - tpr, 0.0)
+    spec_v = np.maximum(0.60 - spec, 0.0)
+
+    # primary = sens_v + spec_v
+    # secondary = (tpr - 0.80)**2 + (spec - 0.60)**2
+    # loss = primary * 1000.0 + secondary
+    # best_threshold = thresholds[np.argmin(loss)]
+
+    loss = (
+        10000.0 * sens_v +
+        100.0 * spec_v +
+        (tpr - 0.80)**2 +
+        (spec - 0.60)**2
+    )
+
+    best_threshold = thresholds[np.argmin(loss)]
+    return best_threshold
