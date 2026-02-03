@@ -449,7 +449,7 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
         num_layers: int = 2,
         output_dim: int = 2, 
         use_tabular: bool = False,
-        fusion_type: str = "film",  # ["gating", "cross_attn", "film"]
+        fusion_type: str = "cross_attn",  # ["gating", "cross_attn", "film"]
         **kwargs
     ):
         super().__init__()

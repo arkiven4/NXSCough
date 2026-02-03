@@ -18,7 +18,7 @@ from sklearn.metrics import (
 import commons
 import models
 import utils
-import losses
+import loss_functions
 
 
 class CoughClassificationRunner(L.LightningModule):
@@ -31,6 +31,7 @@ class CoughClassificationRunner(L.LightningModule):
         self.probs_threshold = probs_threshold
         self.calibrate_threshold = False
         self.generate_figure = False
+        self.loss_fn = loss_functions.get_losses_fn(hps.train.loss_function)
 
         # =============================================================
         # SECTION: Additional Setupo
@@ -46,17 +47,14 @@ class CoughClassificationRunner(L.LightningModule):
             del ssl_model
             torch.cuda.empty_cache()
 
-        trainable_params = sum(p.numel()
-                               for p in self.model.parameters() if p.requires_grad)
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_percentage = 100 * trainable_params / \
-            total_params if total_params > 0 else 0
+        trainable_percentage = 100 * trainable_params / total_params if total_params > 0 else 0
         self.custom_logger.info(
             f'Trainable params: {trainable_params} | Total params: {total_params} | Trainable%: {trainable_percentage:.2f}% | Size: {trainable_params/(1e6):.2f}M')
 
     def forward(self, x1, x2=None, attention_mask=None, tabular_ids=None, train=False):
-        x = self.model(x1, x2=x2, attention_mask=attention_mask,
-                       tabular_ids=tabular_ids, train=train)
+        x = self.model(x1, x2=x2, attention_mask=attention_mask, tabular_ids=tabular_ids, train=train)
         return x
 
     def configure_optimizers(self):
@@ -67,8 +65,7 @@ class CoughClassificationRunner(L.LightningModule):
             # {"params": self.model.head.parameters(), "lr": self.hps.train.learning_rate},
             # {"params": self.center_loss.parameters(), "lr": self.hps.train.learning_rate},
         ])
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.1, patience=2)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=2)
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -101,8 +98,7 @@ class CoughClassificationRunner(L.LightningModule):
     def on_after_backward(self):
         norm_type = 2
         total_norm = 0
-        parameters = list(
-            filter(lambda p: p.grad is not None, self.model.parameters()))
+        parameters = list(filter(lambda p: p.grad is not None, self.model.parameters()))
         for p in parameters:
             param_norm = p.grad.data.norm(norm_type)
             total_norm += param_norm.item() ** norm_type
@@ -110,15 +106,12 @@ class CoughClassificationRunner(L.LightningModule):
         self.log("train/grad_norm", total_norm, sync_dist=True)
 
     def training_step(self, batch, batch_idx):
-        _, audio1, audio2, attention_masks, dse_ids, [
-            patient_ids, _, tabular_ids] = batch
-        out_model = self.forward(
-            audio1, audio2, attention_mask=attention_masks, tabular_ids=tabular_ids, train=True)
+        _, audio1, audio2, attention_masks, dse_ids, [patient_ids, _, tabular_ids, _] = batch
+        out_model = self.forward(audio1, audio2, attention_mask=attention_masks, tabular_ids=tabular_ids, train=True)
 
         tot_loss = []
         if "disease_logits" in out_model:
-            ld = utils.many_loss_category(
-                out_model["disease_logits"], dse_ids, loss_type=self.hps.train.loss_function, weights=self.class_weights)
+            ld = self.loss_fn(out_model["disease_logits"], dse_ids, batch)
             tot_loss.append(ld[0])
 
         if hasattr(self.model, "calc_additional_loss"):
@@ -165,16 +158,17 @@ class CoughClassificationRunner(L.LightningModule):
         lr = self.optimizers().param_groups[0]["lr"]
         self.log("train/lr", lr, sync_dist=True)
 
+    # def on_train_epoch_end(self):
+    #     self.loss_fn.step_lambda(factor=1.1)
+    #     self.log("lambda", self.loss_fn.lambda_val, prog_bar=True, sync_dist=True,)
+        
     def validation_step(self, batch, batch_idx):
-        _, audio1, audio2, attention_masks, dse_ids, [
-            patient_ids, _, tabular_ids] = batch
-        out_model = self.forward(
-            audio1, audio2, attention_mask=attention_masks, tabular_ids=tabular_ids)
+        _, audio1, audio2, attention_masks, dse_ids, [patient_ids, _, tabular_ids, _] = batch
+        out_model = self.forward(audio1, audio2, attention_mask=attention_masks, tabular_ids=tabular_ids)
 
         tot_loss = []
         if "disease_logits" in out_model:
-            ld = utils.many_loss_category(
-                out_model["disease_logits"], dse_ids, loss_type=self.hps.train.loss_function, weights=self.class_weights)
+            ld = self.loss_fn(out_model["disease_logits"], dse_ids, batch)
             tot_loss.append(ld[0])
 
         if hasattr(self.model, "calc_additional_loss"):
@@ -199,7 +193,7 @@ class CoughClassificationRunner(L.LightningModule):
         self.test_logits = []
 
     def test_step(self, batch, batch_idx):
-        _, audio1, audio2, attention_masks, dse_ids, [_, _, tabular_ids] = batch
+        _, audio1, audio2, attention_masks, dse_ids, [_, _, tabular_ids, _] = batch
         dse_ids = dse_ids.float()
         logits = self.forward(audio1, audio2, attention_mask=attention_masks,
                               tabular_ids=tabular_ids)["disease_logits"]
@@ -211,21 +205,18 @@ class CoughClassificationRunner(L.LightningModule):
             preds = torch.argmax(logits, dim=1)
 
         labels = torch.argmax(dse_ids, dim=1)
+        logits = torch.sigmoid(logits).detach()
+        # probs = torch.softmax(logits, dim=1)[:, 1].numpy()
         # labels = (labels != 0).float() # TEMPORARY
 
         self.test_preds.append(preds.cpu())
         self.test_labels.append(labels.cpu())
-        self.test_logits.append(logits.detach().cpu())
+        self.test_logits.append(logits.cpu())
 
     def on_test_epoch_end(self):
         preds = torch.cat(self.test_preds).numpy()
         labels = torch.cat(self.test_labels).numpy()
-        logits = torch.cat(self.test_logits)
-
-        if self.hps.train.loss_function == "BCE":
-            probs = torch.sigmoid(logits).numpy()
-        else:
-            probs = torch.softmax(logits, dim=1)[:, 1].numpy()
+        probs = torch.cat(self.test_logits).numpy()
 
         if self.calibrate_threshold:
             optimized_threshold = utils.optimize_threshold_youden(labels, probs)

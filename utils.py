@@ -26,7 +26,6 @@ from scipy.signal import resample
 from tqdm import tqdm
 from sklearn.metrics import roc_curve
 
-import losses
 MATPLOTLIB_FLAG = False
 
 logging.basicConfig(stream=sys.stdout, level=logging.ERROR)
@@ -834,7 +833,7 @@ def compute_spectrogram_stats_from_dataset(df, hparams, pickle_path="spec_stats.
     for batch in tqdm(dataloader, desc="Computing Spectrogram Stats", unit="batch"):
         try:
             # Get the processed audio (spectrogram) without augmentation
-            spec = batch[1]  # wav1 is at index 1
+            spec = batch[2]  # wav1 is at index 1
             
             # Remove any extra dimensions and compute stats
             if isinstance(spec, torch.Tensor):
@@ -942,42 +941,42 @@ def compute_wav_stats(df, path_col, pickle_path="wav_stats.pickle"):
 
     return stats
 
-def many_loss_category(pred, lab, loss_type="CE", test=False, weights=None):
-    if test == True:
-        pred_labels = torch.max(pred, 1).cpu().numpy()
-        lab = lab.cpu().numpy()
+# def many_loss_category(pred, lab, loss_type="CE", test=False, weights=None):
+#     if test == True:
+#         pred_labels = torch.max(pred, 1).cpu().numpy()
+#         lab = lab.cpu().numpy()
 
-        f1_micro = f1_score(lab, pred_labels, average='micro')
-        f1_macro = f1_score(lab, pred_labels, average='macro')
-        accuracy = accuracy_score(lab, pred_labels)
-        return f1_micro, f1_macro, accuracy
+#         f1_micro = f1_score(lab, pred_labels, average='micro')
+#         f1_macro = f1_score(lab, pred_labels, average='macro')
+#         accuracy = accuracy_score(lab, pred_labels)
+#         return f1_micro, f1_macro, accuracy
 
-    if loss_type == "CE":
-        criterion = torch.nn.CrossEntropyLoss()  # weight=weights
-        loss = criterion(pred, lab)
-        return [loss]
-    elif loss_type == "BCE":
-        if len(lab.shape) == 2:
-            # lab = lab.squeeze(-1)
-            lab = torch.argmax(lab, dim=1)
-            lab = (lab != 0).float() # Clustering
+#     if loss_type == "CE":
+#         criterion = torch.nn.CrossEntropyLoss()  # weight=weights
+#         loss = criterion(pred, lab)
+#         return [loss]
+#     elif loss_type == "BCE":
+#         if len(lab.shape) == 2:
+#             # lab = lab.squeeze(-1)
+#             lab = torch.argmax(lab, dim=1)
+#             lab = (lab != 0).float() # Clustering
 
-        if len(pred.shape) == 2:
-            pred = pred.squeeze(-1)
+#         if len(pred.shape) == 2:
+#             pred = pred.squeeze(-1)
 
-        criterion = torch.nn.BCEWithLogitsLoss()
-        loss = criterion(pred, lab)
-        return [loss]
-    elif loss_type == "KLDivLoss":
-        criterion = losses.KLDivLoss()
-        loss = criterion(pred, lab)
-        return [loss]
-    elif loss_type == "HardTripletLoss":
-        criterion = losses.HardTripletLoss(margin=0.1).cuda()
-        if lab.dim() == 2:
-            lab = torch.argmax(lab, dim=1).long()
-        loss = criterion(pred, lab)
-        return [loss]
+#         criterion = torch.nn.BCEWithLogitsLoss()
+#         loss = criterion(pred, lab)
+#         return [loss]
+#     elif loss_type == "KLDivLoss":
+#         criterion = losses.KLDivLoss()
+#         loss = criterion(pred, lab)
+#         return [loss]
+#     elif loss_type == "HardTripletLoss":
+#         criterion = losses.HardTripletLoss(margin=0.1).cuda()
+#         if lab.dim() == 2:
+#             lab = torch.argmax(lab, dim=1).long()
+#         loss = criterion(pred, lab)
+#         return [loss]
 
 
 def optimize_threshold_youden(y_true, y_prob):

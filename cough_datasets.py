@@ -3,7 +3,7 @@ from torch.utils.data import Sampler
 from matplotlib import cm
 import os
 import pickle
-import random
+import random, math
 
 import numpy as np
 import pandas as pd
@@ -370,7 +370,8 @@ class CoughDatasets(torch.utils.data.Dataset):
         return wav, dse_id
 
     def __getitem__(self, index):
-        return self.get_mel_text_pair(self.audiopaths_and_text[index])
+        data = self.get_mel_text_pair(self.audiopaths_and_text[index])
+        return (index,) + data  # Prepend index to the tuple
 
     def __len__(self):
         return len(self.audiopaths_and_text)
@@ -384,17 +385,18 @@ class CoughDatasetsCollate:
         self.many_tabular = many_tabular
 
     def __call__(self, batch):
-        lengths1 = torch.tensor([x[1].shape[-1] for x in batch])
-        lengths2 = torch.tensor([x[2].shape[-1] for x in batch])
+        lengths1 = torch.tensor([x[2].shape[-1] for x in batch])
+        lengths2 = torch.tensor([x[3].shape[-1] for x in batch])
         lengths_sorted1, idx = torch.sort(lengths1, descending=True)
         lengths_sorted2, idx = torch.sort(lengths2, descending=True)
 
         max_len = lengths_sorted1[0]
         bsz = len(batch)
 
-        first_wav = batch[0][1]
+        first_wav = batch[0][2]
         feature_dim = first_wav.shape[1] if first_wav.ndim == 3 else 1
 
+        sorted_indices = torch.zeros(bsz, dtype=torch.long)
         wav_names = []
         wav_padded1 = torch.zeros(
             bsz, feature_dim, lengths_sorted1[0], dtype=first_wav.dtype)
@@ -409,8 +411,9 @@ class CoughDatasetsCollate:
         tabular_ids = torch.zeros(bsz, self.many_tabular, dtype=torch.float32)
 
         for i, j in enumerate(idx):
-            name, wav1, wav2, dse, spk, gndr, tblr = batch[j]
+            sample_idx, name, wav1, wav2, dse, spk, gndr, tblr = batch[j]
             wav_names.append(name)
+            sorted_indices[i] = sample_idx
 
             wav_padded1[i, :, :wav1.shape[-1]] = wav1
             wav_padded2[i, :, :wav2.shape[-1]] = wav2
@@ -420,9 +423,9 @@ class CoughDatasetsCollate:
             dse_ids[i] = dse
             spk_ids[i] = spk
             gndr_ids[i] = gndr
-            tabular_ids[i] = gndr
+            tabular_ids[i] = tblr.squeeze(0)
 
-        return wav_names, wav_padded1, wav_padded2, attention_masks, dse_ids, [spk_ids, gndr_ids, tabular_ids]
+        return wav_names, wav_padded1, wav_padded2, attention_masks, dse_ids, [spk_ids, gndr_ids, tabular_ids, sorted_indices]
 
 
 class CoughDatasetsProcessorCollate():
@@ -641,3 +644,73 @@ class PatientBatchSampler(Sampler):
 
     def __len__(self):
         return len(self.patients) // self.P
+
+
+class AutoPatientBatchSampler(Sampler):
+    def __init__(
+        self,
+        patient_ids,
+        labels,
+        target_batch_wavs=128,
+        pos_fraction=0.5,
+        shuffle=True,
+    ):
+        self.patient_ids = patient_ids
+        self.labels = labels
+        self.target_batch_wavs = target_batch_wavs
+        self.pos_fraction = pos_fraction
+        self.shuffle = shuffle
+
+        # wav indices per patient
+        self.pid2idx = defaultdict(list)
+        for i, pid in enumerate(patient_ids):
+            self.pid2idx[pid].append(i)
+
+        # patient labels
+        self.pid2label = {}
+        for i, pid in enumerate(patient_ids):
+            if pid not in self.pid2label:
+                self.pid2label[pid] = int(labels[i])
+
+        self.pos_pids = [p for p, y in self.pid2label.items() if y == 1]
+        self.neg_pids = [p for p, y in self.pid2label.items() if y == 0]
+
+        # ---- CRITICAL: fixed epoch length ----
+        total_wavs = len(patient_ids)
+        self._len = math.ceil(total_wavs / target_batch_wavs)
+
+    def __len__(self):
+        return self._len
+
+    def __iter__(self):
+        for _ in range(self._len):
+            batch = []
+            remaining = self.target_batch_wavs
+
+            # sample patients WITH replacement
+            n_pos = int(self.pos_fraction * remaining)
+            n_neg = remaining - n_pos
+
+            # heuristic: average wavs per patient
+            avg_wavs = sum(len(v) for v in self.pid2idx.values()) / len(self.pid2idx)
+            est_patients = max(1, int(remaining / avg_wavs))
+
+            k_pos = max(1, int(est_patients * self.pos_fraction))
+            k_neg = est_patients - k_pos
+
+            pos_pids = random.choices(self.pos_pids, k=k_pos)
+            neg_pids = random.choices(self.neg_pids, k=k_neg)
+
+            batch_pids = pos_pids + neg_pids
+            random.shuffle(batch_pids)
+
+            for pid in batch_pids:
+                if remaining <= 0:
+                    break
+
+                wavs = self.pid2idx[pid]
+                take = min(len(wavs), remaining)
+                batch.extend(random.sample(wavs, take))
+                remaining -= take
+
+            yield batch

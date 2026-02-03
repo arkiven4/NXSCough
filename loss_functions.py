@@ -2,6 +2,223 @@ import torch, math
 import torch.nn as nn
 import torch.nn.functional as F
 
+class BCELossFn(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss()
+
+    def forward(self, logits, targets, batchs):
+        if len(targets.shape) == 2:
+            targets = torch.argmax(targets, dim=1)
+            targets = (targets != 0).float()
+
+        if len(logits.shape) == 2:
+            logits = logits.squeeze(-1)
+
+        losses = self.bce(logits, targets)
+        return [losses]
+
+
+class SPLBCELoss(nn.Module):
+    def __init__(self, keep_ratio=0.7):
+        super().__init__()
+        self.keep_ratio = keep_ratio
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+
+    def forward(self, logits, targets, batchs):
+        if len(targets.shape) == 2:
+            targets = torch.argmax(targets, dim=1)
+            targets = (targets != 0).float()
+
+        if len(logits.shape) == 2:
+            logits = logits.squeeze(-1)
+
+        losses = self.bce(logits, targets)  # (B,)
+
+        B = losses.numel()
+        k = max(1, int(self.keep_ratio * B))
+
+        # select k smallest losses
+        _, idx = torch.topk(losses, k, largest=False)
+        selected_losses = losses[idx]
+
+        return [selected_losses.mean()]
+
+class PRLBCELoss(nn.Module):
+    def __init__(self, keep_ratio=0.8):
+        super().__init__()
+        self.keep_ratio = keep_ratio
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+
+    def forward(self, logits, targets, batchs):
+        """
+        logits: (B,)
+        targets: (B,)
+        """
+        if len(targets.shape) == 2:
+            targets = torch.argmax(targets, dim=1)
+            targets = (targets != 0).float()
+
+        if len(logits.shape) == 2:
+            logits = logits.squeeze(-1)
+
+        # per-sample BCE
+        losses = self.bce(logits, targets)
+
+        # gradient of BCE wrt logits (closed-form)
+        probs = torch.sigmoid(logits)
+        grad_norms = torch.abs(probs - targets)  # |∂ℓ/∂z|
+
+        B = logits.numel()
+        k = max(1, int(self.keep_ratio * B))
+
+        # select samples with smallest gradient norms
+        _, idx = torch.topk(grad_norms, k, largest=False)
+
+        return [losses[idx].mean()]
+
+class ClippedBCELoss(nn.Module):
+    def __init__(self, clip_value=1.0):
+        super().__init__()
+        self.clip_value = clip_value
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+
+    def forward(self, logits, targets, batchs):
+        if len(targets.shape) == 2:
+            targets = torch.argmax(targets, dim=1)
+            targets = (targets != 0).float()
+
+        if len(logits.shape) == 2:
+            logits = logits.squeeze(-1)
+
+        losses = self.bce(logits, targets)
+        clipped_losses = torch.clamp(losses, max=self.clip_value)
+        return [clipped_losses.mean()]
+
+class ELRBCELoss(nn.Module):
+    def __init__(
+        self,
+        alpha=0.3,
+        beta=0.7,
+        lambda_elr=3.0,
+    ):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.lambda_elr = lambda_elr
+
+        self.targets_ema = None
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+
+    def init_memory(self, num_samples):
+        self.targets_ema = torch.zeros(num_samples)
+        self.targets_ema = self.targets_ema.cuda()
+
+    def forward(self, logits, targets, batchs):
+        """
+        logits: (B,)
+        targets: (B,)
+        indices: dataset indices of samples
+        """
+        if len(targets.shape) == 2:
+            targets = torch.argmax(targets, dim=1)
+            targets = (targets != 0).float()
+
+        if len(logits.shape) == 2:
+            logits = logits.squeeze(-1)
+
+        _, _, _, _, _, [_, _, _, indices] = batchs 
+
+        probs = torch.sigmoid(logits)
+
+        # update EMA targets (no grad)
+        with torch.no_grad():
+            self.targets_ema[indices] = (
+                self.beta * self.targets_ema[indices]
+                + (1 - self.beta) * probs.detach()
+            )
+
+        # mixed targets
+        mixed_targets = (
+            (1 - self.alpha) * targets
+            + self.alpha * self.targets_ema[indices]
+        )
+
+        # standard BCE
+        bce_loss = self.bce(logits, mixed_targets)
+
+        # ELR regularizer
+        elr_reg = -torch.log(
+            1 - probs * self.targets_ema[indices] + 1e-6
+        )
+
+        return [(bce_loss + self.lambda_elr * elr_reg).mean()]
+
+
+class PatientAwareLoss(nn.Module):
+    def __init__(self, agg="logsumexp"):
+        super().__init__()
+        assert agg in ["mean", "max", "logsumexp"]
+        self.agg = agg
+        self.bce = nn.BCEWithLogitsLoss()
+
+    def forward(self, logits, labels, batchs):
+        """
+        logits: (N_wavs, 1) or (N_wavs,)
+        labels: (N_wavs,)  # same label for same patient
+        patient_ids: (N_wavs,)
+        """
+        if len(labels.shape) == 2:
+            labels = torch.argmax(labels, dim=1)
+            labels = (labels != 0).float()
+
+        if len(logits.shape) == 2:
+            logits = logits.squeeze(-1)
+
+        _, _, _, _, _, [patient_ids, _, _, indices] = batchs 
+        logits = logits.squeeze()
+
+        unique_pids = torch.unique(patient_ids)
+
+        patient_logits = []
+        patient_labels = []
+
+        for pid in unique_pids:
+            mask = patient_ids == pid
+
+            bag_logits = logits[mask]
+            bag_label = labels[mask][0]  # patient label
+
+            if self.agg == "mean":
+                z = bag_logits.mean()
+            elif self.agg == "max":
+                z = bag_logits.max()
+            else:
+                z = torch.logsumexp(bag_logits, dim=0)
+
+            patient_logits.append(z)
+            patient_labels.append(bag_label)
+
+        patient_logits = torch.stack(patient_logits)
+        patient_labels = torch.stack(patient_labels).float()
+        return [self.bce(patient_logits, patient_labels)]
+
+def get_losses_fn(loss_type="BCE"):
+    if loss_type == "BCE":
+        return BCELossFn()
+    elif loss_type == "SPL":
+        return SPLBCELoss(keep_ratio=0.7)
+    elif loss_type == "PRL":
+        return PRLBCELoss(keep_ratio=0.8)
+    elif loss_type == "CBCE":
+        return ClippedBCELoss()
+    elif loss_type == "ELR":
+        return ELRBCELoss()
+    elif loss_type == "PAL":
+        return PatientAwareLoss()
+
+
+
 def _pairwise_distance(x, squared=False, eps=1e-16):
     # Compute the 2D matrix of distances between all the embeddings.
 

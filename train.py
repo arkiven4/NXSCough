@@ -38,7 +38,6 @@ from tqdm import tqdm
 # Local imports
 import commons
 import lightning_wrapper
-import losses
 import models
 import utils
 from cough_datasets import (
@@ -47,7 +46,7 @@ from cough_datasets import (
     CoughDatasetsProcessorCollate,
     CoughDetectionRatioBatchSampler,
     CoughDiseaseBinaryBatchSampler,
-    PatientBatchSampler
+    PatientBatchSampler, AutoPatientBatchSampler
 )
 
 torch.set_float32_matmul_precision("medium")
@@ -198,18 +197,19 @@ def create_sampler(train_fold, hps):
         sample_weights[positive_idx] = pos_weight
         sample_weights[negative_idx] = neg_weight
         
-        sampler = WeightedRandomSampler(
-            weights=sample_weights,
-            num_samples=len(sample_weights),
-            replacement=True
-        )
-
-        # patient_ids = train_fold['participant'].astype(str).values
-        # sampler = PatientBatchSampler(
-        #     patient_ids=patient_ids,
-        #     patients_per_batch=hps.train.batch_size // 2,
-        #     coughs_per_patient=2,
+        # sampler = WeightedRandomSampler(
+        #     weights=sample_weights,
+        #     num_samples=len(sample_weights),
+        #     replacement=True
         # )
+
+        patient_ids = train_fold['participant'].astype(str).values
+        labels = train_fold[hps.data.target_column].astype(int).values
+        sampler = AutoPatientBatchSampler(
+            labels=labels,
+            patient_ids=patient_ids,
+            target_batch_wavs=hps.train.batch_size,
+        )
     
     return sampler
 
@@ -252,8 +252,9 @@ def prepare_fold_data(train_fold, val_fold, hps, fold, collate_fn):
     train_loader = DataLoader(
         train_dataset, 
         num_workers=28, 
-        sampler=sampler, 
-        batch_size=hps.train.batch_size,
+        #sampler=sampler, 
+        #batch_size=hps.train.batch_size,
+        batch_sampler=sampler,
         pin_memory=True, 
         collate_fn=collate_fn
     )
@@ -517,8 +518,7 @@ def main(cli_args=None):
 
             tb_logger = TensorBoardLogger(save_dir=hps.model_dir, name=f"fold_{fold}", sub_dir="train")
             early_stopping = EarlyStopping(monitor="val/loss", patience=7, mode="min", verbose=False)
-            runner_lightning = lightning_wrapper.CoughClassificationRunner(
-                pool_model, hps=hps, custom_logger=logger, class_weights=[]) # Bcs i use Sampler
+            runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[]) # Bcs i use Sampler
             trainer = L.Trainer(
                 max_epochs=1000,
                 callbacks=[checkpoint_callback, early_stopping],
@@ -527,6 +527,9 @@ def main(cli_args=None):
                 devices="auto",
                 default_root_dir=hps.model_dir
             )
+
+            #runner_lightning.loss_fn.init_memory(num_samples=len(train_fold))
+
             trainer.fit(runner_lightning, train_dataloaders=train_loader, val_dataloaders=val_loader)
             runner_lightning.calibrate_threshold = True
             trainer.test(runner_lightning, dataloaders=val_loader)[0]
