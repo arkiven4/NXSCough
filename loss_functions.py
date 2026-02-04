@@ -7,10 +7,11 @@ class BCELossFn(nn.Module):
         super().__init__()
         self.bce = nn.BCEWithLogitsLoss()
 
-    def forward(self, logits, targets, batchs):
+    def forward(self, out_model, batchs):
+        logits = out_model["disease_logits"]
+
         if len(targets.shape) == 2:
-            targets = torch.argmax(targets, dim=1)
-            targets = (targets != 0).float()
+            targets = torch.argmax(targets, dim=1).float()
 
         if len(logits.shape) == 2:
             logits = logits.squeeze(-1)
@@ -18,7 +19,196 @@ class BCELossFn(nn.Module):
         losses = self.bce(logits, targets)
         return [losses]
 
+class BCEPatContrasiveLossFn(nn.Module):
+    def __init__(self, temperature=0.1):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss()
+        self.temperature = temperature
 
+    def forward(self, out_model, batchs):
+        logits = out_model["disease_logits"]
+        embeddings = out_model["embeddings"]
+        _, _, _, _, targets, [patient_ids, _, _, _] = batchs 
+
+        if len(targets.shape) == 2:
+            targets = torch.argmax(targets, dim=1).float()
+
+        if len(logits.shape) == 2:
+            logits = logits.squeeze(-1)
+            
+        device = embeddings.device
+        N = embeddings.size(0)
+
+        # cosine similarity
+        embeddings = F.normalize(embeddings, dim=1)
+        sim = torch.matmul(embeddings, embeddings.T) / self.temperature  # (N, N)
+
+        # mask out self-similarity
+        self_mask = torch.eye(N, device=device, dtype=torch.bool)
+        sim.masked_fill_(self_mask, -1e9)
+
+        # positives: same patient, different wav
+        pid = patient_ids.unsqueeze(0)
+        pos_mask = (pid == pid.T) & (~self_mask)
+
+        # negatives: different patient
+        neg_mask = pid != pid.T
+
+        # log-softmax over all pairs
+        log_prob = F.log_softmax(sim, dim=1)
+
+        # only keep anchors that have positives
+        valid = pos_mask.sum(dim=1) > 0
+        if valid.sum() == 0:
+            return torch.tensor(0.0, device=device)
+
+        # InfoNCE
+        loss = -(log_prob[valid] * pos_mask[valid]).sum(dim=1) / pos_mask[valid].sum(dim=1)
+        InfoNCELoss = loss.mean()
+
+        losses = self.bce(logits, targets)
+        return [losses + 0.15 * InfoNCELoss]
+
+class BinaryFocalLoss(nn.Module):
+    def __init__(self, alpha=0.5, gamma=1.5, reduction="mean"):
+        """
+        alpha: class balancing factor (float or None)
+        • Class ratio ≈ 1:1 → alpha ≈ 0.5
+        • Positives ≈ 20–30% → alpha ≈ 0.3–0.4
+        • Positives ≈ 5–10% → alpha ≈ 0.6–0.75
+        • Extreme imbalance (<2%) → alpha ≈ 0.8–0.9
+
+        gamma: focusing parameter
+        • gamma = 0 → standard BCE
+        • gamma ∈ [1,2] → mild hard-sample emphasis
+        • gamma ≥ 3 → aggressive focus on misclassified / noisy samples
+
+        • Clean labels, strong backbone → gamma = 2.0
+        • Noisy labels (your cough/TB case) → gamma = 1.0–1.5
+        • MIL / weak supervision → gamma = 0.5–1.5
+
+        reduction: 'none' | 'mean' | 'sum'
+        """
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, out_model, batchs):
+        """
+        logits: (B,) or (B, 1) raw model outputs
+        targets: (B,) binary labels {0,1}
+        """
+        logits = out_model["disease_logits"]
+        _, _, _, _, targets, [patient_ids, _, _, _] = batchs 
+
+        if len(targets.shape) == 2:
+            targets = torch.argmax(targets, dim=1).float()
+
+        if len(logits.shape) == 2:
+            logits = logits.squeeze(-1)
+
+        targets = targets.float()
+        logits = logits.view(-1)
+        targets = targets.view(-1)
+
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction="none"
+        )
+
+        p_t = torch.exp(-bce)  # = sigmoid(logits) if y=1 else 1-sigmoid
+        focal_loss = (1 - p_t) ** self.gamma * bce
+
+        if self.alpha is not None:
+            alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+            focal_loss = alpha_t * focal_loss
+
+        if self.reduction == "mean":
+            return [focal_loss.mean()]
+        elif self.reduction == "sum":
+            return [focal_loss.sum()]
+        else:
+            return [focal_loss]
+
+class NormalizedFocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, eps=1e-8):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.eps = eps
+
+    def forward(self, out_model, batchs):
+        logits = out_model["disease_logits"]
+        _, _, _, _, targets, [patient_ids, _, _, _] = batchs 
+
+        if len(targets.shape) == 2:
+            targets = torch.argmax(targets, dim=1).float()
+
+        if len(logits.shape) == 2:
+            logits = logits.squeeze(-1)
+
+        targets = targets.float().view(-1)
+        logits = logits.view(-1)
+
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction="none"
+        )
+
+        p_t = torch.exp(-bce)
+        focal = (1 - p_t) ** self.gamma * bce
+
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        focal = alpha_t * focal
+
+        # Normalization (key difference)
+        return [focal.mean() / (focal.detach().mean() + self.eps)]
+
+
+class ReverseCrossEntropy(nn.Module):
+    def __init__(self, eps=1e-7):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, out_model, batchs):
+        """
+        logits  : (B,) or (B, 1) raw outputs
+        targets : (B,) or (B, 1) binary {0,1}
+        """
+        logits = out_model["disease_logits"]
+        _, _, _, _, targets, [patient_ids, _, _, _] = batchs 
+
+        if len(targets.shape) == 2:
+            targets = torch.argmax(targets, dim=1).float()
+
+        if len(logits.shape) == 2:
+            logits = logits.squeeze(-1)
+
+        logits = logits.view(-1)
+        targets = targets.float().view(-1)
+
+        probs = torch.sigmoid(logits)
+        probs = torch.clamp(probs, self.eps, 1.0 - self.eps)
+
+        # BCE-style Reverse Cross Entropy
+        rce = -(
+            probs * torch.log(targets + self.eps) +
+            (1.0 - probs) * torch.log(1.0 - targets + self.eps)
+        )
+        return [rce.mean()]
+
+class NFL_RCE_Loss(nn.Module):
+    def __init__(self, lambda_rce=0.1):
+        super().__init__()
+        self.nfl = NormalizedFocalLoss()
+        self.rce = ReverseCrossEntropy()
+        self.lambda_rce = lambda_rce
+
+    def forward(self, out_model, batchs):
+        loss_nfl = self.nfl(out_model, batchs)[0]
+        loss_rce = self.rce(out_model, batchs)[0]
+        return [loss_nfl + self.lambda_rce * loss_rce]
+
+# https://blog.allegro.tech/2023/04/learning-from-noisy-data.html#fn:2
 class SPLBCELoss(nn.Module):
     def __init__(self, keep_ratio=0.7):
         super().__init__()
@@ -203,19 +393,11 @@ class PatientAwareLoss(nn.Module):
         patient_labels = torch.stack(patient_labels).float()
         return [self.bce(patient_logits, patient_labels)]
 
-def get_losses_fn(loss_type="BCE"):
-    if loss_type == "BCE":
-        return BCELossFn()
-    elif loss_type == "SPL":
-        return SPLBCELoss(keep_ratio=0.7)
-    elif loss_type == "PRL":
-        return PRLBCELoss(keep_ratio=0.8)
-    elif loss_type == "CBCE":
-        return ClippedBCELoss()
-    elif loss_type == "ELR":
-        return ELRBCELoss()
-    elif loss_type == "PAL":
-        return PatientAwareLoss()
+def get_losses_fn(loss_type="BCELossFn"):
+    loss_cls = globals().get(loss_type)
+    if loss_cls is None:
+        raise ValueError(f"Unknown loss type: {loss_type}")
+    return loss_cls()
 
 
 

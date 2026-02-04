@@ -10,7 +10,7 @@
     "eps": 1e-9,
     "lr_decay": 0.999875,
     "batch_size": 128,
-    "loss_function": "PAL",
+    "loss_function": "BCELossFn",
     "use_Kfold": true,
     "mae_training": false,
     "ssccl_training": false
@@ -64,6 +64,7 @@
     "pooling_model": "ResNet34ManualClassifier",
     "use_tabular": false,
     "feature_dim": 240,
+    "hidden_size": 128,
     "output_dim": 1,
 
     "lora_finetune": true,

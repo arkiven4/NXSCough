@@ -34,7 +34,7 @@ python train.py --init --model_name resnet34pal_logmel --pooling_model ResNet34M
 # TODO: mutimask effect, no augment effect
 
 
-python train.py --init --model_name resnet34prl_logmel --pooling_model ResNet34ManualClassifier --feature_type logmel --feature_dim 80 --config_path configs/general.json 
+python train.py --init --model_name bilstm_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel --feature_dim 80 --config_path configs/general.json
 ###################################################################################################################################
 # TODO: MIXUP,  
 

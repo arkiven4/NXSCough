@@ -197,11 +197,11 @@ class ResNet34ManualClassifier(nn.Module):
         """
         x = x.unsqueeze_(1)
         stats = self.encoder1(x)  # torch.Size([128, 5120])
-        
         disease_logits = self.classifier(stats)
 
         return {
             "disease_logits": disease_logits,
+            "embeddings": stats,
         }
 
 
@@ -567,7 +567,6 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
             "self_attn_weights": self_attn_weights,
             "asp_weights": asp_weights,
         }
-
 
 class PEFTWavLM_Try1(nn.Module):
     def __init__(self, input_size, output_dim, lora_rank, lora_alpha, target_modules, spk_dim, **kwargs):

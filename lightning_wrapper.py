@@ -111,7 +111,7 @@ class CoughClassificationRunner(L.LightningModule):
 
         tot_loss = []
         if "disease_logits" in out_model:
-            ld = self.loss_fn(out_model["disease_logits"], dse_ids, batch)
+            ld = self.loss_fn(out_model, batch)
             tot_loss.append(ld[0])
 
         if hasattr(self.model, "calc_additional_loss"):
@@ -168,7 +168,7 @@ class CoughClassificationRunner(L.LightningModule):
 
         tot_loss = []
         if "disease_logits" in out_model:
-            ld = self.loss_fn(out_model["disease_logits"], dse_ids, batch)
+            ld = self.loss_fn(out_model, batch)
             tot_loss.append(ld[0])
 
         if hasattr(self.model, "calc_additional_loss"):
@@ -182,10 +182,8 @@ class CoughClassificationRunner(L.LightningModule):
         #     tot_loss.append(self.center_loss(out_model["embedding"], dse_ids) * 0.005)
 
         loss = sum(tot_loss)
-        self.logger.experiment.add_scalars(
-            'loss', {'valid': loss}, self.global_step)
-        self.log("val/loss", loss, on_step=False,
-                 on_epoch=True, prog_bar=False, logger=True)
+        self.logger.experiment.add_scalars('loss', {'valid': loss}, self.global_step)
+        self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
 
     def on_test_epoch_start(self):
         self.test_preds = []
@@ -195,8 +193,7 @@ class CoughClassificationRunner(L.LightningModule):
     def test_step(self, batch, batch_idx):
         _, audio1, audio2, attention_masks, dse_ids, [_, _, tabular_ids, _] = batch
         dse_ids = dse_ids.float()
-        logits = self.forward(audio1, audio2, attention_mask=attention_masks,
-                              tabular_ids=tabular_ids)["disease_logits"]
+        logits = self.forward(audio1, audio2, attention_mask=attention_masks, tabular_ids=tabular_ids)["disease_logits"]
 
         if self.hps.train.loss_function == "BCE":
             probs = torch.sigmoid(logits)     # [B]
@@ -230,8 +227,7 @@ class CoughClassificationRunner(L.LightningModule):
         n_classes = cm.shape[0]
 
         # sanity check: binary only
-        assert cm.shape == (
-            2, 2), f"Expected binary confusion matrix, got {cm.shape}"
+        assert cm.shape == (2, 2), f"Expected binary confusion matrix, got {cm.shape}"
 
         TN, FP = cm[0, 0], cm[0, 1]
         FN, TP = cm[1, 0], cm[1, 1]
