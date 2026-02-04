@@ -456,7 +456,7 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
         
         self.use_tabular = use_tabular
         self.fusion_type = fusion_type
-        fusion_dim = 2048
+        fusion_dim = hidden_size * 4
 
         # ========== AUDIO BACKBONE ==========
         # self.frontend = modules.FeatureFrontend(in_freq=feature_dim, out_dim=int(feature_dim * 1.6))
@@ -537,9 +537,9 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
 
             if self.training:
                 r = torch.rand(1, device=audio_feat.device)
-                if r < 0.2:
-                    audio_feat = torch.zeros_like(audio_feat)
-                elif r < 0.2 + 0.2:
+                # if r < 0.2:
+                #     audio_feat = torch.zeros_like(audio_feat)
+                if r < 0.2 + 0.2:
                     tab_feat = torch.zeros_like(tab_feat)
 
             # ---- Dynamic Gating ----

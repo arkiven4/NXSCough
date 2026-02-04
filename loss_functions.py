@@ -9,6 +9,7 @@ class BCELossFn(nn.Module):
 
     def forward(self, out_model, batchs):
         logits = out_model["disease_logits"]
+        _, _, _, _, targets, [patient_ids, _, _, _] = batchs
 
         if len(targets.shape) == 2:
             targets = torch.argmax(targets, dim=1).float()

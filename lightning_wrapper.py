@@ -188,32 +188,29 @@ class CoughClassificationRunner(L.LightningModule):
     def on_test_epoch_start(self):
         self.test_preds = []
         self.test_labels = []
-        self.test_logits = []
+        self.test_probs = []
 
     def test_step(self, batch, batch_idx):
         _, audio1, audio2, attention_masks, dse_ids, [_, _, tabular_ids, _] = batch
-        dse_ids = dse_ids.float()
         logits = self.forward(audio1, audio2, attention_mask=attention_masks, tabular_ids=tabular_ids)["disease_logits"]
 
-        if self.hps.train.loss_function == "BCE":
+        dse_ids = dse_ids.float()
+        labels = torch.argmax(dse_ids, dim=1)
+        if logits.shape[-1] == 1:
             probs = torch.sigmoid(logits)     # [B]
             preds = (probs >= self.probs_threshold).long()     # [B]
         else:
-            preds = torch.argmax(logits, dim=1)
-
-        labels = torch.argmax(dse_ids, dim=1)
-        logits = torch.sigmoid(logits).detach()
-        # probs = torch.softmax(logits, dim=1)[:, 1].numpy()
-        # labels = (labels != 0).float() # TEMPORARY
+            probs = torch.softmax(logits, dim=1)
+            preds = torch.argmax(probs, dim=1)
 
         self.test_preds.append(preds.cpu())
         self.test_labels.append(labels.cpu())
-        self.test_logits.append(logits.cpu())
+        self.test_probs.append(probs.cpu())
 
     def on_test_epoch_end(self):
         preds = torch.cat(self.test_preds).numpy()
         labels = torch.cat(self.test_labels).numpy()
-        probs = torch.cat(self.test_logits).numpy()
+        probs = torch.cat(self.test_probs).numpy()
 
         if self.calibrate_threshold:
             optimized_threshold = utils.optimize_threshold_youden(labels, probs)
