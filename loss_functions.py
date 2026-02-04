@@ -397,7 +397,9 @@ class PatientAwareLoss(nn.Module):
 def get_losses_fn(loss_type="BCELossFn"):
     loss_cls = globals().get(loss_type)
     if loss_cls is None:
-        raise ValueError(f"Unknown loss type: {loss_type}")
+        loss_cls = globals().get("BCELossFn")
+        return loss_cls()
+        #raise ValueError(f"Unknown loss type: {loss_type}")
     return loss_cls()
 
 

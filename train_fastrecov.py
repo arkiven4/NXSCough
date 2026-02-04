@@ -34,6 +34,7 @@ from sklearn.model_selection import StratifiedKFold, train_test_split, Stratifie
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torchvision import datasets, transforms
 from tqdm import tqdm
+from sklearn.model_selection import KFold
 
 # Local imports
 import commons
@@ -199,19 +200,19 @@ def create_sampler(train_fold, hps):
         sample_weights[positive_idx] = pos_weight
         sample_weights[negative_idx] = neg_weight
         
-        # sampler = WeightedRandomSampler(
-        #     weights=sample_weights,
-        #     num_samples=len(sample_weights),
-        #     replacement=True
-        # )
-
-        patient_ids = train_fold['participant'].astype(str).values
-        labels = train_fold[hps.data.target_column].astype(int).values
-        sampler = AutoPatientBatchSampler(
-            labels=labels,
-            patient_ids=patient_ids,
-            target_batch_wavs=hps.train.batch_size,
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True
         )
+
+        # patient_ids = train_fold['participant'].astype(str).values
+        # labels = train_fold[hps.data.target_column].astype(int).values
+        # sampler = AutoPatientBatchSampler(
+        #     labels=labels,
+        #     patient_ids=patient_ids,
+        #     target_batch_wavs=hps.train.batch_size,
+        # )
     
     return sampler
 
@@ -223,26 +224,26 @@ def prepare_fold_data(train_fold, val_fold, hps, fold, collate_fn):
         utils.compute_spectrogram_stats_from_dataset(
             train_fold, 
             hps.data, 
-            pickle_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle"
+            pickle_path=f"{hps.model_dir}/wav_stats.pickle"
         )
     else:
         utils.compute_wav_stats(
             train_fold, 
             "path_file", 
-            pickle_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle"
+            pickle_path=f"{hps.model_dir}/wav_stats.pickle"
         )
     
     # Create datasets
     train_dataset = CoughDatasets(
         train_fold.values, 
         hps.data,
-        wav_stats_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle", 
+        wav_stats_path=f"{hps.model_dir}/wav_stats.pickle", 
         train=True
     )
     val_dataset = CoughDatasets(
         val_fold.values, 
         hps.data,
-        wav_stats_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle", 
+        wav_stats_path=f"{hps.model_dir}/wav_stats.pickle", 
         train=False
     )
     
@@ -254,9 +255,9 @@ def prepare_fold_data(train_fold, val_fold, hps, fold, collate_fn):
     train_loader = DataLoader(
         train_dataset, 
         num_workers=28, 
-        # sampler=sampler, 
-        # batch_size=hps.train.batch_size,
-        batch_sampler=sampler,
+        sampler=sampler, 
+        batch_size=hps.train.batch_size,
+        #batch_sampler=sampler,
         pin_memory=True, 
         collate_fn=collate_fn
     )
@@ -419,6 +420,58 @@ def cleanup_fold_directories(model_dir, best_fold_idx=None):
     else:
         print("best_model.ckpt not found; no folders removed.")
 
+def set_seed(seed: int = 42) -> None:
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    # When running on the CuDNN backend, two further options must be set
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # Set a fixed value for the hash seed
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    print(f"Random seed set as {seed}")
+
+from typing import Dict, List, Tuple
+def get_sample_probs(weights:np.array, tau:float) -> np.array:
+    '''
+    Gets sampling probability based on weights
+    '''
+    exp_i = np.exp(weights/tau)
+    return exp_i/np.sum(exp_i)
+
+def sample_folds(n_folds:int, weights:np.array, tau:float) -> Tuple[List,Dict]:
+    '''
+    Given weights of the sample, performs weighted sampling into n_folds
+    taking temperature tau into account
+    '''
+    n_samples = len(weights)
+    #Assuming 'best' is the best fold and 'worst' is the worst fold and 'rest' are in between folds
+    fold_id = {"best":[],"rest":[],"worst":[]}
+    p_i = get_sample_probs(weights,tau)
+    if tau<0.0001:
+        #tau = 0 case, deterministic
+        ordering = np.argsort(weights)[::-1]
+    elif tau>10000:
+        #infinite tau case
+        ordering = np.random.permutation(len(weights))
+    else:
+        ordering = np.random.choice(n_samples,size=n_samples,replace=False,p=p_i)
+    fold_id["best"] = ordering[:int(n_samples/n_folds)]
+    fold_id["rest"] = ordering[int(n_samples/n_folds):(n_folds-1)*int(n_samples/n_folds)]
+    fold_id["worst"] = ordering[(n_folds-1)*int(n_samples/n_folds):]
+    # Convert into train_test splits
+    rest_ids = fold_id["rest"]
+    #split into n-2 folds with two reserved for best and worst
+    rest_ids = [rest_ids[i*int(np.ceil(len(rest_ids)/(n_folds-2))):(i+1)*int(np.ceil(len(rest_ids)/(n_folds-2)))] for i in range(n_folds-2)]
+    folds = [fold_id["best"]] + rest_ids + [fold_id["worst"]]
+    fold_splits = []
+    for i in range(n_folds):
+        temp = folds.copy()
+        test_ids = np.random.permutation(temp.pop(i))
+        train_ids = np.random.permutation(np.concatenate(temp))
+        fold_splits.append((train_ids,test_ids))
+    return fold_splits, fold_id
 
 #######################################################################
 # MAIN SCRIPT
@@ -462,9 +515,15 @@ def main(cli_args=None):
     # =============================================================
     # SECTION: Loading Data
     # =============================================================
-    df_train, df_test = load_data(hps)
+    df_train, _ = load_data(hps)
     collate_fn = get_collate_fn(hps)
     target_labels = df_train[hps.data.target_column]
+
+    utils.compute_spectrogram_stats_from_dataset(
+        df_train, 
+        hps.data, 
+        pickle_path=f"{hps.model_dir}/wav_stats.pickle"
+    )
 
     # =============================================================
     # SECTION: Model Setup
@@ -490,18 +549,40 @@ def main(cli_args=None):
     # =============================================================
     # SECTION: Setup Logger, Dataloader
     # =============================================================
-    fold_metrics = []
-    fold_checkpoints = []
-    fold_thresholds = []
+    N_RUNS = 10
+    N_FOLDS = 5
+    TAU = 0.1
+    RANDOM_STATE = 1
+    MEMORY_NOISE_THRES = 0.4
+    #Dropping bottom x% of the dataset
+    NOISY_DROP = 0.5
 
-    if not args.eval:
-        splitter, num_folds = create_data_split(df_train, target_labels, use_kfold=hps.train.use_Kfold)
+    kf = KFold(n_splits=N_FOLDS, random_state=RANDOM_STATE, shuffle=True)
+    fold_splits = list(kf.split(df_train, target_labels))
 
-        for fold, (train_idx, val_idx) in enumerate(splitter):
-            logger.info(f"\n{'='*20} Fold {fold+1}/{num_folds} {'='*20}")
+    memory = np.zeros_like(target_labels)
+    identified = []
+    for seed in range(RANDOM_STATE, RANDOM_STATE + N_RUNS):
+        logger.info(f"\n{'='*20} Run {seed}/{N_RUNS} {'='*20}")
+        set_seed(seed)
+        test_labels = []
+        test_probs = []
+        test_preds = []
+        test_ids = []
 
-            train_fold = df_train.iloc[train_idx].reset_index(drop=True)
-            val_fold = df_train.iloc[val_idx].reset_index(drop=True)
+        for fold, (train_idx, test_idx) in enumerate(fold_splits):
+            logger.info(f"\n{'='*20} Fold {fold+1}/{N_FOLDS} {'='*20}")
+            if len(identified) > 0:
+                drop_idx = np.random.permutation(identified)[:int(NOISY_DROP*len(identified))]
+                train_idx = list(set(train_idx) - set(drop_idx))
+
+            trainval_fold = df_train.iloc[train_idx].reset_index(drop=True)
+            test_fold = df_train.iloc[test_idx].reset_index(drop=True)
+
+            sgkf_fold = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+            trainfold_idx, valfold_idx = next(sgkf_fold.split(trainval_fold, trainval_fold[hps.data.target_column], trainval_fold["participant"]))
+            train_fold = trainval_fold.iloc[trainfold_idx].reset_index(drop=True)
+            val_fold  = trainval_fold.iloc[valfold_idx].reset_index(drop=True)
 
             # Prepare data loaders
             train_loader, val_loader = prepare_fold_data(train_fold, val_fold, hps, fold, collate_fn)
@@ -520,7 +601,7 @@ def main(cli_args=None):
 
             tb_logger = TensorBoardLogger(save_dir=hps.model_dir, name=f"fold_{fold}", sub_dir="train")
             early_stopping = EarlyStopping(monitor="val/loss", patience=7, mode="min", verbose=False)
-            runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[]) # Bcs i use Sampler
+            runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[])
             trainer = L.Trainer(
                 max_epochs=1000,
                 callbacks=[checkpoint_callback, early_stopping],
@@ -530,141 +611,80 @@ def main(cli_args=None):
                 default_root_dir=hps.model_dir
             )
 
-            #runner_lightning.loss_fn.init_memory(num_samples=len(train_fold))
-
             trainer.fit(runner_lightning, train_dataloaders=train_loader, val_dataloaders=val_loader)
             runner_lightning.calibrate_threshold = True
             trainer.test(runner_lightning, dataloaders=val_loader)[0]
             runner_lightning.calibrate_threshold = False
+            optimized_threshold = runner_lightning.probs_threshold
 
-            results = trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
-            if results:
-                current_bacc = results[0].get('test_bacc', 0.0)
-                logger.info(f"Fold {fold+1} Balanced Accuracy: {current_bacc:.4f}")
-                fold_metrics.append(current_bacc)
-                fold_checkpoints.append(checkpoint_callback.best_model_path)
-                fold_thresholds.append(runner_lightning.probs_threshold)
+            test_dataset = CoughDatasets(
+                test_fold.values, 
+                hps.data,
+                wav_stats_path=f"{hps.model_dir}/wav_stats.pickle", 
+                train=False
+            )
+            test_loader = DataLoader(
+                test_dataset, 
+                num_workers=28, 
+                shuffle=False, 
+                batch_size=hps.train.batch_size,
+                pin_memory=True, 
+                collate_fn=collate_fn
+            )
 
-    if not args.eval and hps.train.use_Kfold:
-        best_fold_idx, production_path = select_best_fold(fold_metrics, fold_checkpoints, hps.model_dir, logger)
-        save_fold_info(best_fold_idx, fold_metrics, fold_thresholds, hps.model_dir)
-    elif not args.eval:
-        best_fold_idx = 0
-        best_model_path = fold_checkpoints[best_fold_idx]
-        production_path = os.path.join(hps.model_dir, "best_model.ckpt")
-        shutil.copy2(best_model_path, production_path)
-        save_fold_info(best_fold_idx, fold_metrics, fold_thresholds, hps.model_dir)
-    else:
-        # In eval mode, load best_fold_idx from existing info_fold.pkl
-        info_fold_data = load_fold_info(hps.model_dir)
-        best_fold_idx = info_fold_data.get("best_fold_idx", 0)
+            pool_model = pool_net(hps.model.feature_dim, **hps.model)
+            runner_lightning = lightning_wrapper.CoughClassificationRunner.load_from_checkpoint(
+                trainer.checkpoint_callback.best_model_path,     
+                model=pool_model,
+                hps=hps, custom_logger=logger
+            ).cuda()
+            runner_lightning.eval()
+            runner_lightning.probs_threshold = optimized_threshold
 
-    # =============================================================
-    # SECTION: Test Phase
-    # =============================================================
-    db_map = {
-        0: "TBCoda Logitudinal",
-        1: "TBCoda Solicited",
-        2: "TBScreen Logitudinal",
-        3: "TBScreen Solicited",
-        4: "CIRDZ",
-        5: "UK19Covid",
-    }
+            fold_test_labels = []
+            fold_test_probs = []
+            fold_test_preds = []
+            with torch.no_grad():
+                for idx, batch in tqdm(enumerate(test_loader), total=len(test_loader)):
+                    wavnames, audio, _, attention_masks, dse_ids, [patient_ids, _, _, _] = batch
+                    audio = audio.cuda()
+                    attention_masks = attention_masks.cuda()
+                    out_model = runner_lightning.model.forward(audio, attention_mask=attention_masks)
+                    logits = out_model['disease_logits']
 
-    runner_lightning = lightning_wrapper.CoughClassificationRunner.load_from_checkpoint(
-        os.path.join(hps.model_dir, "best_model.ckpt"),
-        model=pool_model,
-        hps=hps, custom_logger=logger
-    )
-    runner_lightning.eval()
-    trainer = L.Trainer(accelerator="gpu" if torch.cuda.is_available() else "cpu", devices="auto")
+                    probs = torch.sigmoid(logits).squeeze(-1)  # [B]
+                    preds = (probs >= runner_lightning.probs_threshold).long().cpu().detach().numpy()
+                    labels = torch.argmax(dse_ids, dim=1).cpu().detach().numpy()
 
-    info_fold = load_fold_info(hps.model_dir)
-    best_fold_idx = info_fold["best_fold_idx"]
-    fold_metrics = info_fold["fold_metrics"]
-    runner_lightning.probs_threshold = info_fold['best_threshold']
+                    fold_test_labels.extend(labels)
+                    fold_test_probs.extend(probs.cpu().detach().numpy())
+                    fold_test_preds.extend(preds)
 
-    ###### Calibrate Threshold or Load if Exist
-    # if os.path.exists(os.path.join(model_dir, "probs_threshold.pkl")):
-    #     with open(os.path.join(model_dir, "probs_threshold.pkl"), "rb") as f:
-    #         runner_lightning.probs_threshold = pickle.load(f)['probs_threshold']
-    # else:
-    #     splitter, num_folds = create_data_split(df_train, target_labels, use_kfold=hps.train.use_Kfold)
-    #     train_idx, val_idx = list(splitter)[best_fold_idx]
-
-    #     train_fold = df_train.iloc[train_idx].reset_index(drop=True)
-    #     val_fold = df_train.iloc[val_idx].reset_index(drop=True)
-    #     train_loader, val_loader = prepare_fold_data(train_fold, val_fold, hps, best_fold_idx, collate_fn)
-
-    #     runner_lightning.calibrate_threshold = True
-    #     results = trainer.test(runner_lightning, dataloaders=val_loader)[0]
-    #     runner_lightning.calibrate_threshold = False
+            test_labels.append(fold_test_labels)
+            test_probs.append(fold_test_probs)
+            test_preds.append(fold_test_preds)
+            test_ids.append(test_idx)
         
-    #     payload = {
-    #         "probs_threshold": runner_lightning.probs_threshold,
-    #     }
-    #     with open(os.path.join(model_dir, "probs_threshold.pkl"), "wb") as f:
-    #         pickle.dump(payload, f)
+        test_labels_all = np.concatenate(test_labels)
+        pred_probs_all = np.concatenate(test_probs)
+        test_ids_all = np.concatenate(test_ids)
+        
+        #idx_temp = np.stack((np.arange(len(test_labels_all)), test_labels_all))
+        #temp =  pred_probs_all[idx_temp[0,:], idx_temp[1,:]] # For Multiclass, Extract Only True Probs
+        # “How confident is the model that the ground-truth label is correct?”
+        temp = np.where(test_labels_all == 1, pred_probs_all, 1 - pred_probs_all)
+        weights = 1 - (temp.max() - temp)
+        # weights = (temp - temp.min()) / (temp.max() - temp.min() + 1e-8)
+        weights = weights[np.argsort(test_ids_all)]
+        memory = 0.3 * weights + 0.7 * memory
 
-    ############################################# Overall Report #########################################################
-    with open(f"{model_dir}/result_overall.txt", "w") as f:
-        f.write(f"")
+        fold_splits, fold_ids = sample_folds(N_FOLDS, memory, TAU)
+        identified = np.where(memory<=MEMORY_NOISE_THRES)[0]
+        np.save(f"{hps.model_dir}/memory.npy", memory)
 
-    df_train_eval = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.train')
-    df_train_eval = df_train_eval.reset_index(drop=True)
-    df_train_eval = df_train_eval[hps.data.column_order]
-
-    results_dict = evaluate_on_dataset(runner_lightning, trainer, df_train_eval, hps, best_fold_idx, collate_fn)
-    write_results_to_file("result_overall.txt", results_dict, model_dir, {0: "Train"})
-
-    df_test_eval = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.test')
-    df_test_eval = df_test_eval.reset_index(drop=True)
-    df_test_eval = df_test_eval[hps.data.column_order]
-
-    runner_lightning.generate_figure = True
-    results_dict = evaluate_on_dataset(runner_lightning, trainer, df_test_eval, hps, best_fold_idx, collate_fn)
-    write_results_to_file("result_overall.txt", results_dict, model_dir, {0: "Test"})
-    runner_lightning.generate_figure = False
-
-    df_cirdz = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/cirdz.csv.test')
-    df_cirdz = df_cirdz.reset_index(drop=True)
-    df_cirdz = df_cirdz[hps.data.column_order]
-
-    results_dict = evaluate_on_dataset(runner_lightning, trainer, df_cirdz, hps, best_fold_idx, collate_fn)
-    write_results_to_file("result_overall.txt", results_dict, model_dir, {0: "Unseen"})
-    ############################################# PerDB Report ###########################################################
-    # Handle result_summary.txt versioning
-    rotate_result_summary(model_dir)
-    with open(f"{model_dir}/result_summary.txt", "w") as f:
-        f.write(f"{'='*25} Train Phase {'='*25}\n")
-    df_train_eval = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.train')
-    df_train_eval = df_train_eval.reset_index(drop=True)
-    df_train_eval = df_train_eval[hps.data.column_order + ['db']]
-
-    results_dict = evaluate_on_dataset(runner_lightning, trainer, df_train_eval, hps, best_fold_idx, collate_fn, db_column='db')
-    write_results_to_file("result_summary.txt", results_dict, model_dir, db_map)
-
-    with open(f"{model_dir}/result_summary.txt", "a") as f:
-        f.write(f"\n{'='*25} Test Phase {'='*25}\n")
-    df_test_eval = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.test')
-    df_test_eval = df_test_eval.reset_index(drop=True)
-    df_test_eval = df_test_eval[hps.data.column_order + ['db']]
-
-    results_dict = evaluate_on_dataset(runner_lightning, trainer, df_test_eval, hps, best_fold_idx, collate_fn, db_column='db')
-    write_results_to_file("result_summary.txt", results_dict, model_dir, db_map)
-
-    df_cirdz = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/cirdz.csv.test')
-    df_cirdz = df_cirdz.reset_index(drop=True)
-    df_cirdz = df_cirdz[hps.data.column_order]
-
-    results_dict = evaluate_on_dataset(runner_lightning, trainer, df_cirdz, hps, best_fold_idx, collate_fn)
-    write_results_to_file("result_summary.txt", results_dict, model_dir, {0: "CIRDZ"})
-
-    # =============================================================
-    # SECTION: Cleaning
-    # =============================================================
-    cleanup_fold_directories(hps.model_dir, best_fold_idx)
-
+    identified = np.where(memory<=MEMORY_NOISE_THRES)[0]
+    np.save(f"{hps.model_dir}/identified.npy", identified)
+    
 
 if __name__ == "__main__":
     main()

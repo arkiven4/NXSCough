@@ -41,3 +41,7 @@ python train.py --eval --model_name resnet34fl_logmel
 python train.py --eval --model_name resnet34rce_logmel
 python train.py --eval --model_name resnet34pal_logmel
 python train.py --eval --model_name resnet34bcepat_logmel
+
+
+
+python train_fastrecov.py --init --model_name bilstmfastrecov_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel --feature_dim 80 --config_path configs/general.json
