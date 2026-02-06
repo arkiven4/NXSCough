@@ -9,7 +9,7 @@ python precompute_features.py \
   --output_dir ./precomputed_features \
   --feature_type logmel
 
-python train_fastrecov.py --model_name participant2 --use_precomputed --precomputed_dir ./precomputed_features --config_path configs/general.json 
+python train_fastrecov.py  --init --model_name participant2 --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features 
 
 
 ############################################################### PHASE 1 ###############################################################

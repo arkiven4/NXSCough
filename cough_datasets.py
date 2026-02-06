@@ -238,13 +238,16 @@ class CoughDatasets(torch.utils.data.Dataset):
         if self.use_precomputed and hasattr(self, 'feature_path_col'):
             # filename is actually the row data, extract feature path
             feature_path = filename[self.feature_path_col] if isinstance(filename, (list, np.ndarray)) else filename
-            if feature_path and pd.notna(feature_path) and os.path.exists(str(feature_path)):
-                audio = torch.load(feature_path)
-                audio = audio.unsqueeze(0)
-                if dse_id is not None and self.nClasses is not None:
-                    # Note: mix_audio_sample expects non-transformed audio, skip for precomputed
-                    pass
-                return audio, dse_id
+            #if feature_path and pd.notna(feature_path) and os.path.exists(str(feature_path)):
+            audio = torch.load(feature_path)
+            audio = audio.unsqueeze(0)
+            eye = torch.eye(self.nClasses, dtype=torch.float32)
+            dse_id = eye[dse_id]
+            dse_id = dse_id.unsqueeze(0)
+            # if dse_id is not None and self.nClasses is not None:
+            #     # Note: mix_audio_sample expects non-transformed audio, skip for precomputed
+            #     pass
+            return audio, dse_id
         
         audio = utils.load_audio_sample(filename, self.sampling_rate, self.saming_length, self.desired_length, fade_samples_ratio=self.fade_samples_ratio,
                                         pad_types=self.pad_types, train=self.train)  # repeat zero
@@ -340,7 +343,6 @@ class CoughDatasets(torch.utils.data.Dataset):
         return audio, dse_id
 
     def mix_audio_sample(self, wav, dse_id):
-
         dse_id = int(dse_id)
         if not (self.mix_audio and self.train):
             if self.nClasses == 1:

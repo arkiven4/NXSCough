@@ -586,11 +586,12 @@ def main(cli_args=None):
     collate_fn = get_collate_fn(hps)
     target_labels = df_train[hps.data.target_column]
 
-    utils.compute_spectrogram_stats_from_dataset(
-        df_train, 
-        hps.data, 
-        pickle_path=f"{hps.model_dir}/wav_stats.pickle"
-    )
+    if not args.use_precomputed:
+        utils.compute_spectrogram_stats_from_dataset(
+            df_train, 
+            hps.data, 
+            pickle_path=f"{hps.model_dir}/wav_stats.pickle"
+        )
 
     # =============================================================
     # SECTION: Model Setup
@@ -611,7 +612,7 @@ def main(cli_args=None):
     else:
         logger.info(f"✨ Running in EVAL mode")
     logger.info(f"======================================")
-
+    
     pool_net, pool_model = setup_model(hps, is_init=args.init)
     # =============================================================
     # SECTION: Setup Logger, Dataloader
