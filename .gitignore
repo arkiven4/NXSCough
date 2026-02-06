@@ -6,6 +6,7 @@ logs_*/
 baklogs_*/
 lightning_logs/
 preprocessed_data
+precomputed_features
 *.zip
 data/TB_resample/
 test.ipynb

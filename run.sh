@@ -4,6 +4,14 @@
 # NOW -> nfft1024
 # Next -> Change folder logs, and retrrain for nfft2048
 
+python precompute_features.py \
+  --config configs/general.json  \
+  --output_dir ./precomputed_features \
+  --feature_type logmel
+
+python train_fastrecov.py --model_name participant2 --use_precomputed --precomputed_dir ./precomputed_features --config_path configs/general.json 
+
+
 ############################################################### PHASE 1 ###############################################################
 python train.py --init --model_name resnet34_mfcc --pooling_model ResNet34ManualClassifier --feature_type mfcc --feature_dim 13 --config_path configs/general.json 
 python train.py --init --model_name resnet34_melspectogram --pooling_model ResNet34ManualClassifier --feature_type melspectogram --feature_dim 80 --config_path configs/general.json 

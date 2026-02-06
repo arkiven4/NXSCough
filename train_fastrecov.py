@@ -248,35 +248,66 @@ def create_sampler(train_fold, hps):
     return sampler
 
 
-def prepare_fold_data(train_fold, val_fold, hps, fold, collate_fn):
+def prepare_fold_data(train_fold, val_fold, hps, fold, collate_fn, use_precomputed=False, precomputed_dir=None):
     """Prepare datasets and dataloaders for a fold."""
-    # Compute statistics
-    if hps.data.acoustic_feature and hps.data.mean_std_norm:
-        utils.compute_spectrogram_stats_from_dataset(
-            train_fold, 
-            hps.data, 
-            pickle_path=f"{hps.model_dir}/wav_stats.pickle"
+    # Skip statistics computation if using precomputed features
+    if not use_precomputed:
+        # Compute statistics
+        if hps.data.acoustic_feature and hps.data.mean_std_norm:
+            utils.compute_spectrogram_stats_from_dataset(
+                train_fold, 
+                hps.data, 
+                pickle_path=f"{hps.model_dir}/wav_stats.pickle"
+            )
+        else:
+            utils.compute_wav_stats(
+                train_fold, 
+                "path_file", 
+                pickle_path=f"{hps.model_dir}/wav_stats.pickle"
+            )
+    
+    # Load precomputed feature mappings if enabled
+    train_data = train_fold
+    val_data = val_fold
+    feature_path_col = None
+    
+    if use_precomputed and precomputed_dir:
+        # Load feature mapping CSV
+        mapping_train = pd.read_csv(os.path.join(precomputed_dir, "feature_mapping_train.csv"))
+        # Merge with current fold data based on file path
+        train_data = train_fold.merge(
+            mapping_train[['path_file', 'feature_path']], 
+            on='path_file', 
+            how='left'
         )
-    else:
-        utils.compute_wav_stats(
-            train_fold, 
-            "path_file", 
-            pickle_path=f"{hps.model_dir}/wav_stats.pickle"
+        val_data = val_fold.merge(
+            mapping_train[['path_file', 'feature_path']], 
+            on='path_file', 
+            how='left'
         )
+        # Get column index for feature_path
+        feature_path_col = list(train_data.columns).index('feature_path')
     
     # Create datasets
     train_dataset = CoughDatasets(
-        train_fold.values, 
+        train_data.values, 
         hps.data,
-        wav_stats_path=f"{hps.model_dir}/wav_stats.pickle", 
-        train=True
+        wav_stats_path=f"{hps.model_dir}/wav_stats.pickle" if not use_precomputed else None, 
+        train=True,
+        use_precomputed=use_precomputed
     )
     val_dataset = CoughDatasets(
-        val_fold.values, 
+        val_data.values, 
         hps.data,
-        wav_stats_path=f"{hps.model_dir}/wav_stats.pickle", 
-        train=False
+        wav_stats_path=f"{hps.model_dir}/wav_stats.pickle" if not use_precomputed else None, 
+        train=False,
+        use_precomputed=use_precomputed
     )
+    
+    # Set feature path column if using precomputed
+    if use_precomputed and feature_path_col is not None:
+        train_dataset.set_feature_path_column(feature_path_col)
+        val_dataset.set_feature_path_column(feature_path_col)
     
     # Create sampler
     sampler = create_sampler(train_fold, hps)
@@ -520,6 +551,8 @@ def parse_args():
     parser.add_argument("--delta_feature", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--deltadelta_feature", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--batch_size", type=int)
+    parser.add_argument("--use_precomputed", action="store_true", help="Use precomputed features")
+    parser.add_argument("--precomputed_dir", type=str, default=None, help="Directory with precomputed features")
     return parser
 
 
@@ -633,7 +666,11 @@ def main(cli_args=None):
             val_fold  = trainval_fold.iloc[valfold_idx].reset_index(drop=True)
 
             # Prepare data loaders
-            train_loader, val_loader = prepare_fold_data(train_fold, val_fold, hps, fold, collate_fn)
+            train_loader, val_loader = prepare_fold_data(
+                train_fold, val_fold, hps, fold, collate_fn,
+                use_precomputed=args.use_precomputed,
+                precomputed_dir=args.precomputed_dir
+            )
 
             # Initialize a FRESH model for each fold
             hps.model.spk_dim = 0
@@ -665,12 +702,27 @@ def main(cli_args=None):
             runner_lightning.calibrate_threshold = False
             optimized_threshold = runner_lightning.probs_threshold
 
+            # Prepare test data
+            test_data = test_fold
+            if args.use_precomputed and args.precomputed_dir:
+                mapping_train = pd.read_csv(os.path.join(args.precomputed_dir, "feature_mapping_train.csv"))
+                test_data = test_fold.merge(
+                    mapping_train[['path_file', 'feature_path']], 
+                    on='path_file', 
+                    how='left'
+                )
+                feature_path_col = list(test_data.columns).index('feature_path')
+            
             test_dataset = CoughDatasets(
-                test_fold.values, 
+                test_data.values, 
                 hps.data,
-                wav_stats_path=f"{hps.model_dir}/wav_stats.pickle", 
-                train=False
+                wav_stats_path=f"{hps.model_dir}/wav_stats.pickle" if not args.use_precomputed else None, 
+                train=False,
+                use_precomputed=args.use_precomputed
             )
+            
+            if args.use_precomputed and args.precomputed_dir:
+                test_dataset.set_feature_path_column(feature_path_col)
             test_loader = DataLoader(
                 test_dataset, 
                 num_workers=28, 
@@ -782,7 +834,7 @@ def main(cli_args=None):
         with open(os.path.join(hps.model_dir, "info_recov.pkl"), "wb") as f:
             pickle.dump(monitor_metrics, f)
 
-        metrics = ['test_accs', 'test_sens', 'test_spec', 'confidence']
+        metrics = ['test_accs', 'test_sens', 'test_spec', 'test_youden', 'confidence', ]
         for metric in metrics:
             values_mean = []
             for runs, values in monitor_metrics['runs'].items():

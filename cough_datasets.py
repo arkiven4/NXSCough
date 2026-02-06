@@ -56,9 +56,10 @@ viridis_lut = viridis_lut[:, :3]
 
 
 class CoughDatasets(torch.utils.data.Dataset):
-    def __init__(self, data_numpy, hparams, train=True, wav_stats_path=None):
+    def __init__(self, data_numpy, hparams, train=True, wav_stats_path=None, use_precomputed=False):
         self.audiopaths_and_text = data_numpy
         self.train = getattr(hparams, "train", train)
+        self.use_precomputed = use_precomputed
 
         self.hop_length = getattr(hparams, "hop_length", None)
         self.max_wav_value = getattr(hparams, "max_wav_value", None)
@@ -104,13 +105,13 @@ class CoughDatasets(torch.utils.data.Dataset):
                 # 0.3, 0.15, 0.2, 0.4, 0.0
                 augmentation_window_size_secs=5.5, augmentation_probability=[0.3, 0.25, 0.2, 0.25, 0.0])
 
-        if self.mean_std_norm:
+        if self.mean_std_norm and not self.use_precomputed:
             with open(wav_stats_path, 'rb') as f:
                 stats = pickle.load(f)
                 self.wav_stats = stats
 
         self.wav_transform = None
-        if hparams.acoustic_feature:
+        if hparams.acoustic_feature and not self.use_precomputed:
             if hparams.feature_type == "mfcc":
                 self.wav_transform = lambda wav: torch.tensor(librosa.feature.mfcc(
                     y=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
@@ -204,21 +205,28 @@ class CoughDatasets(torch.utils.data.Dataset):
             self.probs = [1 / self.nClasses] * self.nClasses
 
         random.seed(1234)
+    
+    def set_feature_path_column(self, col_index):
+        """Set the column index where precomputed feature paths are stored."""
+        self.feature_path_col = col_index
 
     def get_mel_text_pair(self, audiopath_and_text):
         if self.cough_detection == True:
             wavname, dse_id, gndr_id, spk_id = audiopath_and_text[0], audiopath_and_text[1], 0, 0
-            wav, dse_id = self.get_audio(self.db_path + "/" + wavname, dse_id, start_index=audiopath_and_text[2], end_index=audiopath_and_text[3])
+            filename = audiopath_and_text if self.use_precomputed else self.db_path + "/" + wavname
+            wav, dse_id = self.get_audio(filename, dse_id, start_index=audiopath_and_text[2], end_index=audiopath_and_text[3])
             wav2 = torch.empty(0, dtype=wav.dtype, device="cpu")
             return (wavname, wav, wav2, dse_id, int(spk_id), int(gndr_id))
 
         wavname, dse_id, gndr_id, spk_id = audiopath_and_text[0], audiopath_and_text[1], audiopath_and_text[2], audiopath_and_text[3]
-        wav1, dse_id = self.get_audio(self.db_path + "/" + wavname, dse_id)
+        filename = audiopath_and_text if self.use_precomputed else self.db_path + "/" + wavname
+        wav1, dse_id = self.get_audio(filename, dse_id)
         
         tabular = np.zeros((1, 4))
         wav2 = torch.empty(0, dtype=wav1.dtype, device="cpu")
         if self.ssccl_training:
-            wav2, _ = self.get_audio(self.db_path + "/" + wavname, always_augment=True)
+            filename2 = audiopath_and_text if self.use_precomputed else self.db_path + "/" + wavname
+            wav2, _ = self.get_audio(filename2, always_augment=True)
 
         if self.tabular_feature:
             tabular = torch.from_numpy(audiopath_and_text[4:8].astype("float32")).reshape(1, -1)
@@ -226,6 +234,18 @@ class CoughDatasets(torch.utils.data.Dataset):
         return (wavname, wav1, wav2, dse_id, int(spk_id), int(gndr_id), tabular)
 
     def get_audio(self, filename, dse_id=None, always_augment=False, start_index=0, end_index=-1):
+        # Load precomputed features if available
+        if self.use_precomputed and hasattr(self, 'feature_path_col'):
+            # filename is actually the row data, extract feature path
+            feature_path = filename[self.feature_path_col] if isinstance(filename, (list, np.ndarray)) else filename
+            if feature_path and pd.notna(feature_path) and os.path.exists(str(feature_path)):
+                audio = torch.load(feature_path)
+                audio = audio.unsqueeze(0)
+                if dse_id is not None and self.nClasses is not None:
+                    # Note: mix_audio_sample expects non-transformed audio, skip for precomputed
+                    pass
+                return audio, dse_id
+        
         audio = utils.load_audio_sample(filename, self.sampling_rate, self.saming_length, self.desired_length, fade_samples_ratio=self.fade_samples_ratio,
                                         pad_types=self.pad_types, train=self.train)  # repeat zero
         audio = audio - audio.mean(dim=-1, keepdim=True)
@@ -320,6 +340,7 @@ class CoughDatasets(torch.utils.data.Dataset):
         return audio, dse_id
 
     def mix_audio_sample(self, wav, dse_id):
+
         dse_id = int(dse_id)
         if not (self.mix_audio and self.train):
             if self.nClasses == 1:
