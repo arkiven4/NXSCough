@@ -324,6 +324,15 @@ class CoughClassificationRunner(L.LightningModule):
                         dpi=200, bbox_inches="tight")
             plt.close()
 
+        # self.custom_logger.info({
+        #     "acc": acc,
+        #     "bacc": b_acc,
+        #     "sens": sens,
+        #     "spec": spec,
+        #     "auroc": auroc,
+        #     "pauroc": p_auroc,
+        # })
+
         return {
             "acc": acc,
             "bacc": b_acc,

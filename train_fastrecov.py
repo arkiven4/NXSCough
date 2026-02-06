@@ -14,6 +14,7 @@ import sys
 import tempfile
 import warnings
 import glob
+import re
 
 # Third-party imports
 import librosa
@@ -56,6 +57,36 @@ cmap = cm.get_cmap("viridis")
 #######################################################################
 # REUSABLE FUNCTIONS
 #######################################################################
+
+class TeeFiltered:
+    def __init__(self, terminal, logfile):
+        self.terminal = terminal
+        self.logfile = logfile
+        self.buffer = ""
+
+        # pattern for tqdm / lightning progress lines
+        self.progress_pattern = re.compile(r"^Epoch \d+:\s+\d+%")
+
+    def write(self, data):
+        self.terminal.write(data)
+        self.terminal.flush()
+
+        # split into real lines
+        self.buffer += data
+        lines = self.buffer.split("\n")
+        self.buffer = lines.pop()
+
+        for line in lines:
+            # skip progress-bar redraw lines
+            if "\r" in line or self.progress_pattern.match(line):
+                continue
+
+            self.logfile.write(line + "\n")
+            self.logfile.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.logfile.flush()
 
 def load_config(config_path, model_dir, args):
     """Load and override configuration from JSON file."""
@@ -442,8 +473,8 @@ def get_sample_probs(weights:np.array, tau:float) -> np.array:
 
 def sample_folds(n_folds:int, weights:np.array, tau:float) -> Tuple[List,Dict]:
     '''
-    Given weights of the sample, performs weighted sampling into n_folds
-    taking temperature tau into account
+    Given weights of the sample, performs weighted sampling into n_folds taking temperature tau into account
+    Bigger τ = more uniform, more random, less influence from weights.
     '''
     n_samples = len(weights)
     #Assuming 'best' is the best fold and 'worst' is the worst fold and 'rest' are in between folds
@@ -512,6 +543,9 @@ def main(cli_args=None):
     config_path = args.config_path if args.init else os.path.join(model_dir, "config.json")
     hps = load_config(config_path, model_dir, args)
 
+    logterminal_file = open(os.path.join(model_dir, "log_terminal.txt"), "w")
+    sys.stdout = TeeFiltered(sys.__stdout__, logterminal_file)
+    sys.stderr = TeeFiltered(sys.__stderr__, logterminal_file)
     # =============================================================
     # SECTION: Loading Data
     # =============================================================
@@ -549,17 +583,26 @@ def main(cli_args=None):
     # =============================================================
     # SECTION: Setup Logger, Dataloader
     # =============================================================
-    N_RUNS = 10
+    N_RUNS = 50
     N_FOLDS = 5
     TAU = 0.1
     RANDOM_STATE = 1
     MEMORY_NOISE_THRES = 0.4
-    #Dropping bottom x% of the dataset
-    NOISY_DROP = 0.5
+    NOISY_DROP = 0.75 # Dropping bottom N * NOISY_DROP of the dataset 
+    Objective_Function_Weights = [1.0, 0.0, 0.0]
 
     kf = KFold(n_splits=N_FOLDS, random_state=RANDOM_STATE, shuffle=True)
     fold_splits = list(kf.split(df_train, target_labels))
 
+    monitor_metrics = {
+        'N_RUNS': N_RUNS,
+        'N_FOLDS': N_FOLDS,
+        'TAU': TAU,
+        'MEMORY_NOISE_THRES': MEMORY_NOISE_THRES,
+        'NOISY_DROP': NOISY_DROP,
+        'Objective_Function_Weights': Objective_Function_Weights,
+        'runs': {}
+    }
     memory = np.zeros_like(target_labels)
     identified = []
     for seed in range(RANDOM_STATE, RANDOM_STATE + N_RUNS):
@@ -568,18 +611,23 @@ def main(cli_args=None):
         test_labels = []
         test_probs = []
         test_preds = []
+        test_accs = []
+        test_youden = []
+        test_sens = []
+        test_spec = []
         test_ids = []
+        test_patient_ids = []
 
         for fold, (train_idx, test_idx) in enumerate(fold_splits):
             logger.info(f"\n{'='*20} Fold {fold+1}/{N_FOLDS} {'='*20}")
             if len(identified) > 0:
-                drop_idx = np.random.permutation(identified)[:int(NOISY_DROP*len(identified))]
+                drop_idx = np.random.permutation(identified)[:int(NOISY_DROP * len(identified))]
                 train_idx = list(set(train_idx) - set(drop_idx))
 
             trainval_fold = df_train.iloc[train_idx].reset_index(drop=True)
             test_fold = df_train.iloc[test_idx].reset_index(drop=True)
 
-            sgkf_fold = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+            sgkf_fold = StratifiedGroupKFold(n_splits=5, shuffle=True)
             trainfold_idx, valfold_idx = next(sgkf_fold.split(trainval_fold, trainval_fold[hps.data.target_column], trainval_fold["participant"]))
             train_fold = trainval_fold.iloc[trainfold_idx].reset_index(drop=True)
             val_fold  = trainval_fold.iloc[valfold_idx].reset_index(drop=True)
@@ -644,6 +692,7 @@ def main(cli_args=None):
             fold_test_labels = []
             fold_test_probs = []
             fold_test_preds = []
+            fold_test_patient_ids = []
             with torch.no_grad():
                 for idx, batch in tqdm(enumerate(test_loader), total=len(test_loader)):
                     wavnames, audio, _, attention_masks, dse_ids, [patient_ids, _, _, _] = batch
@@ -659,31 +708,98 @@ def main(cli_args=None):
                     fold_test_labels.extend(labels)
                     fold_test_probs.extend(probs.cpu().detach().numpy())
                     fold_test_preds.extend(preds)
+                    fold_test_patient_ids.extend(patient_ids.cpu().detach().numpy())
 
+            temp_labels = np.array(fold_test_labels)
+            temp_preds = np.array(fold_test_preds)
+            cm = confusion_matrix(temp_labels, temp_preds, labels=[0, 1])
+            assert cm.shape == (2, 2), f"Expected binary confusion matrix, got {cm.shape}"
+            TN, FP = cm[0, 0], cm[0, 1]
+            FN, TP = cm[1, 0], cm[1, 1]
+            sens = TP / (TP + FN) if (TP + FN) > 0 else 0.0   # TB recall
+            spec = TN / (TN + FP) if (TN + FP) > 0 else 0.0   # non-TB recall
+            b_acc = 0.5 * (sens + spec)
+            youden = sens + spec - 1.0
+            
             test_labels.append(fold_test_labels)
             test_probs.append(fold_test_probs)
             test_preds.append(fold_test_preds)
+            test_accs.append(b_acc)
+            test_youden.append(youden)
+            test_sens.append(sens)
+            test_spec.append(spec)
             test_ids.append(test_idx)
+            test_patient_ids.append(fold_test_patient_ids)
+            
         
+        number_ids = [len(i) for i in test_ids]
         test_labels_all = np.concatenate(test_labels)
         pred_probs_all = np.concatenate(test_probs)
         test_ids_all = np.concatenate(test_ids)
+        test_patient_ids_all = np.concatenate(test_patient_ids)
+
+        weights_acc = np.max(test_accs) - test_accs # distance from best fold, distance = 0, larger value.
+        weights_acc = (weights_acc - weights_acc.min()) / (weights_acc.max()-weights_acc.min()) # 0 - 1 Norm
+        weights_acc = 1 - weights_acc # Best fold → weight ≈ 1
+        weights_acc = np.concatenate([[weights_acc[i]]*number_ids[i] for i in range(N_FOLDS)])
+
+        weights_youden = np.max(test_youden) - test_youden # distance from best fold, distance = 0, larger value.
+        weights_youden = (weights_youden - weights_youden.min()) / (weights_youden.max()-weights_youden.min()) # 0 - 1 Norm
+        weights_youden = 1 - weights_youden # Best fold → weight ≈ 1
+        weights_youden = np.concatenate([[weights_youden[i]]*number_ids[i] for i in range(N_FOLDS)])
         
         #idx_temp = np.stack((np.arange(len(test_labels_all)), test_labels_all))
         #temp =  pred_probs_all[idx_temp[0,:], idx_temp[1,:]] # For Multiclass, Extract Only True Probs
         # “How confident is the model that the ground-truth label is correct?”
         temp = np.where(test_labels_all == 1, pred_probs_all, 1 - pred_probs_all)
-        weights = 1 - (temp.max() - temp)
-        # weights = (temp - temp.min()) / (temp.max() - temp.min() + 1e-8)
-        weights = weights[np.argsort(test_ids_all)]
+        #weights = 1 - (temp.max() - temp)
+        weights_probs = (temp - temp.min()) / (temp.max() - temp.min() + 1e-8)
+        weights = Objective_Function_Weights[0] * weights_probs + Objective_Function_Weights[1] * weights_acc + Objective_Function_Weights[2] * weights_youden
+        order = np.argsort(test_ids_all)
+        weights = weights[order]
+        
+        # Participant Aggregatiion
+        test_patient_ids_all = test_patient_ids_all[order]
+        _, inverse = np.unique(test_patient_ids_all, return_inverse=True)
+        pid_sum = np.bincount(inverse, weights=weights)
+        pid_cnt = np.bincount(inverse)
+        pid_mean = pid_sum / pid_cnt
+        weights = pid_mean[inverse]
+
         memory = 0.3 * weights + 0.7 * memory
 
         fold_splits, fold_ids = sample_folds(N_FOLDS, memory, TAU)
         identified = np.where(memory<=MEMORY_NOISE_THRES)[0]
         np.save(f"{hps.model_dir}/memory.npy", memory)
+        monitor_metrics['runs'][seed] = {
+            'test_accs': test_accs,
+            'test_sens': test_sens,
+            'test_spec': test_spec,
+            'test_youden': test_youden,
+            'confidence': memory,
 
+        }
+        with open(os.path.join(hps.model_dir, "info_recov.pkl"), "wb") as f:
+            pickle.dump(monitor_metrics, f)
+
+        metrics = ['test_accs', 'test_sens', 'test_spec', 'confidence']
+        for metric in metrics:
+            values_mean = []
+            for runs, values in monitor_metrics['runs'].items():
+                values_mean.append(np.mean(values[metric]))
+            plt.figure()
+            plt.plot(values_mean)
+            plt.xlabel("Run Index")
+            plt.ylabel(metric)
+            plt.title(f"{metric} across runs")
+            plt.grid(True)
+            plt.savefig(f"{hps.model_dir}/{metric}_across_runs.png", dpi=300, bbox_inches="tight")
+            plt.close()
+        
     identified = np.where(memory<=MEMORY_NOISE_THRES)[0]
     np.save(f"{hps.model_dir}/identified.npy", identified)
+    with open(os.path.join(hps.model_dir, "info_recov.pkl"), "wb") as f:
+        pickle.dump(monitor_metrics, f)
     
 
 if __name__ == "__main__":

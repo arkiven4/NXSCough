@@ -64,7 +64,7 @@
     "pooling_model": "ResNet34ManualClassifier",
     "use_tabular": false,
     "feature_dim": 240,
-    "hidden_size": 128,
+    "hidden_size": 512,
     "output_dim": 1,
 
     "lora_finetune": true,
