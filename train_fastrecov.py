@@ -14,7 +14,6 @@ import sys
 import tempfile
 import warnings
 import glob
-import re
 
 # Third-party imports
 import librosa
@@ -31,17 +30,17 @@ from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers.tensorboard import TensorBoardLogger
 from matplotlib import cm
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix
-from sklearn.model_selection import StratifiedKFold, train_test_split, StratifiedGroupKFold
+from sklearn.model_selection import StratifiedKFold, KFold, train_test_split, StratifiedGroupKFold
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torchvision import datasets, transforms
 from tqdm import tqdm
-from sklearn.model_selection import KFold
 
 # Local imports
 import commons
 import lightning_wrapper
 import models
 import utils
+import train
 from cough_datasets import (
     CoughDatasets,
     CoughDatasetsCollate,
@@ -57,430 +56,6 @@ cmap = cm.get_cmap("viridis")
 #######################################################################
 # REUSABLE FUNCTIONS
 #######################################################################
-
-class TeeFiltered:
-    def __init__(self, terminal, logfile):
-        self.terminal = terminal
-        self.logfile = logfile
-        self.buffer = ""
-
-        # pattern for tqdm / lightning progress lines
-        self.progress_pattern = re.compile(r"^Epoch \d+:\s+\d+%")
-
-    def write(self, data):
-        self.terminal.write(data)
-        self.terminal.flush()
-
-        # split into real lines
-        self.buffer += data
-        lines = self.buffer.split("\n")
-        self.buffer = lines.pop()
-
-        for line in lines:
-            # skip progress-bar redraw lines
-            if "\r" in line or self.progress_pattern.match(line):
-                continue
-
-            self.logfile.write(line + "\n")
-            self.logfile.flush()
-
-    def flush(self):
-        self.terminal.flush()
-        self.logfile.flush()
-
-def load_config(config_path, model_dir, args):
-    """Load and override configuration from JSON file."""
-    with open(config_path) as f:
-        config = json.load(f)
-    
-    # Centralized override map
-    overrides = {
-        ("model", "feature_dim"): args.feature_dim,
-        ("model", "pooling_model"): args.pooling_model,
-        ("data", "feature_type"): args.feature_type,
-        ("data", "delta_feature"): args.delta_feature,
-        ("data", "deltadelta_feature"): args.deltadelta_feature,
-        ("train", "batch_size"): args.batch_size,
-    }
-    
-    for (section, key), value in overrides.items():
-        if value is not None:
-            config.setdefault(section, {})[key] = value
-    
-    # Save updated config
-    with open(os.path.join(model_dir, "config.json"), "w") as f:
-        json.dump(config, f, indent=2)
-    
-    hps = utils.HParams(**config)
-    hps.model_dir = model_dir
-    hps.data.mae_training = hps.train.mae_training
-    hps.data.ssccl_training = hps.train.ssccl_training
-    
-    return hps
-
-
-def load_data(hps):
-    """Load training and test dataframes."""
-    df_train = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.train')
-    df_train = df_train.reset_index(drop=True)
-    df_train = df_train[hps.data.column_order]
-
-    try:
-        df_test = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.test')
-        df_test = df_test.reset_index(drop=True)
-        df_test = df_test[hps.data.column_order]
-    except:
-        df_test = None
-    
-    return df_train, df_test
-
-
-def get_collate_fn(hps):
-    """Get appropriate collate function based on model type."""
-    if "qwen" in hps.model.pooling_model.lower():
-        from transformers import Qwen3OmniMoeProcessor
-        collate_fn = CoughDatasetsProcessorCollate(
-            hps.data.many_class,
-            processor=Qwen3OmniMoeProcessor.from_pretrained(
-                "/run/media/fourier/Data1/Pras/pretrain_models/Qwen3-Omni-30B-A3B-Thinking"
-            ),
-            sampling_rate=hps.data.sampling_rate
-        )
-    else:
-        collate_fn = CoughDatasetsCollate(hps.data.many_class)
-    
-    return collate_fn
-
-
-def setup_model(hps, is_init=True):
-    """Load or initialize model based on configuration."""
-    hps.model.spk_dim = 0
-    if is_init:
-        pool_net = getattr(models, hps.model.pooling_model)
-        pool_model = pool_net(hps.model.feature_dim, **hps.model)
-        shutil.copy2('./models.py', f'{hps.model_dir}/model_net.py.bak')
-    else:
-        temp_path = tempfile.NamedTemporaryFile(suffix=".py", delete=False).name
-        shutil.copy(f"{hps.model_dir}/model_net.py.bak", temp_path)
-        spec = importlib.util.spec_from_file_location("model_net", temp_path)
-        model_modules = importlib.util.module_from_spec(spec)
-        sys.modules["model_net"] = model_modules
-        spec.loader.exec_module(model_modules)
-        pool_net = getattr(model_modules, hps.model.pooling_model)
-        pool_model = pool_net(hps.model.feature_dim, **hps.model)
-    
-    return pool_net, pool_model
-
-
-def create_data_split(df_train, target_labels, use_kfold=True, n_splits=5, test_size=0.2, random_state=42):
-    """Create train/validation splits using K-Fold or simple split."""
-    if use_kfold:
-        sgkf = StratifiedGroupKFold(
-            n_splits=n_splits,
-            shuffle=True,
-            random_state=random_state
-        )
-        splitter = sgkf.split(
-            X=df_train,
-            y=target_labels,
-            groups=df_train["participant"]
-        )
-        num_folds = sgkf.get_n_splits()
-
-        # skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-        # splitter = skf.split(df_train, target_labels)
-        # num_folds = skf.get_n_splits()
-    else:
-        train_idx, val_idx = train_test_split(
-            df_train.index.to_numpy(),
-            test_size=test_size,
-            random_state=random_state,
-            stratify=target_labels
-        )
-        splitter = [(train_idx, val_idx)]
-        num_folds = 1
-    
-    return splitter, num_folds
-
-
-def create_sampler(train_fold, hps):
-    """Create appropriate sampler for training data."""
-    if hps.data.cough_detection:
-        cough_idx = train_fold.index[train_fold["source"] == "cough"].tolist()
-        speech_idx = train_fold.index[train_fold["source"] == "speech"].tolist()
-        noise_idx = train_fold.index[train_fold["source"] == "noise"].tolist()
-        
-        sampler = CoughDetectionRatioBatchSampler(
-            cough_idx=cough_idx,
-            speech_idx=speech_idx,
-            noise_idx=noise_idx,
-            batch_size=hps.train.batch_size,
-            ratios=(0.5, 0.35, 0.15)
-        )
-    else:
-        positive_idx = train_fold.index[train_fold[hps.data.target_column] == 1].tolist()
-        negative_idx = train_fold.index[train_fold[hps.data.target_column] == 0].tolist()
-        
-        num_pos = len(positive_idx)
-        num_neg = len(negative_idx)
-        
-        pos_weight = 1.0 / num_pos
-        neg_weight = 1.0 / num_neg
-        
-        sample_weights = torch.zeros(len(train_fold), dtype=torch.double)
-        sample_weights[positive_idx] = pos_weight
-        sample_weights[negative_idx] = neg_weight
-        
-        sampler = WeightedRandomSampler(
-            weights=sample_weights,
-            num_samples=len(sample_weights),
-            replacement=True
-        )
-
-        # patient_ids = train_fold['participant'].astype(str).values
-        # labels = train_fold[hps.data.target_column].astype(int).values
-        # sampler = AutoPatientBatchSampler(
-        #     labels=labels,
-        #     patient_ids=patient_ids,
-        #     target_batch_wavs=hps.train.batch_size,
-        # )
-    
-    return sampler
-
-
-def prepare_fold_data(train_fold, val_fold, hps, fold, collate_fn, use_precomputed=False, precomputed_dir=None):
-    """Prepare datasets and dataloaders for a fold."""
-    # Skip statistics computation if using precomputed features
-    if not use_precomputed:
-        # Compute statistics
-        if hps.data.acoustic_feature and hps.data.mean_std_norm:
-            utils.compute_spectrogram_stats_from_dataset(
-                train_fold, 
-                hps.data, 
-                pickle_path=f"{hps.model_dir}/wav_stats.pickle"
-            )
-        else:
-            utils.compute_wav_stats(
-                train_fold, 
-                "path_file", 
-                pickle_path=f"{hps.model_dir}/wav_stats.pickle"
-            )
-    
-    # Load precomputed feature mappings if enabled
-    train_data = train_fold
-    val_data = val_fold
-    feature_path_col = None
-    
-    if use_precomputed and precomputed_dir:
-        # Load feature mapping CSV
-        mapping_train = pd.read_csv(os.path.join(precomputed_dir, "feature_mapping_train.csv"))
-        # Merge with current fold data based on file path
-        train_data = train_fold.merge(
-            mapping_train[['path_file', 'feature_path']], 
-            on='path_file', 
-            how='left'
-        )
-        val_data = val_fold.merge(
-            mapping_train[['path_file', 'feature_path']], 
-            on='path_file', 
-            how='left'
-        )
-        # Get column index for feature_path
-        feature_path_col = list(train_data.columns).index('feature_path')
-    
-    # Create datasets
-    train_dataset = CoughDatasets(
-        train_data.values, 
-        hps.data,
-        wav_stats_path=f"{hps.model_dir}/wav_stats.pickle" if not use_precomputed else None, 
-        train=True,
-        use_precomputed=use_precomputed
-    )
-    val_dataset = CoughDatasets(
-        val_data.values, 
-        hps.data,
-        wav_stats_path=f"{hps.model_dir}/wav_stats.pickle" if not use_precomputed else None, 
-        train=False,
-        use_precomputed=use_precomputed
-    )
-    
-    # Set feature path column if using precomputed
-    if use_precomputed and feature_path_col is not None:
-        train_dataset.set_feature_path_column(feature_path_col)
-        val_dataset.set_feature_path_column(feature_path_col)
-    
-    # Create sampler
-    sampler = create_sampler(train_fold, hps)
-    #sampler = None
-    
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset, 
-        num_workers=28, 
-        sampler=sampler, 
-        batch_size=hps.train.batch_size,
-        #batch_sampler=sampler,
-        pin_memory=True, 
-        collate_fn=collate_fn
-    )
-    val_loader = DataLoader(
-        val_dataset, 
-        num_workers=28, 
-        shuffle=False, 
-        batch_size=hps.train.batch_size,
-        pin_memory=True, 
-        collate_fn=collate_fn
-    )
-    
-    return train_loader, val_loader
-
-
-def select_best_fold(fold_metrics, fold_checkpoints, model_dir, logger):
-    """Select the best fold based on balanced accuracy closest to mean."""
-    mean_bacc = np.mean(fold_metrics)
-    differences = [abs(metric - mean_bacc) for metric in fold_metrics]
-    best_fold_idx = np.argmin(differences)
-    best_fold_metric = fold_metrics[best_fold_idx]
-    best_model_path = fold_checkpoints[best_fold_idx]
-    
-    logger.info(f"\n{'='*20} BEST MODEL SELECTION {'='*20}")
-    logger.info(f"All Fold Balanced Accuracies: {[f'{m:.4f}' for m in fold_metrics]}")
-    logger.info(f"Mean Balanced Accuracy: {mean_bacc:.4f}")
-    logger.info(f"Best Fold (Closest to Mean): {best_fold_idx+1}")
-    logger.info(f"Best Fold Balanced Accuracy: {best_fold_metric:.4f}")
-    logger.info(f"Difference from Mean: {abs(best_fold_metric - mean_bacc):.4f}")
-    logger.info(f"Source Checkpoint: {best_model_path}")
-    
-    production_path = None
-    if best_model_path and os.path.exists(best_model_path):
-        production_path = os.path.join(model_dir, "best_model.ckpt")
-        shutil.copy2(best_model_path, production_path)
-        logger.info(f"🏆 Saved Production Model to: {production_path}")
-    else:
-        logger.info("❌ Could not find best model checkpoint to copy.")
-    
-    return best_fold_idx, production_path
-
-
-def save_fold_info(best_fold_idx, fold_metrics, fold_thresholds, model_dir):
-    """Save fold information to pickle file."""
-    payload = {
-        "best_fold_idx": best_fold_idx,
-        "best_threshold": fold_thresholds[best_fold_idx],
-        "fold_metrics": fold_metrics,
-    }
-    
-    with open(os.path.join(model_dir, "info_fold.pkl"), "wb") as f:
-        pickle.dump(payload, f)
-
-
-def load_fold_info(model_dir):
-    """Load fold information from pickle file."""
-    info_path = os.path.join(model_dir, "info_fold.pkl")
-    if os.path.exists(info_path):
-        with open(info_path, "rb") as f:
-            return pickle.load(f)
-    return {"best_fold_idx": 0, "best_threshold": 0.0, "fold_metrics": []}
-
-
-def rotate_result_summary(model_dir):
-    """Rotate existing result summary files (keep last 3 versions)."""
-    result_summary_path = f"{model_dir}/result_summary.txt"
-    if os.path.exists(result_summary_path):
-        old3_path = f"{model_dir}/old3_result_summary.txt"
-        old2_path = f"{model_dir}/old2_result_summary.txt"
-        old1_path = f"{model_dir}/old1_result_summary.txt"
-        
-        if os.path.exists(old3_path):
-            os.remove(old3_path)
-        if os.path.exists(old2_path):
-            shutil.move(old2_path, old3_path)
-        if os.path.exists(old1_path):
-            shutil.move(old1_path, old2_path)
-        shutil.move(result_summary_path, old1_path)
-
-
-def evaluate_on_dataset(runner_lightning, trainer, df, hps, best_fold_idx, collate_fn, db_column=None):
-    """Evaluate model on dataset, optionally grouped by database type."""
-    results_dict = {}
-    
-    if db_column and db_column in df.columns:
-        for db_type in df[db_column].unique().tolist():
-            df_subset = df[df[db_column] == db_type]
-            dataset = CoughDatasets(
-                df_subset.values, 
-                hps.data,
-                wav_stats_path=f"{hps.model_dir}/wav_stats_fold_{best_fold_idx}.pickle", 
-                train=False
-            )
-            loader = DataLoader(
-                dataset, 
-                num_workers=28, 
-                shuffle=False,
-                batch_size=hps.train.batch_size, 
-                pin_memory=True, 
-                collate_fn=collate_fn
-            )
-            results = trainer.test(runner_lightning, dataloaders=loader)[0]
-            results_dict[db_type] = results
-    else:
-        dataset = CoughDatasets(
-            df.values, 
-            hps.data,
-            wav_stats_path=f"{hps.model_dir}/wav_stats_fold_{best_fold_idx}.pickle", 
-            train=False
-        )
-        loader = DataLoader(
-            dataset, 
-            num_workers=28, 
-            shuffle=False, 
-            batch_size=hps.train.batch_size,
-            pin_memory=True, 
-            collate_fn=collate_fn
-        )
-        results = trainer.test(runner_lightning, dataloaders=loader)[0]
-        results_dict[0] = results
-    
-    return results_dict
-
-
-def write_results_to_file(filename, results_dict, model_dir, db_map=None):
-    """Write evaluation results to summary file."""
-    with open(f"{model_dir}/{filename}", "a") as f:
-        for db_type, results in results_dict.items():
-            db_name = db_map.get(db_type, f"Database {db_type}") if db_map else "Full Dataset"
-            f.write(
-                f"{db_name} - "
-                f"Acc {results['test_acc']:.4f} | "
-                f"BalAcc {results['test_bacc']:.4f} | "
-                f"Sens {results['test_sens']:.4f} | "
-                f"Spec {results['test_spec']:.4f} | "
-                f"AUROC {results['test_auroc']:.4f} | "
-                f"pAUROC {results['test_pauroc']:.4f}\n"
-            )
-
-
-def cleanup_fold_directories(model_dir, best_fold_idx=None):
-    """Remove fold directories after best model is saved."""
-    if os.path.isfile(os.path.join(model_dir, "best_model.ckpt")):
-        keep_name = None
-        if best_fold_idx is not None:
-            keep_name = f"fold_{best_fold_idx}"
-
-        # 9.ckpt
-        for name in os.listdir(model_dir):
-            p = os.path.join(model_dir, name)
-            if os.path.isdir(p) and name.startswith("fold_"):
-                if keep_name is not None and name == keep_name:
-                    ckpts = glob.glob(os.path.join(p, "*.ckpt"))
-                    for ckpt in ckpts:
-                        os.remove(ckpt)
-                    print(f"Kept: {p}")
-                    continue
-                shutil.rmtree(p)
-                print(f"Removed: {p}")
-    else:
-        print("best_model.ckpt not found; no folders removed.")
 
 def set_seed(seed: int = 42) -> None:
     np.random.seed(seed)
@@ -574,16 +149,13 @@ def main(cli_args=None):
         port = None
 
     config_path = args.config_path if args.init else os.path.join(model_dir, "config.json")
-    hps = load_config(config_path, model_dir, args)
+    hps = train.load_config(config_path, model_dir, args)
 
-    logterminal_file = open(os.path.join(model_dir, "log_terminal.txt"), "w")
-    sys.stdout = TeeFiltered(sys.__stdout__, logterminal_file)
-    sys.stderr = TeeFiltered(sys.__stderr__, logterminal_file)
     # =============================================================
     # SECTION: Loading Data
     # =============================================================
-    df_train, _ = load_data(hps)
-    collate_fn = get_collate_fn(hps)
+    df_train, _ = train.load_data(hps)
+    collate_fn = train.get_collate_fn(hps)
     target_labels = df_train[hps.data.target_column]
 
     if not args.use_precomputed:
@@ -613,17 +185,18 @@ def main(cli_args=None):
         logger.info(f"✨ Running in EVAL mode")
     logger.info(f"======================================")
     
-    pool_net, pool_model = setup_model(hps, is_init=args.init)
+    pool_net, pool_model = train.setup_model(hps, is_init=args.init)
     # =============================================================
     # SECTION: Setup Logger, Dataloader
     # =============================================================
-    N_RUNS = 50
+    N_RUNS = 100
     N_FOLDS = 5
-    TAU = 0.1
+    TAU = 0.01
     RANDOM_STATE = 1
-    MEMORY_NOISE_THRES = 0.4
-    NOISY_DROP = 0.75 # Dropping bottom N * NOISY_DROP of the dataset 
-    Objective_Function_Weights = [1.0, 0.0, 0.0]
+    MEMORY_NOISE_THRES = 0.5
+    NOISY_DROP = 0.8 # Dropping bottom N * NOISY_DROP of the dataset 
+    Objective_Function_Weights = [0.5, 0.0, 0.5]
+    Youden_Weights = [1.3, 0.7]
 
     kf = KFold(n_splits=N_FOLDS, random_state=RANDOM_STATE, shuffle=True)
     fold_splits = list(kf.split(df_train, target_labels))
@@ -635,6 +208,7 @@ def main(cli_args=None):
         'MEMORY_NOISE_THRES': MEMORY_NOISE_THRES,
         'NOISY_DROP': NOISY_DROP,
         'Objective_Function_Weights': Objective_Function_Weights,
+        'Youden_Weights': Youden_Weights,
         'runs': {}
     }
     memory = np.zeros_like(target_labels)
@@ -667,7 +241,7 @@ def main(cli_args=None):
             val_fold  = trainval_fold.iloc[valfold_idx].reset_index(drop=True)
 
             # Prepare data loaders
-            train_loader, val_loader = prepare_fold_data(
+            train_loader, val_loader = train.prepare_fold_data(
                 train_fold, val_fold, hps, fold, collate_fn,
                 use_precomputed=args.use_precomputed,
                 precomputed_dir=args.precomputed_dir
@@ -772,7 +346,7 @@ def main(cli_args=None):
             sens = TP / (TP + FN) if (TP + FN) > 0 else 0.0   # TB recall
             spec = TN / (TN + FP) if (TN + FP) > 0 else 0.0   # non-TB recall
             b_acc = 0.5 * (sens + spec)
-            youden = sens + spec - 1.0
+            youden = Youden_Weights[0] * sens + Youden_Weights[1] * spec - 1.0
             
             test_labels.append(fold_test_labels)
             test_probs.append(fold_test_probs)

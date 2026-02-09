@@ -199,52 +199,83 @@ def create_sampler(train_fold, hps):
         sample_weights[positive_idx] = pos_weight
         sample_weights[negative_idx] = neg_weight
         
-        # sampler = WeightedRandomSampler(
-        #     weights=sample_weights,
-        #     num_samples=len(sample_weights),
-        #     replacement=True
-        # )
-
-        patient_ids = train_fold['participant'].astype(str).values
-        labels = train_fold[hps.data.target_column].astype(int).values
-        sampler = AutoPatientBatchSampler(
-            labels=labels,
-            patient_ids=patient_ids,
-            target_batch_wavs=hps.train.batch_size,
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True
         )
+
+        # patient_ids = train_fold['participant'].astype(str).values
+        # labels = train_fold[hps.data.target_column].astype(int).values
+        # sampler = AutoPatientBatchSampler(
+        #     labels=labels,
+        #     patient_ids=patient_ids,
+        #     target_batch_wavs=hps.train.batch_size,
+        # )
     
     return sampler
 
 
-def prepare_fold_data(train_fold, val_fold, hps, fold, collate_fn):
+def prepare_fold_data(train_fold, val_fold, hps, fold, collate_fn, use_precomputed=False, precomputed_dir=None):
     """Prepare datasets and dataloaders for a fold."""
-    # Compute statistics
-    if hps.data.acoustic_feature and hps.data.mean_std_norm:
-        utils.compute_spectrogram_stats_from_dataset(
-            train_fold, 
-            hps.data, 
-            pickle_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle"
+    # Skip statistics computation if using precomputed features
+    if not use_precomputed:
+        # Compute statistics
+        if hps.data.acoustic_feature and hps.data.mean_std_norm:
+            utils.compute_spectrogram_stats_from_dataset(
+                train_fold, 
+                hps.data, 
+                pickle_path=f"{hps.model_dir}/wav_stats.pickle"
+            )
+        else:
+            utils.compute_wav_stats(
+                train_fold, 
+                "path_file", 
+                pickle_path=f"{hps.model_dir}/wav_stats.pickle"
+            )
+    
+    # Load precomputed feature mappings if enabled
+    train_data = train_fold
+    val_data = val_fold
+    feature_path_col = None
+    
+    if use_precomputed and precomputed_dir:
+        # Load feature mapping CSV
+        mapping_train = pd.read_csv(os.path.join(precomputed_dir, "feature_mapping_train.csv"))
+        # Merge with current fold data based on file path
+        train_data = train_fold.merge(
+            mapping_train[['path_file', 'feature_path']], 
+            on='path_file', 
+            how='left'
         )
-    else:
-        utils.compute_wav_stats(
-            train_fold, 
-            "path_file", 
-            pickle_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle"
+        val_data = val_fold.merge(
+            mapping_train[['path_file', 'feature_path']], 
+            on='path_file', 
+            how='left'
         )
+        # Get column index for feature_path
+        feature_path_col = list(train_data.columns).index('feature_path')
     
     # Create datasets
     train_dataset = CoughDatasets(
-        train_fold.values, 
+        train_data.values, 
         hps.data,
-        wav_stats_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle", 
-        train=True
+        wav_stats_path=f"{hps.model_dir}/wav_stats.pickle" if not use_precomputed else None, 
+        train=True,
+        use_precomputed=use_precomputed
     )
     val_dataset = CoughDatasets(
-        val_fold.values, 
+        val_data.values, 
         hps.data,
-        wav_stats_path=f"{hps.model_dir}/wav_stats_fold_{fold}.pickle", 
-        train=False
+        wav_stats_path=f"{hps.model_dir}/wav_stats.pickle" if not use_precomputed else None, 
+        train=False,
+        use_precomputed=use_precomputed
     )
+    
+    # Set feature path column if using precomputed
+    if use_precomputed and feature_path_col is not None:
+        train_dataset.set_feature_path_column(feature_path_col)
+        val_dataset.set_feature_path_column(feature_path_col)
     
     # Create sampler
     sampler = create_sampler(train_fold, hps)
@@ -254,9 +285,9 @@ def prepare_fold_data(train_fold, val_fold, hps, fold, collate_fn):
     train_loader = DataLoader(
         train_dataset, 
         num_workers=28, 
-        # sampler=sampler, 
-        # batch_size=hps.train.batch_size,
-        batch_sampler=sampler,
+        sampler=sampler, 
+        batch_size=hps.train.batch_size,
+        #batch_sampler=sampler,
         pin_memory=True, 
         collate_fn=collate_fn
     )
@@ -337,17 +368,28 @@ def rotate_result_summary(model_dir):
         shutil.move(result_summary_path, old1_path)
 
 
-def evaluate_on_dataset(runner_lightning, trainer, df, hps, best_fold_idx, collate_fn, db_column=None):
+def evaluate_on_dataset(runner_lightning, trainer, df, hps, best_fold_idx, collate_fn, db_column=None, use_precomputed=False, precomputed_dir=None):
     """Evaluate model on dataset, optionally grouped by database type."""
+    # TODO : Refine for PRECOMPUTED
     results_dict = {}
-    
+
+    test_data = df
+    if use_precomputed and precomputed_dir:
+        mapping_train = pd.read_csv(os.path.join(precomputed_dir, "feature_mapping_train.csv"))
+        test_data = df.merge(
+            mapping_train[['path_file', 'feature_path']], 
+            on='path_file', 
+            how='left'
+        )
+        feature_path_col = list(test_data.columns).index('feature_path')
+
     if db_column and db_column in df.columns:
         for db_type in df[db_column].unique().tolist():
             df_subset = df[df[db_column] == db_type]
             dataset = CoughDatasets(
                 df_subset.values, 
                 hps.data,
-                wav_stats_path=f"{hps.model_dir}/wav_stats_fold_{best_fold_idx}.pickle", 
+                wav_stats_path=f"{hps.model_dir}/wav_stats.pickle" if not use_precomputed else None, 
                 train=False
             )
             loader = DataLoader(
@@ -362,11 +404,15 @@ def evaluate_on_dataset(runner_lightning, trainer, df, hps, best_fold_idx, colla
             results_dict[db_type] = results
     else:
         dataset = CoughDatasets(
-            df.values, 
+            test_data.values, 
             hps.data,
-            wav_stats_path=f"{hps.model_dir}/wav_stats_fold_{best_fold_idx}.pickle", 
-            train=False
+            wav_stats_path=f"{hps.model_dir}/wav_stats.pickle" if not use_precomputed else None, 
+            train=False,
+            use_precomputed=use_precomputed
         )
+        if use_precomputed and precomputed_dir:
+            dataset.set_feature_path_column(feature_path_col)
+        
         loader = DataLoader(
             dataset, 
             num_workers=28, 
@@ -436,6 +482,8 @@ def parse_args():
     parser.add_argument("--delta_feature", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--deltadelta_feature", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--batch_size", type=int)
+    parser.add_argument("--use_precomputed", action="store_true", help="Use precomputed features")
+    parser.add_argument("--precomputed_dir", type=str, default=None, help="Directory with precomputed features")
     return parser
 
 
@@ -465,6 +513,13 @@ def main(cli_args=None):
     df_train, df_test = load_data(hps)
     collate_fn = get_collate_fn(hps)
     target_labels = df_train[hps.data.target_column]
+
+    if not args.use_precomputed:
+        utils.compute_spectrogram_stats_from_dataset(
+            df_train, 
+            hps.data, 
+            pickle_path=f"{hps.model_dir}/wav_stats.pickle"
+        )
 
     # =============================================================
     # SECTION: Model Setup

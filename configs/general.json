@@ -56,7 +56,7 @@
     "many_class": 2,
 
     "db_path": "",
-    "metadata_csv": "metadata_solicited_full.csv",
+    "metadata_csv": "metadata_coda_solicited.csv",
     "target_column": "disease_status",
     "column_order": ["path_file", "disease_status", "gender", "participant", "weight_loss", "hemoptysis", "night_sweats", "smoker"]
   }, 

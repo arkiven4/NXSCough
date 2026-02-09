@@ -620,7 +620,7 @@ def random_place_cough(
         dim=0,
     )
 
-    return data[:target_len]
+    return data[:target_len].unsqueeze(0)
 
 
 def load_audio_sample(file_path, db_sample_rate, is_saming_length, desired_length, fade_samples_ratio=6, pad_types='zero', train=False):
@@ -638,8 +638,7 @@ def load_audio_sample(file_path, db_sample_rate, is_saming_length, desired_lengt
     if pad_types == "synthesis":
         data = augment_and_merge(data, path=file_path, sr=sample_rate)
 
-    data = random_place_cough(data, sample_rate, target_sec=1, train=train)
-    data = data.unsqueeze(0)
+    #data = random_place_cough(data, sample_rate, target_sec=1, train=train)
 
     return data if torch.is_tensor(data) else torch.from_numpy(data).unsqueeze(0)
 

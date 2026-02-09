@@ -6,11 +6,16 @@
 
 python precompute_features.py \
   --config configs/general.json  \
-  --output_dir ./precomputed_features \
-  --feature_type logmel
+  --output_dir ./precomputed_features/spectogram \
+  --feature_type spectogram
 
 python train_fastrecov.py  --init --model_name participant2 --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features 
 
+python train_nmfolds.py  --init --model_name bilstm_spectogram --pooling_model BiLSTMSelfAttASPClassifier --feature_type spectogram \
+  --feature_dim 1025 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/spectogram
+
+python train_nmfolds.py  --init --model_name bilstm_gammmaspectogram --pooling_model BiLSTMSelfAttASPClassifier --feature_type gammmaspectogram \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/gammmaspectogram
 
 ############################################################### PHASE 1 ###############################################################
 python train.py --init --model_name resnet34_mfcc --pooling_model ResNet34ManualClassifier --feature_type mfcc --feature_dim 13 --config_path configs/general.json 

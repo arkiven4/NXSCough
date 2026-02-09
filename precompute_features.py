@@ -87,7 +87,7 @@ def precompute_features(df, hparams, output_dir, split_name="train"):
             # Create output path
             # Use relative path structure to avoid collisions
             rel_path = wavname.replace('/', '_').replace('\\', '_')
-            feature_filename = f"{split_name}_{idx}_{Path(rel_path).stem}.pt"
+            feature_filename = f"{idx}_{Path(rel_path).stem}.pt"
             feature_path = output_dir / feature_filename
             
             # Save features

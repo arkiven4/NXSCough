@@ -206,6 +206,7 @@ class CoughDatasets(torch.utils.data.Dataset):
 
         random.seed(1234)
     
+    # TODO:  MOove to INIT
     def set_feature_path_column(self, col_index):
         """Set the column index where precomputed feature paths are stored."""
         self.feature_path_col = col_index
@@ -219,6 +220,7 @@ class CoughDatasets(torch.utils.data.Dataset):
             return (wavname, wav, wav2, dse_id, int(spk_id), int(gndr_id))
 
         wavname, dse_id, gndr_id, spk_id = audiopath_and_text[0], audiopath_and_text[1], audiopath_and_text[2], audiopath_and_text[3]
+        # TODO: Direct FIletpath, no need pass Row
         filename = audiopath_and_text if self.use_precomputed else self.db_path + "/" + wavname
         wav1, dse_id = self.get_audio(filename, dse_id)
         

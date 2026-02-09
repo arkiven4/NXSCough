@@ -191,7 +191,7 @@ class CoughClassificationRunner(L.LightningModule):
         self.test_probs = []
 
     def test_step(self, batch, batch_idx):
-        _, audio1, audio2, attention_masks, dse_ids, [_, _, tabular_ids, _] = batch
+        _, audio1, audio2, attention_masks, dse_ids, [patient_ids, _, tabular_ids, _] = batch
         logits = self.forward(audio1, audio2, attention_mask=attention_masks, tabular_ids=tabular_ids)["disease_logits"]
 
         dse_ids = dse_ids.float()
