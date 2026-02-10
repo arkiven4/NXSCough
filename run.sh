@@ -6,8 +6,43 @@
 
 python precompute_features.py \
   --config configs/general.json  \
+  --output_dir ./precomputed_features/mfcc \
+  --feature_type mfcc
+
+python precompute_features.py \
+  --config configs/general.json  \
+  --output_dir ./precomputed_features/melspectogram \
+  --feature_type melspectogram
+
+python precompute_features.py \
+  --config configs/general.json  \
+  --output_dir ./precomputed_features/logmel \
+  --feature_type logmel
+
+python precompute_features.py \
+  --config configs/general.json  \
+  --output_dir ./precomputed_features/gammmaspectogram \
+  --feature_type gammmaspectogram
+
+python precompute_features.py \
+  --config configs/general.json  \
   --output_dir ./precomputed_features/spectogram \
   --feature_type spectogram
+
+
+python train_nmfolds.py  --init --model_name bilstm_mfcc --pooling_model BiLSTMSelfAttASPClassifier --feature_type mfcc \
+  --feature_dim 13 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/mfcc
+
+python train_nmfolds.py  --init --model_name bilstm_melspectogram --pooling_model BiLSTMSelfAttASPClassifier --feature_type melspectogram \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/melspectogram
+
+python train_nmfolds.py  --init --model_name bilstmold_logmel --pooling_model LSTMAudioClassifier1 --feature_type logmel \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
+
+python train_nmfolds.py  --init --model_name bilstm_gammmaspectogram --pooling_model BiLSTMSelfAttASPClassifier --feature_type gammmaspectogram \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/gammmaspectogram
+
+
 
 python train_fastrecov.py  --init --model_name participant2 --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features 
 

@@ -334,7 +334,7 @@ def save_fold_info(best_fold_idx, fold_metrics, fold_thresholds, model_dir):
     """Save fold information to pickle file."""
     payload = {
         "best_fold_idx": best_fold_idx,
-        "best_threshold": fold_thresholds[best_fold_idx],
+        "best_threshold": np.mean(fold_thresholds), #  fold_thresholds[best_fold_idx]
         "fold_metrics": fold_metrics,
     }
     

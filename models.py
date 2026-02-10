@@ -349,6 +349,46 @@ class ResNet34HalfClassifier(nn.Module):
         }
 
 
+class LSTMAudioClassifier1(nn.Module):
+    def __init__(self, dummy_input, feature_dim = 80, hidden_size = 1024, output_dim = 1, **kwargs):
+        super(LSTMAudioClassifier1, self).__init__()
+        
+        self.batch_norm1 = nn.BatchNorm1d(feature_dim)
+        self.lstm1 = nn.LSTM(feature_dim, hidden_size, batch_first=True)
+        
+        self.batch_norm2 = nn.BatchNorm1d(hidden_size)
+        self.lstm2 = nn.LSTM(hidden_size, hidden_size, batch_first=True)
+        
+        #self.attention = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=8, batch_first=True)
+
+        self.flatten = nn.Flatten()
+        self.dropout = nn.Dropout(0.1)
+        self.fc = nn.Linear(hidden_size, output_dim)
+
+    def forward(self, x, tabular_ids=None, **kwargs):
+        """
+        x: (B, n_mels, T) mel-spectrogram frames
+        """
+        x = x.permute(0, 2, 1)
+        x = self.batch_norm1(x.transpose(1, 2)).transpose(1, 2)
+        x, _ = self.lstm1(x)
+        
+        x = self.batch_norm2(x.transpose(1, 2)).transpose(1, 2)
+        x, _ = self.lstm2(x)
+        
+        # attn_output, _ = self.attention(x, x, x)
+        # x = torch.mean(attn_output, dim=1)
+
+        x = self.flatten(x[:, -1, :])
+        x = self.dropout(x)
+
+        embedding = x.clone()
+        disease_logits = self.fc(x)
+        return {
+            "disease_logits": disease_logits,
+            "embeddings": embedding,
+        }
+
 class BiLSTMClassifier(nn.Module):
     def __init__(
         self,
@@ -449,7 +489,7 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
         num_layers: int = 2,
         output_dim: int = 2, 
         use_tabular: bool = False,
-        fusion_type: str = "cross_attn",  # ["gating", "cross_attn", "film"]
+        fusion_type: str = "gating",  # ["gating", "cross_attn", "film"]
         **kwargs
     ):
         super().__init__()
@@ -535,12 +575,12 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
         if self.use_tabular and tabular_ids is not None:
             tab_feat = self.tab_proj(tabular_ids)
 
-            if self.training:
-                r = torch.rand(1, device=audio_feat.device)
-                # if r < 0.2:
-                #     audio_feat = torch.zeros_like(audio_feat)
-                if r < 0.2 + 0.2:
-                    tab_feat = torch.zeros_like(tab_feat)
+            # if self.training:
+            #     r = torch.rand(1, device=audio_feat.device)
+            #     # if r < 0.2:
+            #     #     audio_feat = torch.zeros_like(audio_feat)
+            #     if r < 0.2 + 0.2:
+            #         tab_feat = torch.zeros_like(tab_feat)
 
             # ---- Dynamic Gating ----
             if self.fusion_type == "gating":
