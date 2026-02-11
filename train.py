@@ -278,8 +278,8 @@ def prepare_fold_data(train_fold, val_fold, hps, fold, collate_fn, use_precomput
         val_dataset.set_feature_path_column(feature_path_col)
     
     # Create sampler
-    #sampler = create_sampler(train_fold, hps)
-    sampler = None
+    sampler = create_sampler(train_fold, hps)
+    #sampler = None
     
     # Create dataloaders
     train_loader = DataLoader(

@@ -113,26 +113,8 @@ def sample_folds(n_folds:int, weights:np.array, tau:float) -> Tuple[List,Dict]:
 #######################################################################
 # MAIN SCRIPT
 #######################################################################
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--init", action="store_true")
-    parser.add_argument("--eval", action="store_true")
-    parser.add_argument("--model_name", type=str, default="try_wavlmlora_downstream")
-    parser.add_argument("--config_path", type=str, default="configs/ssl_finetuning.json")
-
-    parser.add_argument("--feature_dim", type=int)
-    parser.add_argument("--pooling_model", type=str)
-    parser.add_argument("--feature_type", type=str)
-    parser.add_argument("--delta_feature", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--deltadelta_feature", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--batch_size", type=int)
-    parser.add_argument("--use_precomputed", action="store_true", help="Use precomputed features")
-    parser.add_argument("--precomputed_dir", type=str, default=None, help="Directory with precomputed features")
-    return parser
-
-
 def main(cli_args=None):
-    parser = parse_args()
+    parser = train.parse_args()
     args = parser.parse_args(cli_args)
 
     model_dir = os.path.join("./logs", args.model_name)

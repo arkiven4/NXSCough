@@ -34,6 +34,7 @@ from sklearn.model_selection import StratifiedKFold, train_test_split, Stratifie
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torchvision import datasets, transforms
 from tqdm import tqdm
+from sklearn.isotonic import IsotonicRegression
 
 # Local imports
 import commons
@@ -52,6 +53,40 @@ from cough_datasets import (
 
 torch.set_float32_matmul_precision("medium")
 cmap = cm.get_cmap("viridis")
+
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedShuffleSplit
+
+def stratified_group_holdout(y: np.ndarray, g: np.ndarray, test_size: float, seed: int):
+    """
+    Split *groups* into proper-train vs calibration in a stratified way,
+    where stratum = majority label per group.
+    Returns: mask_proper, mask_calib (both length N samples).
+    """
+    y = np.asarray(y).astype(int)
+    g = np.asarray(g)
+
+    ug = np.unique(g)
+    # majority label per speaker (ties -> 1 if mean>=0.5)
+    gy = np.array([int(np.mean(y[g == gi]) >= 0.5) for gi in ug], dtype=int)
+
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+
+    # try a few seeds in case of degenerate split
+    for k in range(20):
+        rs = seed + k
+        sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=rs)
+        tr_gi, ca_gi = next(sss.split(ug, gy))
+        g_tr = ug[tr_gi]
+        g_ca = ug[ca_gi]
+        mask_tr = np.isin(g, g_tr)
+        mask_ca = np.isin(g, g_ca)
+
+        # ensure both classes exist in calibration (needed for ROC/Youden etc.)
+        if len(np.unique(y[mask_ca])) == 2 and len(np.unique(y[mask_tr])) == 2:
+            return mask_tr, mask_ca
+
+    # fallback: no guarantee, but return last attempt
+    return mask_tr, mask_ca
 
 #######################################################################
 # MAIN SCRIPT
@@ -133,104 +168,79 @@ def main(cli_args=None):
     # =============================================================
     # SECTION: Setup Logger, Dataloader
     # =============================================================  
+    RNG_SEED = 42
     if not args.eval:
-        splitter_outter, num_folds_outter = train.create_data_split(df_train, target_labels, use_kfold=hps.train.use_Kfold, n_splits=10)
-        for fold_outter, (trainval_idx, test_idx) in enumerate(splitter_outter):
+        splitter_outter, num_folds_outter = train.create_data_split(df_train, target_labels, use_kfold=True, n_splits=10, random_state=RNG_SEED)
+        for fold_outter, (inner_idx, test_idx) in enumerate(splitter_outter):
             logger.info(f"\n{'='*20} Outter Fold {fold_outter+1}/{num_folds_outter} {'='*20}")
 
-            trainval_fold = df_train.iloc[trainval_idx].reset_index(drop=True)
+            inner_fold = df_train.iloc[inner_idx].reset_index(drop=True)
             test_fold = df_train.iloc[test_idx].reset_index(drop=True)
+
+            mask_proper, mask_cp = stratified_group_holdout(inner_fold[hps.data.target_column].values, inner_fold["participant"].values, 
+                                                            test_size=0.15, seed=RNG_SEED + fold_outter)
             
-            fold_metrics = []
-            fold_checkpoints = []
-            fold_thresholds = []
-            splitter_inner, num_folds_inner = train.create_data_split(trainval_fold, trainval_fold[hps.data.target_column], use_kfold=hps.train.use_Kfold)
-            for fold_inner, (train_idx, val_idx) in enumerate(splitter_inner):
-                logger.info(f"\n{'='*20} Inner Fold {fold_inner+1}/{num_folds_inner} {'='*20}")
+            train_fold = inner_fold.iloc[mask_proper].reset_index(drop=True)
+            val_fold = inner_fold.iloc[mask_cp].reset_index(drop=True)
+            
+            #oof_probs = np.zeros(len(val_fold))
+            train_loader, val_loader = train.prepare_fold_data(
+                train_fold, val_fold, hps, 0, collate_fn,
+                use_precomputed=args.use_precomputed,
+                precomputed_dir=args.precomputed_dir
+            )
 
-                train_fold = trainval_fold.iloc[train_idx].reset_index(drop=True)
-                val_fold = trainval_fold.iloc[val_idx].reset_index(drop=True)
+            pool_model = pool_net(hps.model.feature_dim, **hps.model)
+            checkpoint_callback = ModelCheckpoint(
+                dirpath=f"{hps.model_dir}/{fold_outter}",
+                monitor="val/loss",
+                filename=f"pool_{{epoch:02d}}",
+                save_top_k=1,
+                mode="min",
+            )
 
-                train_loader, val_loader = train.prepare_fold_data(
-                    train_fold, val_fold, hps, fold_inner, collate_fn,
-                    use_precomputed=args.use_precomputed,
-                    precomputed_dir=args.precomputed_dir
-                )
+            tb_logger = TensorBoardLogger(save_dir=f"{hps.model_dir}/{fold_outter}", sub_dir="train")
+            early_stopping = EarlyStopping(monitor="val/loss", patience=7, mode="min", verbose=False)
+            runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[]) # Bcs i use Sampler
+            trainer = L.Trainer(
+                max_epochs=10000,
+                callbacks=[checkpoint_callback, early_stopping],
+                logger=tb_logger,
+                accelerator="gpu" if torch.cuda.is_available() else "cpu",
+                devices="auto",
+                default_root_dir=f"{hps.model_dir}/{fold_outter}"
+            )
+            trainer.fit(runner_lightning, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
-                pool_model = pool_net(hps.model.feature_dim, **hps.model)
-                checkpoint_callback = ModelCheckpoint(
-                    dirpath=f"{hps.model_dir}/{fold_outter}/fold_{fold_inner}",
-                    monitor="val/loss",
-                    filename=f"pool_fold{fold_inner}_{{epoch:02d}}",
-                    save_top_k=1,
-                    mode="min",
-                )
+            # runner_lightning.test_raw = True
+            # trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
+            # oof_probs = runner_lightning.test_outputs['probs'].reshape(-1) 
+            # iso = IsotonicRegression(out_of_bounds="clip")
+            # iso.fit(oof_probs, val_fold[hps.data.target_column].values)
+            # payload = {"calibrator": iso}
+            # with open(os.path.join(f"{hps.model_dir}/{fold_outter}", "calibrator.pkl"), "wb") as f:
+            #     pickle.dump(payload, f)
 
-                tb_logger = TensorBoardLogger(save_dir=f"{hps.model_dir}/{fold_outter}", name=f"fold_{fold_inner}", sub_dir="train")
-                early_stopping = EarlyStopping(monitor="val/loss", patience=7, mode="min", verbose=False)
-                runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[]) # Bcs i use Sampler
-                trainer = L.Trainer(
-                    max_epochs=1000,
-                    callbacks=[checkpoint_callback, early_stopping],
-                    logger=tb_logger,
-                    accelerator="gpu" if torch.cuda.is_available() else "cpu",
-                    devices="auto",
-                    default_root_dir=f"{hps.model_dir}/{fold_outter}"
-                )
-
-                trainer.fit(runner_lightning, train_dataloaders=train_loader, val_dataloaders=val_loader)
-                runner_lightning.calibrate_threshold = True
-                trainer.test(runner_lightning, dataloaders=val_loader)[0]
-                runner_lightning.calibrate_threshold = False
-
-                results = trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
-                if results:
-                    current_bacc = results[0].get('test_bacc', 0.0)
-                    logger.info(f"Fold {fold_inner+1} Balanced Accuracy: {current_bacc:.4f}")
-                    fold_metrics.append(current_bacc)
-                    fold_checkpoints.append(checkpoint_callback.best_model_path)
-                    fold_thresholds.append(runner_lightning.probs_threshold)
-
-            if not args.eval and hps.train.use_Kfold:
-                best_fold_idx, production_path = train.select_best_fold(fold_metrics, fold_checkpoints, f"{hps.model_dir}/{fold_outter}", logger)
-                train.save_fold_info(best_fold_idx, fold_metrics, fold_thresholds, f"{hps.model_dir}/{fold_outter}")
-            elif not args.eval:
-                best_fold_idx = 0
-                best_model_path = fold_checkpoints[best_fold_idx]
-                production_path = os.path.join(f"{hps.model_dir}/{fold_outter}", "best_model.ckpt")
-                shutil.copy2(best_model_path, production_path)
-                train.save_fold_info(best_fold_idx, fold_metrics, fold_thresholds, f"{hps.model_dir}/{fold_outter}")
-            else:
-                # In eval mode, load best_fold_idx from existing info_fold.pkl
-                info_fold_data = train.load_fold_info(f"{hps.model_dir}/{fold_outter}")
-                best_fold_idx = info_fold_data.get("best_fold_idx", 0)
-
-
+            production_path = os.path.join(f"{hps.model_dir}/{fold_outter}", "best_model.ckpt")
+            shutil.move(trainer.checkpoint_callback.best_model_path, production_path)
             runner_lightning = lightning_wrapper.CoughClassificationRunner.load_from_checkpoint(
                 os.path.join(f"{hps.model_dir}/{fold_outter}", "best_model.ckpt"),
                 model=pool_model,
                 hps=hps, custom_logger=logger
             )
             runner_lightning.eval()
+            #runner_lightning.calibrator = iso
             trainer = L.Trainer(accelerator="gpu" if torch.cuda.is_available() else "cpu", devices="auto")
 
-            info_fold = train.load_fold_info(f"{hps.model_dir}/{fold_outter}")
-            best_fold_idx = info_fold["best_fold_idx"]
-            fold_metrics = info_fold["fold_metrics"]
-            runner_lightning.probs_threshold = info_fold['best_threshold']
+            runner_lightning.calibrate_threshold = True
+            trainer.test(runner_lightning, dataloaders=val_loader)
 
             runner_lightning.generate_figure = True
-            results_dict = train.evaluate_on_dataset(runner_lightning, trainer, test_fold, hps, best_fold_idx, collate_fn,
+            results_dict = train.evaluate_on_dataset(runner_lightning, trainer, test_fold, hps, 0, collate_fn,
                     use_precomputed=args.use_precomputed,
                     precomputed_dir=args.precomputed_dir)
             train.write_results_to_file("result_overall.txt", results_dict, f"{hps.model_dir}", {0: "Test " + str(fold_outter)})
             runner_lightning.generate_figure = False
-
-            # =============================================================
-            # SECTION: Cleaning
-            # =============================================================
-            train.cleanup_fold_directories(f"{hps.model_dir}/{fold_outter}", best_fold_idx)
-
 
 if __name__ == "__main__":
     main()

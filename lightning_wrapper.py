@@ -31,6 +31,8 @@ class CoughClassificationRunner(L.LightningModule):
         self.probs_threshold = probs_threshold
         self.calibrate_threshold = False
         self.generate_figure = False
+        self.test_raw = False
+        self.calibrator = None
         self.loss_fn = loss_functions.get_losses_fn(hps.train.loss_function)
 
         # =============================================================
@@ -212,10 +214,19 @@ class CoughClassificationRunner(L.LightningModule):
         labels = torch.cat(self.test_labels).numpy()
         probs = torch.cat(self.test_probs).numpy()
 
+        if self.test_raw:
+            self.test_raw = False
+            self.test_outputs = {"labels": labels, "probs": probs, "preds": preds}
+            return 0
+
+        if self.calibrator != None:
+            probs = self.calibrator.transform(probs.reshape(-1))
+
         if self.calibrate_threshold:
             optimized_threshold = utils.optimize_threshold_youden(labels, probs)
             self.probs_threshold = optimized_threshold
             preds = (probs >= self.probs_threshold).astype(int)
+            self.calibrate_threshold = False
 
         # -----------------------------------------
         # Confusion Matrix + metrics

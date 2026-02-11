@@ -204,6 +204,42 @@ class ResNet34ManualClassifier(nn.Module):
             "embeddings": stats,
         }
 
+class ResNet34CBAMClassifier(nn.Module):
+    def __init__(
+        self,
+        dummy_input,
+        feature_dim: int = 39,
+        output_dim: int = 2, **kwargs
+    ):
+        super().__init__()
+
+        #model = ResNet(BasicBlock, [2, 2, 2, 2], network_type, num_classes, att_type)
+        #model = ResNet(BasicBlock, [3, 4, 6, 3], network_type, num_classes, att_type)
+        #model = ResNet(Bottleneck, [3, 4, 6, 3], network_type, num_classes, att_type)
+        #model = ResNet(Bottleneck, [3, 4, 23, 3], network_type, num_classes, att_type)
+        # ['BAM', 'CBAM']
+
+        self.encoder1 = modules.ResNetCBAM(feature_dim, [3, 4, 6, 3], "Dummy", 'CBAM')
+
+        self.classifier = nn.Sequential(
+            nn.Linear(self.encoder1.afterpooling, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, output_dim)
+        )
+
+    def forward(self, x, tabular_ids=None, **kwargs):
+        """
+        x: (B, n_mels, T) mel-spectrogram frames
+        """
+        x = x.unsqueeze_(1)
+        stats = self.encoder1(x)  # torch.Size([128, 5120])
+        disease_logits = self.classifier(stats)
+
+        return {
+            "disease_logits": disease_logits,
+            "embeddings": stats,
+        }
 
 class ResNet34MultiEncoderClassifier(nn.Module):
     def __init__(
@@ -489,7 +525,7 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
         num_layers: int = 2,
         output_dim: int = 2, 
         use_tabular: bool = False,
-        fusion_type: str = "gating",  # ["gating", "cross_attn", "film"]
+        fusion_type: str = "cross_attn",  # ["gating", "cross_attn", "film"]
         **kwargs
     ):
         super().__init__()

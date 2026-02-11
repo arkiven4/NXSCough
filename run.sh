@@ -36,12 +36,29 @@ python train_nmfolds.py  --init --model_name bilstm_mfcc --pooling_model BiLSTMS
 python train_nmfolds.py  --init --model_name bilstm_melspectogram --pooling_model BiLSTMSelfAttASPClassifier --feature_type melspectogram \
   --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/melspectogram
 
-python train_nmfolds.py  --init --model_name bilstmold_logmel --pooling_model LSTMAudioClassifier1 --feature_type logmel \
+python train_nmfolds.py  --init --model_name bilstm_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
   --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
 
 python train_nmfolds.py  --init --model_name bilstm_gammmaspectogram --pooling_model BiLSTMSelfAttASPClassifier --feature_type gammmaspectogram \
   --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/gammmaspectogram
 
+
+python train_nmfolds.py  --init --model_name resnet34_mfcc --pooling_model ResNet34ManualClassifier --feature_type mfcc \
+  --feature_dim 13 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/mfcc
+
+python train_nmfolds.py  --init --model_name resnet34_melspectogram --pooling_model ResNet34ManualClassifier --feature_type melspectogram \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/melspectogram
+
+python train_nmfolds.py  --init --model_name resnet34_logmel --pooling_model ResNet34ManualClassifier --feature_type logmel \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
+
+python train_nmfolds.py  --init --model_name resnet34_gammmaspectogram --pooling_model ResNet34ManualClassifier --feature_type gammmaspectogram \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/gammmaspectogram
+
+
+
+python train_nmfolds.py  --init --model_name resnet34cbam_melspectogram --pooling_model ResNet34CBAMClassifier --feature_type logmel \
+  --feature_dim 80 --config_path configs/general.json
 
 
 python train_fastrecov.py  --init --model_name participant2 --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features 
