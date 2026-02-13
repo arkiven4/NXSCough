@@ -61,7 +61,8 @@ python train_nmfolds.py  --init --model_name resnet34cbam_melspectogram --poolin
   --feature_dim 80 --config_path configs/general.json
 
 
-python train_fastrecov.py  --init --model_name participant2 --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features 
+python train_fastrecov.py  --init --model_name try1 --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
+ --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel 
 
 python train_nmfolds.py  --init --model_name bilstm_spectogram --pooling_model BiLSTMSelfAttASPClassifier --feature_type spectogram \
   --feature_dim 1025 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/spectogram

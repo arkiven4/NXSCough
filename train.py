@@ -30,7 +30,7 @@ from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers.tensorboard import TensorBoardLogger
 from matplotlib import cm
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix
-from sklearn.model_selection import StratifiedKFold, train_test_split, StratifiedGroupKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split, StratifiedGroupKFold, StratifiedShuffleSplit
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torchvision import datasets, transforms
 from tqdm import tqdm
@@ -367,6 +367,37 @@ def rotate_result_summary(model_dir):
             shutil.move(old1_path, old2_path)
         shutil.move(result_summary_path, old1_path)
 
+def stratified_group_holdout(y: np.ndarray, g: np.ndarray, test_size: float, seed: int):
+    """
+    Split *groups* into proper-train vs calibration in a stratified way,
+    where stratum = majority label per group.
+    Returns: mask_proper, mask_calib (both length N samples).
+    """
+    y = np.asarray(y).astype(int)
+    g = np.asarray(g)
+
+    ug = np.unique(g)
+    # majority label per speaker (ties -> 1 if mean>=0.5)
+    gy = np.array([int(np.mean(y[g == gi]) >= 0.5) for gi in ug], dtype=int)
+
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+
+    # try a few seeds in case of degenerate split
+    for k in range(20):
+        rs = seed + k
+        sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=rs)
+        tr_gi, ca_gi = next(sss.split(ug, gy))
+        g_tr = ug[tr_gi]
+        g_ca = ug[ca_gi]
+        mask_tr = np.isin(g, g_tr)
+        mask_ca = np.isin(g, g_ca)
+
+        # ensure both classes exist in calibration (needed for ROC/Youden etc.)
+        if len(np.unique(y[mask_ca])) == 2 and len(np.unique(y[mask_tr])) == 2:
+            return mask_tr, mask_ca
+
+    # fallback: no guarantee, but return last attempt
+    return mask_tr, mask_ca
 
 def evaluate_on_dataset(runner_lightning, trainer, df, hps, best_fold_idx, collate_fn, db_column=None, use_precomputed=False, precomputed_dir=None):
     """Evaluate model on dataset, optionally grouped by database type."""

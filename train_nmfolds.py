@@ -54,40 +54,6 @@ from cough_datasets import (
 torch.set_float32_matmul_precision("medium")
 cmap = cm.get_cmap("viridis")
 
-from sklearn.model_selection import StratifiedGroupKFold, StratifiedShuffleSplit
-
-def stratified_group_holdout(y: np.ndarray, g: np.ndarray, test_size: float, seed: int):
-    """
-    Split *groups* into proper-train vs calibration in a stratified way,
-    where stratum = majority label per group.
-    Returns: mask_proper, mask_calib (both length N samples).
-    """
-    y = np.asarray(y).astype(int)
-    g = np.asarray(g)
-
-    ug = np.unique(g)
-    # majority label per speaker (ties -> 1 if mean>=0.5)
-    gy = np.array([int(np.mean(y[g == gi]) >= 0.5) for gi in ug], dtype=int)
-
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
-
-    # try a few seeds in case of degenerate split
-    for k in range(20):
-        rs = seed + k
-        sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=rs)
-        tr_gi, ca_gi = next(sss.split(ug, gy))
-        g_tr = ug[tr_gi]
-        g_ca = ug[ca_gi]
-        mask_tr = np.isin(g, g_tr)
-        mask_ca = np.isin(g, g_ca)
-
-        # ensure both classes exist in calibration (needed for ROC/Youden etc.)
-        if len(np.unique(y[mask_ca])) == 2 and len(np.unique(y[mask_tr])) == 2:
-            return mask_tr, mask_ca
-
-    # fallback: no guarantee, but return last attempt
-    return mask_tr, mask_ca
-
 #######################################################################
 # MAIN SCRIPT
 #######################################################################
@@ -177,7 +143,7 @@ def main(cli_args=None):
             inner_fold = df_train.iloc[inner_idx].reset_index(drop=True)
             test_fold = df_train.iloc[test_idx].reset_index(drop=True)
 
-            mask_proper, mask_cp = stratified_group_holdout(inner_fold[hps.data.target_column].values, inner_fold["participant"].values, 
+            mask_proper, mask_cp = train.stratified_group_holdout(inner_fold[hps.data.target_column].values, inner_fold["participant"].values, 
                                                             test_size=0.15, seed=RNG_SEED + fold_outter)
             
             train_fold = inner_fold.iloc[mask_proper].reset_index(drop=True)

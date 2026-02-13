@@ -62,7 +62,7 @@
   }, 
   "model": {
     "pooling_model": "ResNet34ManualClassifier",
-    "use_tabular": true,
+    "use_tabular": false,
     "feature_dim": 240,
     "hidden_size": 512,
     "output_dim": 1,
