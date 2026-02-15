@@ -125,7 +125,7 @@ def setup_model(hps, is_init=True):
     hps.model.spk_dim = 0
     if is_init:
         pool_net = getattr(models, hps.model.pooling_model)
-        pool_model = pool_net(hps.model.feature_dim, **hps.model)
+        pool_model = pool_net(**hps.model)
         shutil.copy2('./models.py', f'{hps.model_dir}/model_net.py.bak')
     else:
         temp_path = tempfile.NamedTemporaryFile(suffix=".py", delete=False).name
@@ -135,7 +135,7 @@ def setup_model(hps, is_init=True):
         sys.modules["model_net"] = model_modules
         spec.loader.exec_module(model_modules)
         pool_net = getattr(model_modules, hps.model.pooling_model)
-        pool_model = pool_net(hps.model.feature_dim, **hps.model)
+        pool_model = pool_net(**hps.model)
     
     return pool_net, pool_model
 
@@ -522,6 +522,9 @@ def main(cli_args=None):
     parser = parse_args()
     args = parser.parse_args(cli_args)
 
+    RNG_SEED = 42
+    L.seed_everything(RNG_SEED, workers=True)
+
     model_dir = os.path.join("./logs", args.model_name)
     os.makedirs(model_dir, exist_ok=True)
 
@@ -537,11 +540,12 @@ def main(cli_args=None):
 
     config_path = args.config_path if args.init else os.path.join(model_dir, "config.json")
     hps = load_config(config_path, model_dir, args)
+    hps.model.spk_dim = 0
 
     # =============================================================
     # SECTION: Loading Data
     # =============================================================
-    df_train, df_test = load_data(hps)
+    df_train, _ = load_data(hps)
     collate_fn = get_collate_fn(hps)
     target_labels = df_train[hps.data.target_column]
 
@@ -576,180 +580,203 @@ def main(cli_args=None):
     # =============================================================
     # SECTION: Setup Logger, Dataloader
     # =============================================================
-    fold_metrics = []
-    fold_checkpoints = []
-    fold_thresholds = []
+    fold_thr = []
+    splitter, num_folds = create_data_split(df_train, target_labels, use_kfold=hps.train.use_Kfold, 
+                                            n_splits=10, random_state=RNG_SEED)
+    for fold_outter, (inner_idx, test_idx) in enumerate(splitter):
+        logger.info(f"\n{'='*20} Fold {fold_outter+1}/{num_folds} {'='*20}")
 
-    if not args.eval:
-        splitter, num_folds = create_data_split(df_train, target_labels, use_kfold=hps.train.use_Kfold)
+        inner_fold = df_train.iloc[inner_idx].reset_index(drop=True)
+        test_fold = df_train.iloc[test_idx].reset_index(drop=True)
 
-        for fold, (train_idx, val_idx) in enumerate(splitter):
-            logger.info(f"\n{'='*20} Fold {fold+1}/{num_folds} {'='*20}")
+        mask_proper, mask_cp = stratified_group_holdout(inner_fold[hps.data.target_column].values, inner_fold["participant"].values, 
+                                                                  test_size=0.15, seed=RNG_SEED + fold_outter)
 
-            train_fold = df_train.iloc[train_idx].reset_index(drop=True)
-            val_fold = df_train.iloc[val_idx].reset_index(drop=True)
+        train_fold = inner_fold.iloc[mask_proper].reset_index(drop=True)
+        val_fold = inner_fold.iloc[mask_cp].reset_index(drop=True)
+            
+        train_loader, val_loader = prepare_fold_data(
+            train_fold, val_fold, hps, 0, collate_fn,
+            use_precomputed=args.use_precomputed,
+            precomputed_dir=args.precomputed_dir
+        )
+        # oof_probs = np.zeros(len(val_fold))
 
-            # Prepare data loaders
-            train_loader, val_loader = prepare_fold_data(train_fold, val_fold, hps, fold, collate_fn)
+        pool_model = pool_net(**hps.model)
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=f"{hps.model_dir}/{fold_outter}",
+            monitor="val/loss",
+            filename=f"pool_fold{fold_outter}_{{epoch:02d}}",
+            save_top_k=1,
+            mode="min",
+        )
 
-            # Initialize a FRESH model for each fold
-            hps.model.spk_dim = 0
-            pool_model = pool_net(hps.model.feature_dim, **hps.model)
+        tb_logger = TensorBoardLogger(save_dir=hps.model_dir, name=f"{fold_outter}", sub_dir="train")
+        early_stopping = EarlyStopping(monitor="val/loss", patience=7, mode="min", verbose=False)
+        runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[]) # Bcs i use Sampler
+        trainer = L.Trainer(
+            max_epochs=1000,
+            callbacks=[checkpoint_callback, early_stopping],
+            logger=tb_logger,
+            accelerator="gpu" if torch.cuda.is_available() else "cpu",
+            devices="auto",
+            default_root_dir=hps.model_dir,
+            deterministic=True,
+        )
 
-            checkpoint_callback = ModelCheckpoint(
-                dirpath=f"{hps.model_dir}/fold_{fold}",
-                monitor="val/loss",
-                filename=f"pool_fold{fold}_{{epoch:02d}}",
-                save_top_k=1,
-                mode="min",
-            )
+        trainer.fit(runner_lightning, train_dataloaders=train_loader, val_dataloaders=val_loader)
+        # runner_lightning.test_raw = True
+        # trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
+        # oof_probs = runner_lightning.test_outputs['probs'].reshape(-1)
+        # iso = IsotonicRegression(out_of_bounds="clip")
+        # iso.fit(oof_probs, val_fold[hps.data.target_column].values)
+        # payload = {"calibrator": iso}
+        # with open(os.path.join(f"{hps.model_dir}/{fold_outter}", "calibrator.pkl"), "wb") as f:
+        #     pickle.dump(payload, f)
 
-            tb_logger = TensorBoardLogger(save_dir=hps.model_dir, name=f"fold_{fold}", sub_dir="train")
-            early_stopping = EarlyStopping(monitor="val/loss", patience=7, mode="min", verbose=False)
-            runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[]) # Bcs i use Sampler
-            trainer = L.Trainer(
-                max_epochs=1000,
-                callbacks=[checkpoint_callback, early_stopping],
-                logger=tb_logger,
-                accelerator="gpu" if torch.cuda.is_available() else "cpu",
-                devices="auto",
-                default_root_dir=hps.model_dir
-            )
+        production_path = os.path.join(f"{hps.model_dir}/{fold_outter}", "best_model.ckpt")
+        shutil.move(trainer.checkpoint_callback.best_model_path, production_path)
 
-            #runner_lightning.loss_fn.init_memory(num_samples=len(train_fold))
+        runner_lightning = lightning_wrapper.CoughClassificationRunner.load_from_checkpoint(
+            os.path.join(f"{hps.model_dir}/{fold_outter}", "best_model.ckpt"),
+            model=pool_model, hps=hps, custom_logger=logger)
+        runner_lightning.eval()
+        trainer = L.Trainer(accelerator="gpu" if torch.cuda.is_available() else "cpu", devices="auto")
 
-            trainer.fit(runner_lightning, train_dataloaders=train_loader, val_dataloaders=val_loader)
-            runner_lightning.calibrate_threshold = True
-            trainer.test(runner_lightning, dataloaders=val_loader)[0]
-            runner_lightning.calibrate_threshold = False
+        runner_lightning.calibrate_threshold = True
+        trainer.test(runner_lightning, dataloaders=val_loader)
 
-            results = trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
-            if results:
-                current_bacc = results[0].get('test_bacc', 0.0)
-                logger.info(f"Fold {fold+1} Balanced Accuracy: {current_bacc:.4f}")
-                fold_metrics.append(current_bacc)
-                fold_checkpoints.append(checkpoint_callback.best_model_path)
-                fold_thresholds.append(runner_lightning.probs_threshold)
+        results_dict = evaluate_on_dataset(runner_lightning, trainer, test_fold, hps, 0, collate_fn,
+                                            use_precomputed=args.use_precomputed,
+                                            precomputed_dir=args.precomputed_dir)
+        write_results_to_file("result_overall.txt", results_dict, f"{hps.model_dir}", {0: "Test " + str(fold_outter)})
+        fold_thr.append(runner_lightning.probs_threshold)
+        if os.path.exists(production_path):
+            os.remove(production_path)
 
-    if not args.eval and hps.train.use_Kfold:
-        best_fold_idx, production_path = select_best_fold(fold_metrics, fold_checkpoints, hps.model_dir, logger)
-        save_fold_info(best_fold_idx, fold_metrics, fold_thresholds, hps.model_dir)
-    elif not args.eval:
-        best_fold_idx = 0
-        best_model_path = fold_checkpoints[best_fold_idx]
-        production_path = os.path.join(hps.model_dir, "best_model.ckpt")
-        shutil.copy2(best_model_path, production_path)
-        save_fold_info(best_fold_idx, fold_metrics, fold_thresholds, hps.model_dir)
-    else:
-        # In eval mode, load best_fold_idx from existing info_fold.pkl
-        info_fold_data = load_fold_info(hps.model_dir)
-        best_fold_idx = info_fold_data.get("best_fold_idx", 0)
-
-    # =============================================================
-    # SECTION: Test Phase
-    # =============================================================
-    db_map = {
-        0: "TBCoda Logitudinal",
-        1: "TBCoda Solicited",
-        2: "TBScreen Logitudinal",
-        3: "TBScreen Solicited",
-        4: "CIRDZ",
-        5: "UK19Covid",
-    }
-
-    runner_lightning = lightning_wrapper.CoughClassificationRunner.load_from_checkpoint(
-        os.path.join(hps.model_dir, "best_model.ckpt"),
-        model=pool_model,
-        hps=hps, custom_logger=logger
-    )
-    runner_lightning.eval()
-    trainer = L.Trainer(accelerator="gpu" if torch.cuda.is_available() else "cpu", devices="auto")
-
-    info_fold = load_fold_info(hps.model_dir)
-    best_fold_idx = info_fold["best_fold_idx"]
-    fold_metrics = info_fold["fold_metrics"]
-    runner_lightning.probs_threshold = info_fold['best_threshold']
-
-    ###### Calibrate Threshold or Load if Exist
-    # if os.path.exists(os.path.join(model_dir, "probs_threshold.pkl")):
-    #     with open(os.path.join(model_dir, "probs_threshold.pkl"), "rb") as f:
-    #         runner_lightning.probs_threshold = pickle.load(f)['probs_threshold']
+    with open(f"{hps.model_dir}/info_run.pkl", "wb") as f:
+        pickle.dump({"fold_thr": fold_thr}, f)
+    
+    # if not args.eval and hps.train.use_Kfold:
+    #     best_fold_idx, production_path = select_best_fold(fold_metrics, fold_checkpoints, hps.model_dir, logger)
+    #     save_fold_info(best_fold_idx, fold_metrics, fold_thresholds, hps.model_dir)
+    # elif not args.eval:
+    #     best_fold_idx = 0
+    #     best_model_path = fold_checkpoints[best_fold_idx]
+    #     production_path = os.path.join(hps.model_dir, "best_model.ckpt")
+    #     shutil.copy2(best_model_path, production_path)
+    #     save_fold_info(best_fold_idx, fold_metrics, fold_thresholds, hps.model_dir)
     # else:
-    #     splitter, num_folds = create_data_split(df_train, target_labels, use_kfold=hps.train.use_Kfold)
-    #     train_idx, val_idx = list(splitter)[best_fold_idx]
+    #     # In eval mode, load best_fold_idx from existing info_fold.pkl
+    #     info_fold_data = load_fold_info(hps.model_dir)
+    #     best_fold_idx = info_fold_data.get("best_fold_idx", 0)
 
-    #     train_fold = df_train.iloc[train_idx].reset_index(drop=True)
-    #     val_fold = df_train.iloc[val_idx].reset_index(drop=True)
-    #     train_loader, val_loader = prepare_fold_data(train_fold, val_fold, hps, best_fold_idx, collate_fn)
+    # # =============================================================
+    # # SECTION: Test Phase
+    # # =============================================================
+    # db_map = {
+    #     0: "TBCoda Logitudinal",
+    #     1: "TBCoda Solicited",
+    #     2: "TBScreen Logitudinal",
+    #     3: "TBScreen Solicited",
+    #     4: "CIRDZ",
+    #     5: "UK19Covid",
+    # }
 
-    #     runner_lightning.calibrate_threshold = True
-    #     results = trainer.test(runner_lightning, dataloaders=val_loader)[0]
-    #     runner_lightning.calibrate_threshold = False
+    # runner_lightning = lightning_wrapper.CoughClassificationRunner.load_from_checkpoint(
+    #     os.path.join(hps.model_dir, "best_model.ckpt"),
+    #     model=pool_model,
+    #     hps=hps, custom_logger=logger
+    # )
+    # runner_lightning.eval()
+    # # runner_lightning.calibrator = iso
+    # trainer = L.Trainer(accelerator="gpu" if torch.cuda.is_available() else "cpu", devices="auto")
+
+    # info_fold = load_fold_info(hps.model_dir)
+    # best_fold_idx = info_fold["best_fold_idx"]
+    # fold_metrics = info_fold["fold_metrics"]
+    # runner_lightning.probs_threshold = info_fold['best_threshold']
+
+    # ###### Calibrate Threshold or Load if Exist
+    # # if os.path.exists(os.path.join(model_dir, "probs_threshold.pkl")):
+    # #     with open(os.path.join(model_dir, "probs_threshold.pkl"), "rb") as f:
+    # #         runner_lightning.probs_threshold = pickle.load(f)['probs_threshold']
+    # # else:
+    # #     splitter, num_folds = create_data_split(df_train, target_labels, use_kfold=hps.train.use_Kfold)
+    # #     train_idx, val_idx = list(splitter)[best_fold_idx]
+
+    # #     train_fold = df_train.iloc[train_idx].reset_index(drop=True)
+    # #     val_fold = df_train.iloc[val_idx].reset_index(drop=True)
+    # #     train_loader, val_loader = prepare_fold_data(train_fold, val_fold, hps, best_fold_idx, collate_fn)
+
+    # #     runner_lightning.calibrate_threshold = True
+    # #     results = trainer.test(runner_lightning, dataloaders=val_loader)[0]
+    # #     runner_lightning.calibrate_threshold = False
         
-    #     payload = {
-    #         "probs_threshold": runner_lightning.probs_threshold,
-    #     }
-    #     with open(os.path.join(model_dir, "probs_threshold.pkl"), "wb") as f:
-    #         pickle.dump(payload, f)
+    # #     payload = {
+    # #         "probs_threshold": runner_lightning.probs_threshold,
+    # #     }
+    # #     with open(os.path.join(model_dir, "probs_threshold.pkl"), "wb") as f:
+    # #         pickle.dump(payload, f)
 
-    ############################################# Overall Report #########################################################
-    with open(f"{model_dir}/result_overall.txt", "w") as f:
-        f.write(f"")
+    # ############################################# Overall Report #########################################################
+    # with open(f"{model_dir}/result_overall.txt", "w") as f:
+    #     f.write(f"")
 
-    df_train_eval = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.train')
-    df_train_eval = df_train_eval.reset_index(drop=True)
-    df_train_eval = df_train_eval[hps.data.column_order]
+    # df_train_eval = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.train')
+    # df_train_eval = df_train_eval.reset_index(drop=True)
+    # df_train_eval = df_train_eval[hps.data.column_order]
 
-    results_dict = evaluate_on_dataset(runner_lightning, trainer, df_train_eval, hps, best_fold_idx, collate_fn)
-    write_results_to_file("result_overall.txt", results_dict, model_dir, {0: "Train"})
+    # results_dict = evaluate_on_dataset(runner_lightning, trainer, df_train_eval, hps, best_fold_idx, collate_fn)
+    # write_results_to_file("result_overall.txt", results_dict, model_dir, {0: "Train"})
 
-    df_test_eval = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.test')
-    df_test_eval = df_test_eval.reset_index(drop=True)
-    df_test_eval = df_test_eval[hps.data.column_order]
+    # df_test_eval = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.test')
+    # df_test_eval = df_test_eval.reset_index(drop=True)
+    # df_test_eval = df_test_eval[hps.data.column_order]
 
-    runner_lightning.generate_figure = True
-    results_dict = evaluate_on_dataset(runner_lightning, trainer, df_test_eval, hps, best_fold_idx, collate_fn)
-    write_results_to_file("result_overall.txt", results_dict, model_dir, {0: "Test"})
-    runner_lightning.generate_figure = False
+    # runner_lightning.generate_figure = True
+    # results_dict = evaluate_on_dataset(runner_lightning, trainer, df_test_eval, hps, best_fold_idx, collate_fn)
+    # write_results_to_file("result_overall.txt", results_dict, model_dir, {0: "Test"})
+    # runner_lightning.generate_figure = False
 
-    df_cirdz = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/cirdz.csv.test')
-    df_cirdz = df_cirdz.reset_index(drop=True)
-    df_cirdz = df_cirdz[hps.data.column_order]
+    # df_cirdz = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/cirdz.csv.test')
+    # df_cirdz = df_cirdz.reset_index(drop=True)
+    # df_cirdz = df_cirdz[hps.data.column_order]
 
-    results_dict = evaluate_on_dataset(runner_lightning, trainer, df_cirdz, hps, best_fold_idx, collate_fn)
-    write_results_to_file("result_overall.txt", results_dict, model_dir, {0: "Unseen"})
-    ############################################# PerDB Report ###########################################################
-    # Handle result_summary.txt versioning
-    rotate_result_summary(model_dir)
-    with open(f"{model_dir}/result_summary.txt", "w") as f:
-        f.write(f"{'='*25} Train Phase {'='*25}\n")
-    df_train_eval = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.train')
-    df_train_eval = df_train_eval.reset_index(drop=True)
-    df_train_eval = df_train_eval[hps.data.column_order + ['db']]
+    # results_dict = evaluate_on_dataset(runner_lightning, trainer, df_cirdz, hps, best_fold_idx, collate_fn)
+    # write_results_to_file("result_overall.txt", results_dict, model_dir, {0: "Unseen"})
+    # ############################################# PerDB Report ###########################################################
+    # # Handle result_summary.txt versioning
+    # rotate_result_summary(model_dir)
+    # with open(f"{model_dir}/result_summary.txt", "w") as f:
+    #     f.write(f"{'='*25} Train Phase {'='*25}\n")
+    # df_train_eval = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.train')
+    # df_train_eval = df_train_eval.reset_index(drop=True)
+    # df_train_eval = df_train_eval[hps.data.column_order + ['db']]
 
-    results_dict = evaluate_on_dataset(runner_lightning, trainer, df_train_eval, hps, best_fold_idx, collate_fn, db_column='db')
-    write_results_to_file("result_summary.txt", results_dict, model_dir, db_map)
+    # results_dict = evaluate_on_dataset(runner_lightning, trainer, df_train_eval, hps, best_fold_idx, collate_fn, db_column='db')
+    # write_results_to_file("result_summary.txt", results_dict, model_dir, db_map)
 
-    with open(f"{model_dir}/result_summary.txt", "a") as f:
-        f.write(f"\n{'='*25} Test Phase {'='*25}\n")
-    df_test_eval = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.test')
-    df_test_eval = df_test_eval.reset_index(drop=True)
-    df_test_eval = df_test_eval[hps.data.column_order + ['db']]
+    # with open(f"{model_dir}/result_summary.txt", "a") as f:
+    #     f.write(f"\n{'='*25} Test Phase {'='*25}\n")
+    # df_test_eval = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.test')
+    # df_test_eval = df_test_eval.reset_index(drop=True)
+    # df_test_eval = df_test_eval[hps.data.column_order + ['db']]
 
-    results_dict = evaluate_on_dataset(runner_lightning, trainer, df_test_eval, hps, best_fold_idx, collate_fn, db_column='db')
-    write_results_to_file("result_summary.txt", results_dict, model_dir, db_map)
+    # results_dict = evaluate_on_dataset(runner_lightning, trainer, df_test_eval, hps, best_fold_idx, collate_fn, db_column='db')
+    # write_results_to_file("result_summary.txt", results_dict, model_dir, db_map)
 
-    df_cirdz = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/cirdz.csv.test')
-    df_cirdz = df_cirdz.reset_index(drop=True)
-    df_cirdz = df_cirdz[hps.data.column_order]
+    # df_cirdz = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/cirdz.csv.test')
+    # df_cirdz = df_cirdz.reset_index(drop=True)
+    # df_cirdz = df_cirdz[hps.data.column_order]
 
-    results_dict = evaluate_on_dataset(runner_lightning, trainer, df_cirdz, hps, best_fold_idx, collate_fn)
-    write_results_to_file("result_summary.txt", results_dict, model_dir, {0: "CIRDZ"})
+    # results_dict = evaluate_on_dataset(runner_lightning, trainer, df_cirdz, hps, best_fold_idx, collate_fn)
+    # write_results_to_file("result_summary.txt", results_dict, model_dir, {0: "CIRDZ"})
 
-    # =============================================================
-    # SECTION: Cleaning
-    # =============================================================
-    cleanup_fold_directories(hps.model_dir, best_fold_idx)
+    # # =============================================================
+    # # SECTION: Cleaning
+    # # =============================================================
+    # cleanup_fold_directories(hps.model_dir, best_fold_idx)
 
 
 if __name__ == "__main__":

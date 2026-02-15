@@ -14,6 +14,7 @@ import sys
 import tempfile
 import warnings
 import glob
+from itertools import product
 
 # Third-party imports
 import librosa
@@ -35,6 +36,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from torchvision import datasets, transforms
 from tqdm import tqdm
 from sklearn.isotonic import IsotonicRegression
+import optuna
 
 # Local imports
 import commons
@@ -57,6 +59,7 @@ cmap = cm.get_cmap("viridis")
 #######################################################################
 # MAIN SCRIPT
 #######################################################################
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--init", action="store_true")
@@ -78,6 +81,9 @@ def parse_args():
 def main(cli_args=None):
     parser = parse_args()
     args = parser.parse_args(cli_args)
+
+    RNG_SEED = 42
+    L.seed_everything(RNG_SEED, workers=True)
 
     model_dir = os.path.join("./logs", args.model_name)
     os.makedirs(model_dir, exist_ok=True)
@@ -105,8 +111,8 @@ def main(cli_args=None):
 
     if not args.use_precomputed:
         utils.compute_spectrogram_stats_from_dataset(
-            df_train, 
-            hps.data, 
+            df_train,
+            hps.data,
             pickle_path=f"{hps.model_dir}/wav_stats.pickle"
         )
 
@@ -133,9 +139,22 @@ def main(cli_args=None):
     pool_net, pool_model = train.setup_model(hps, is_init=args.init)
     # =============================================================
     # SECTION: Setup Logger, Dataloader
-    # =============================================================  
-    RNG_SEED = 42
-    if not args.eval:
+    # =============================================================
+    
+    def sample_params(trial):
+        params = {
+            "hidden_size": trial.suggest_categorical("hidden_size", [32, 64, 128, 192, 256, 384, 512, 1024]),
+            "lstmnum_layers": trial.suggest_int("lstmnum_layers", 1, 4),
+            "att_head": trial.suggest_categorical("att_head", [1, 2, 4]),
+            "hidden_dim_classifier": trial.suggest_categorical("hidden_dim_classifier", [32, 64, 128, 192, 256, 384, 512, 1024]),
+            "dropout": trial.suggest_float("dropout", 0.1, 0.7),
+        }
+        return params
+
+    def objective(trial):
+        now_params = sample_params(trial)
+        fold_scores = []
+
         splitter_outter, num_folds_outter = train.create_data_split(df_train, target_labels, use_kfold=True, n_splits=10, random_state=RNG_SEED)
         for fold_outter, (inner_idx, test_idx) in enumerate(splitter_outter):
             logger.info(f"\n{'='*20} Outter Fold {fold_outter+1}/{num_folds_outter} {'='*20}")
@@ -144,19 +163,20 @@ def main(cli_args=None):
             test_fold = df_train.iloc[test_idx].reset_index(drop=True)
 
             mask_proper, mask_cp = train.stratified_group_holdout(inner_fold[hps.data.target_column].values, inner_fold["participant"].values, 
-                                                            test_size=0.15, seed=RNG_SEED + fold_outter)
-            
+                                                                  test_size=0.15, seed=RNG_SEED + fold_outter)
+
             train_fold = inner_fold.iloc[mask_proper].reset_index(drop=True)
             val_fold = inner_fold.iloc[mask_cp].reset_index(drop=True)
             
-            #oof_probs = np.zeros(len(val_fold))
             train_loader, val_loader = train.prepare_fold_data(
                 train_fold, val_fold, hps, 0, collate_fn,
                 use_precomputed=args.use_precomputed,
                 precomputed_dir=args.precomputed_dir
             )
 
-            pool_model = pool_net(hps.model.feature_dim, **hps.model)
+            pool_model = pool_net(feature_dim=hps.model.feature_dim, 
+                                  hidden_size=now_params["hidden_size"], lstmnum_layers=now_params["lstmnum_layers"], 
+                                  att_head=now_params["att_head"], hidden_dim_classifier=now_params["hidden_dim_classifier"], dropout=now_params["dropout"])
             checkpoint_callback = ModelCheckpoint(
                 dirpath=f"{hps.model_dir}/{fold_outter}",
                 monitor="val/loss",
@@ -167,46 +187,63 @@ def main(cli_args=None):
 
             tb_logger = TensorBoardLogger(save_dir=f"{hps.model_dir}/{fold_outter}", sub_dir="train")
             early_stopping = EarlyStopping(monitor="val/loss", patience=7, mode="min", verbose=False)
-            runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[]) # Bcs i use Sampler
+            runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[])  # Bcs i use Sampler
             trainer = L.Trainer(
                 max_epochs=10000,
                 callbacks=[checkpoint_callback, early_stopping],
                 logger=tb_logger,
                 accelerator="gpu" if torch.cuda.is_available() else "cpu",
                 devices="auto",
-                default_root_dir=f"{hps.model_dir}/{fold_outter}"
+                default_root_dir=f"{hps.model_dir}/{fold_outter}",
+                deterministic=True,
             )
             trainer.fit(runner_lightning, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
-            # runner_lightning.test_raw = True
-            # trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
-            # oof_probs = runner_lightning.test_outputs['probs'].reshape(-1) 
-            # iso = IsotonicRegression(out_of_bounds="clip")
-            # iso.fit(oof_probs, val_fold[hps.data.target_column].values)
-            # payload = {"calibrator": iso}
-            # with open(os.path.join(f"{hps.model_dir}/{fold_outter}", "calibrator.pkl"), "wb") as f:
-            #     pickle.dump(payload, f)
-
             production_path = os.path.join(f"{hps.model_dir}/{fold_outter}", "best_model.ckpt")
             shutil.move(trainer.checkpoint_callback.best_model_path, production_path)
+
             runner_lightning = lightning_wrapper.CoughClassificationRunner.load_from_checkpoint(
                 os.path.join(f"{hps.model_dir}/{fold_outter}", "best_model.ckpt"),
-                model=pool_model,
-                hps=hps, custom_logger=logger
+                model=pool_model, hps=hps, custom_logger=logger
             )
             runner_lightning.eval()
-            #runner_lightning.calibrator = iso
             trainer = L.Trainer(accelerator="gpu" if torch.cuda.is_available() else "cpu", devices="auto")
 
             runner_lightning.calibrate_threshold = True
             trainer.test(runner_lightning, dataloaders=val_loader)
 
-            runner_lightning.generate_figure = True
             results_dict = train.evaluate_on_dataset(runner_lightning, trainer, test_fold, hps, 0, collate_fn,
-                    use_precomputed=args.use_precomputed,
-                    precomputed_dir=args.precomputed_dir)
-            train.write_results_to_file("result_overall.txt", results_dict, f"{hps.model_dir}", {0: "Test " + str(fold_outter)})
-            runner_lightning.generate_figure = False
+                                                    use_precomputed=args.use_precomputed,
+                                                    precomputed_dir=args.precomputed_dir)
+
+            fold_scores.append(results_dict[0].get('test_bacc', 0.0))
+            if os.path.exists(production_path):
+                os.remove(production_path)
+
+            # # ---- pruning signal ----
+            # trial.report(np.mean(fold_scores), fold_outter)
+            # if trial.should_prune():
+            #     raise optuna.TrialPruned()
+        
+        mean_acc = np.mean(fold_scores)
+        std_acc = np.std(fold_scores)
+
+        alpha = 0.0
+        final_score = mean_acc - alpha * std_acc
+        return final_score
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=40) # 70 -> 5 fold, 35 -> 10 fold
+
+    print("Best params:", study.best_trial.params)
+    print("Best stability-aware score:", study.best_value)
+
+    best_result = {
+        "params": study.best_trial.params,
+        "score": study.best_value,
+    }
+    with open(f"{hps.model_dir}/optuna_best.pkl", "wb") as f:
+        pickle.dump(best_result, f)
 
 if __name__ == "__main__":
     main()

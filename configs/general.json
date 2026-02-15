@@ -62,10 +62,15 @@
   }, 
   "model": {
     "pooling_model": "ResNet34ManualClassifier",
-    "use_tabular": false,
-    "feature_dim": 240,
-    "hidden_size": 512,
+    "feature_dim": 80,
     "output_dim": 1,
+    "dropout": 0.34,
+    "use_tabular": false,
+
+    "hidden_size": 64,
+    "lstmnum_layers": 3,
+    "att_head": 4,
+    "hidden_dim_classifier": 256,
 
     "lora_finetune": true,
     "adapter_hidden_dim": 128,

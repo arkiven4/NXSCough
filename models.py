@@ -519,11 +519,13 @@ class BiLSTMClassifier(nn.Module):
 class BiLSTMSelfAttASPClassifier(nn.Module):
     def __init__(
         self,
-        dummy_input,
         feature_dim: int = 39,
         hidden_size: int = 512,
-        num_layers: int = 2,
-        output_dim: int = 2, 
+        lstmnum_layers: int = 2,
+        att_head: int = 2,
+        hidden_dim_classifier: int = 128,
+        dropout: float = 0.1,
+        output_dim: int = 1, 
         use_tabular: bool = False,
         fusion_type: str = "cross_attn",  # ["gating", "cross_attn", "film"]
         **kwargs
@@ -541,16 +543,16 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
         self.lstm = nn.LSTM(
             input_size=feature_dim,
             hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=0.2 if num_layers > 1 else 0.0,
+            num_layers=lstmnum_layers,
+            dropout=0.2 if lstmnum_layers > 1 else 0.0,
             bidirectional=True,
             batch_first=True,
         )
 
         self.attn = nn.MultiheadAttention(
             embed_dim=hidden_size * 2,
-            num_heads=4,
-            dropout=0.3,
+            num_heads=att_head,
+            dropout=dropout,
             batch_first=True
         )
         self.norm = nn.LayerNorm(hidden_size * 2)
@@ -578,17 +580,18 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
         if self.use_tabular and fusion_type == "cross_attn":
             self.cross_attn = nn.MultiheadAttention(
                 embed_dim=fusion_dim,
-                num_heads=4,
+                num_heads=att_head,
                 batch_first=True
             )
             self.ca_norm = nn.LayerNorm(fusion_dim)
 
         # ========== CLASSIFIER ==========
         self.classifier = nn.Sequential(
-            nn.Linear(fusion_dim, 128),
+            nn.Linear(fusion_dim, hidden_dim_classifier),
+            nn.BatchNorm1d(hidden_dim_classifier),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, output_dim)
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim_classifier, output_dim)
         )
 
     def forward(self, x, tabular_ids=None, train=False, **kwargs):

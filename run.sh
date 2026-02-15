@@ -57,8 +57,12 @@ python train_nmfolds.py  --init --model_name resnet34_gammmaspectogram --pooling
 
 
 
-python train_nmfolds.py  --init --model_name resnet34cbam_melspectogram --pooling_model ResNet34CBAMClassifier --feature_type logmel \
-  --feature_dim 80 --config_path configs/general.json
+python train.py  --init --model_name bilstmbest_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
+
+
+python train_hypersearch.py  --init --model_name searchlstm_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
 
 
 python train_fastrecov.py  --init --model_name try1 --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
