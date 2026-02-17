@@ -214,10 +214,9 @@ class CoughClassificationRunner(L.LightningModule):
         labels = torch.cat(self.test_labels).numpy()
         probs = torch.cat(self.test_probs).numpy()
 
-        if self.test_raw:
-            self.test_raw = False
-            self.test_outputs = {"labels": labels, "probs": probs, "preds": preds}
-            return 0
+        #if self.test_raw:
+        #self.test_raw = False
+        self.test_outputs = {"labels": labels, "probs": probs, "preds": preds}
 
         if self.calibrator != None:
             probs = self.calibrator.transform(probs.reshape(-1))

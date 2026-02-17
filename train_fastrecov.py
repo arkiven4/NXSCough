@@ -191,7 +191,6 @@ def update_tau_variance(tau, memory, alpha=2.0, tau_min=1e-4, tau_max=10.0):
     tau_new = tau * np.exp(-alpha * var)
     return float(np.clip(tau_new, tau_min, tau_max))
 
-
 # -------------------------------------------------
 # Validation-metric feedback schedule
 # -------------------------------------------------
@@ -278,6 +277,49 @@ def estimate_noise_threshold_gmm(memory):
     return threshold
 
 
+def safe_minmax_scale(x, eps=1e-8):
+    arr = np.asarray(x, dtype=np.float64)
+    span = arr.max() - arr.min()
+    if span < eps:
+        return np.full_like(arr, 0.5, dtype=np.float64)
+    return (arr - arr.min()) / (span + eps)
+
+
+def select_identified_with_warmup(memory,
+                                  threshold,
+                                  run_idx,
+                                  warmup_runs=10,
+                                  max_ratio=0.10,
+                                  cap_after_warmup=False):
+    """
+    Select noisy IDs with warmup cap.
+    During warmup, cap grows linearly up to max_ratio.
+    After warmup, cap is optional via cap_after_warmup.
+    """
+    candidate = np.where(memory <= threshold)[0]
+    if len(candidate) == 0:
+        return np.array([], dtype=np.int64), 0.0
+
+    in_warmup = run_idx < warmup_runs
+    if in_warmup:
+        warmup_factor = min(1.0, (run_idx + 1) / max(1, warmup_runs))
+        cap_ratio = max_ratio * warmup_factor
+        cap_n = int(np.floor(cap_ratio * len(memory)))
+    elif cap_after_warmup:
+        cap_ratio = max_ratio
+        cap_n = int(np.floor(cap_ratio * len(memory)))
+    else:
+        cap_ratio = len(candidate) / max(1, len(memory))
+        cap_n = len(candidate)
+
+    if cap_n <= 0:
+        return np.array([], dtype=np.int64), cap_ratio
+
+    candidate_sorted = candidate[np.argsort(memory[candidate])]  # ascending => worst first
+    selected = candidate_sorted[:min(cap_n, len(candidate_sorted))]
+    return selected.astype(np.int64), cap_ratio
+
+
 #######################################################################
 # MAIN SCRIPT
 #######################################################################
@@ -328,11 +370,14 @@ def main(cli_args=None):
     N_RUNS = 100
     N_FOLDS = 6 # beta ↓ when N_FOLDS ↑
     RANDOM_STATE = 1
-    TAU = 5
+    TAU = 2
 
     NOISY_DROP = 0.1 # Dropping bottom N * NOISY_DROP of the dataset 
-    Objective_Function_Weights = [0.7, 0.0, 0.3]
+    Objective_Function_Weights = [0.6, 0.15, 0.25]
     Youden_Weights = [1.3, 0.7]
+    WARMUP_RUNS = max(10, int(0.1 * N_RUNS))
+    MAX_IDENTIFIED_RATIO = 0.10
+    CAP_AFTER_WARMUP = False
 
     kf = KFold(n_splits=N_FOLDS, random_state=RANDOM_STATE, shuffle=True)
     fold_splits = list(kf.split(df_train, target_labels))
@@ -345,9 +390,9 @@ def main(cli_args=None):
         'runs': {}
     }
 
-    memory = np.zeros_like(target_labels)
+    memory = np.zeros_like(target_labels, dtype=np.float64)
     identified = []
-    for seed in range(RANDOM_STATE, RANDOM_STATE + N_RUNS):
+    for run_idx, seed in enumerate(range(RANDOM_STATE, RANDOM_STATE + N_RUNS)):
         logger.info(f"\n{'='*20} Run {seed}/{N_RUNS} {'='*20}")
         set_seed(seed)
         test_labels = []
@@ -359,6 +404,7 @@ def main(cli_args=None):
         test_spec = []
         test_ids = []
         test_patient_ids = []
+        test_thresholds = []
 
         for fold, (train_idx, test_idx) in enumerate(fold_splits):
             logger.info(f"\n{'='*20} Fold {fold+1}/{N_FOLDS} {'='*20}")
@@ -384,7 +430,7 @@ def main(cli_args=None):
                 precomputed_dir=args.precomputed_dir
             )
 
-            pool_model = pool_net(hps.model.feature_dim, **hps.model)
+            pool_model = pool_net(**hps.model)
             checkpoint_callback = ModelCheckpoint(
                 dirpath=f"{hps.model_dir}/fold_{fold}",
                 monitor="val/loss",
@@ -406,9 +452,11 @@ def main(cli_args=None):
             )
 
             trainer.fit(runner_lightning, train_dataloaders=train_loader, val_dataloaders=val_loader)
+            
             runner_lightning.calibrate_threshold = True
             trainer.test(runner_lightning, dataloaders=val_loader)[0]
             optimized_threshold = runner_lightning.probs_threshold
+            test_thresholds.append(optimized_threshold)
 
             # Prepare test data
             test_data = test_fold
@@ -440,7 +488,7 @@ def main(cli_args=None):
                 collate_fn=collate_fn
             )
 
-            pool_model = pool_net(hps.model.feature_dim, **hps.model)
+            pool_model = pool_net(**hps.model)
             runner_lightning = lightning_wrapper.CoughClassificationRunner.load_from_checkpoint(
                 trainer.checkpoint_callback.best_model_path,     
                 model=pool_model,
@@ -496,14 +544,18 @@ def main(cli_args=None):
         pred_probs_all = np.concatenate(test_probs)
         test_ids_all = np.concatenate(test_ids)
         test_patient_ids_all = np.concatenate(test_patient_ids)
+        threshold_all = np.concatenate([[test_thresholds[i]] * number_ids[i] for i in range(N_FOLDS)])
 
-        weights_acc = np.max(test_accs) - test_accs # distance from best fold, distance = 0, larger value.
-        weights_acc = (weights_acc - weights_acc.min()) / (weights_acc.max()-weights_acc.min()) # 0 - 1 Norm
+        test_accs_np = np.asarray(test_accs, dtype=np.float64)
+        test_youden_np = np.asarray(test_youden, dtype=np.float64)
+
+        weights_acc = np.max(test_accs_np) - test_accs_np # distance from best fold, distance = 0, larger value.
+        weights_acc = safe_minmax_scale(weights_acc) # 0 - 1 Norm
         weights_acc = 1 - weights_acc # Best fold → weight ≈ 1
         weights_acc = np.concatenate([[weights_acc[i]]*number_ids[i] for i in range(N_FOLDS)])
 
-        weights_youden = np.max(test_youden) - test_youden # distance from best fold, distance = 0, larger value.
-        weights_youden = (weights_youden - weights_youden.min()) / (weights_youden.max()-weights_youden.min()) # 0 - 1 Norm
+        weights_youden = np.max(test_youden_np) - test_youden_np # distance from best fold, distance = 0, larger value.
+        weights_youden = safe_minmax_scale(weights_youden) # 0 - 1 Norm
         weights_youden = 1 - weights_youden # Best fold → weight ≈ 1
         weights_youden = np.concatenate([[weights_youden[i]]*number_ids[i] for i in range(N_FOLDS)])
         
@@ -511,9 +563,22 @@ def main(cli_args=None):
         #temp =  pred_probs_all[idx_temp[0,:], idx_temp[1,:]] # For Multiclass, Extract Only True Probs
         # “How confident is the model that the ground-truth label is correct?”
         temp = np.where(test_labels_all == 1, pred_probs_all, 1 - pred_probs_all)
-        #weights = 1 - (temp.max() - temp)
-        weights_probs = (temp - temp.min()) / (temp.max() - temp.min() + 1e-8)
-        weights = Objective_Function_Weights[0] * weights_probs + Objective_Function_Weights[1] * weights_acc + Objective_Function_Weights[2] * weights_youden
+        weights_probs_conf = safe_minmax_scale(temp)
+        weights_probs_margin = safe_minmax_scale(np.abs(pred_probs_all - threshold_all))
+        weights_probs = 0.7 * weights_probs_conf + 0.3 * weights_probs_margin
+
+        # Adaptive objective weights: add more fold-level regularization after warmup.
+        progress = min(1.0, run_idx / max(1, N_RUNS - 1))
+        objective_weights = np.asarray(Objective_Function_Weights, dtype=np.float64).copy()
+        objective_weights[1] = min(0.30, objective_weights[1] + 0.10 * progress)
+        objective_weights[0] = max(0.45, objective_weights[0] - 0.10 * progress)
+        objective_weights = objective_weights / objective_weights.sum()
+
+        weights = (
+            objective_weights[0] * weights_probs
+            + objective_weights[1] * weights_acc
+            + objective_weights[2] * weights_youden
+        )
         order = np.argsort(test_ids_all)
         weights = weights[order]
         
@@ -525,7 +590,8 @@ def main(cli_args=None):
         pid_mean = pid_sum / pid_cnt
         weights = pid_mean[inverse]
 
-        memory = 0.3 * weights + 0.7 * memory
+        ema_keep = 0.9 if run_idx < WARMUP_RUNS else 0.7
+        memory = (1.0 - ema_keep) * weights + ema_keep * memory
 
         TAU = update_tau_variance(TAU, memory) # 1) variance-driven
         #TAU = update_tau_validation(TAU, test_youden) # 2) validation-feedback (use Youden or b_acc)
@@ -539,7 +605,14 @@ def main(cli_args=None):
         #     tau=TAU,
         #     random_state=seed
         # )
-        identified = np.where(memory<=MEMORY_NOISE_THRES)[0]
+        identified, warmup_cap_ratio = select_identified_with_warmup(
+            memory,
+            MEMORY_NOISE_THRES,
+            run_idx=run_idx,
+            warmup_runs=WARMUP_RUNS,
+            max_ratio=MAX_IDENTIFIED_RATIO,
+            cap_after_warmup=CAP_AFTER_WARMUP,
+        )
         np.save(f"{hps.model_dir}/memory.npy", memory)
         monitor_metrics['runs'][seed] = {
             'test_accs': test_accs,
@@ -550,6 +623,9 @@ def main(cli_args=None):
             'TAU': TAU,
             'MEMORY_NOISE_THRES': MEMORY_NOISE_THRES,
             'NOISY_DROP': NOISY_DROP,
+            'objective_weights': objective_weights,
+            'warmup_cap_ratio': warmup_cap_ratio,
+            'identified_ratio': len(identified) / len(df_train),
             'percentage_datasets': 1 - round(len(identified) / len(df_train), 2),
             'percentage_positivedata': round((train_fold[hps.data.target_column] == 1).sum() / len(df_train), 2),
             'percentage_negativedata': round((train_fold[hps.data.target_column] == 0).sum() / len(df_train), 2),
@@ -557,8 +633,8 @@ def main(cli_args=None):
         with open(os.path.join(hps.model_dir, "info_recov.pkl"), "wb") as f:
             pickle.dump(monitor_metrics, f)
 
-        metrics = ['test_accs', 'test_sens', 'test_spec', 'test_youden', 'confidence', 'TAU', 'MEMORY_NOISE_THRES', 'NOISY_DROP', 
-                   'percentage_datasets', 'percentage_positivedata', 'percentage_negativedata']
+        metrics = ['test_accs', 'test_sens', 'test_spec', 'test_youden', 'confidence', 'TAU', 'MEMORY_NOISE_THRES', 'NOISY_DROP',
+                   'identified_ratio', 'warmup_cap_ratio', 'percentage_datasets', 'percentage_positivedata', 'percentage_negativedata']
         for metric in metrics:
             values_mean = []
             for runs, values in monitor_metrics['runs'].items():
@@ -572,7 +648,14 @@ def main(cli_args=None):
             plt.savefig(f"{hps.model_dir}/{metric}_across_runs.png", dpi=300, bbox_inches="tight")
             plt.close()
         
-    identified = np.where(memory<=MEMORY_NOISE_THRES)[0]
+    identified, _ = select_identified_with_warmup(
+        memory,
+        MEMORY_NOISE_THRES,
+        run_idx=N_RUNS - 1,
+        warmup_runs=WARMUP_RUNS,
+        max_ratio=MAX_IDENTIFIED_RATIO,
+        cap_after_warmup=CAP_AFTER_WARMUP,
+    )
     np.save(f"{hps.model_dir}/identified.npy", identified)
     with open(os.path.join(hps.model_dir, "info_recov.pkl"), "wb") as f:
         pickle.dump(monitor_metrics, f)

@@ -4,6 +4,7 @@
 # NOW -> nfft1024
 # Next -> Change folder logs, and retrrain for nfft2048
 
+# =========================================== Precomputed ==========================================================
 python precompute_features.py \
   --config configs/general.json  \
   --output_dir ./precomputed_features/mfcc \
@@ -28,6 +29,39 @@ python precompute_features.py \
   --config configs/general.json  \
   --output_dir ./precomputed_features/spectogram \
   --feature_type spectogram
+
+# =========================================== search hyperparameter  ==========================================================
+
+python train_hypersearch.py  --init --model_name searchresnet10fold_mfcc --pooling_model ResNet34ManualClassifier --feature_type mfcc \
+  --feature_dim 13 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/mfcc
+
+python train_hypersearch.py  --init --model_name searchresnet10fold_logmel --pooling_model ResNet34ManualClassifier --feature_type logmel \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
+
+# =========================================== Train best hyperparameter  ==========================================================
+python train.py  --init --model_name bilstmbest_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
+
+python train.py  --init --model_name resnetbest_logmel --pooling_model ResNet34ManualClassifier --feature_type logmel \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
+
+
+# =========================================== Active learning  ==========================================================
+python train_fastrecov.py  --init --model_name try4 --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
+ --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel 
+
+
+# =========================================== Others  ==========================================================
+python train.py --init --model_name wavlmasp_peft --pooling_model PEFTWavLM_Try1 --feature_dim 1024 --config_path configs/general.json 
+
+
+
+
+
+
+
+
+
 
 
 python train_nmfolds.py  --init --model_name bilstm_mfcc --pooling_model BiLSTMSelfAttASPClassifier --feature_type mfcc \

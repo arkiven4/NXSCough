@@ -217,22 +217,22 @@ def create_sampler(train_fold, hps):
 
 
 def prepare_fold_data(train_fold, val_fold, hps, fold, collate_fn, use_precomputed=False, precomputed_dir=None):
-    """Prepare datasets and dataloaders for a fold."""
-    # Skip statistics computation if using precomputed features
-    if not use_precomputed:
-        # Compute statistics
-        if hps.data.acoustic_feature and hps.data.mean_std_norm:
-            utils.compute_spectrogram_stats_from_dataset(
-                train_fold, 
-                hps.data, 
-                pickle_path=f"{hps.model_dir}/wav_stats.pickle"
-            )
-        else:
-            utils.compute_wav_stats(
-                train_fold, 
-                "path_file", 
-                pickle_path=f"{hps.model_dir}/wav_stats.pickle"
-            )
+    # """Prepare datasets and dataloaders for a fold."""
+    # # Skip statistics computation if using precomputed features
+    # if not use_precomputed:
+    #     # Compute statistics
+    #     if hps.data.acoustic_feature and hps.data.mean_std_norm:
+    #         utils.compute_spectrogram_stats_from_dataset(
+    #             train_fold, 
+    #             hps.data, 
+    #             pickle_path=f"{hps.model_dir}/wav_stats.pickle"
+    #         )
+    #     else:
+    #         utils.compute_wav_stats(
+    #             train_fold, 
+    #             "path_file", 
+    #             pickle_path=f"{hps.model_dir}/wav_stats.pickle"
+    #         )
     
     # Load precomputed feature mappings if enabled
     train_data = train_fold
@@ -452,8 +452,12 @@ def evaluate_on_dataset(runner_lightning, trainer, df, hps, best_fold_idx, colla
             pin_memory=True, 
             collate_fn=collate_fn
         )
+
         results = trainer.test(runner_lightning, dataloaders=loader)[0]
-        results_dict[0] = results
+        results_dict[0] = {
+            "metrics": results,
+            "raw_data": runner_lightning.test_outputs,
+        }
     
     return results_dict
 
@@ -462,6 +466,7 @@ def write_results_to_file(filename, results_dict, model_dir, db_map=None):
     """Write evaluation results to summary file."""
     with open(f"{model_dir}/{filename}", "a") as f:
         for db_type, results in results_dict.items():
+            results = results['metrics']
             db_name = db_map.get(db_type, f"Database {db_type}") if db_map else "Full Dataset"
             f.write(
                 f"{db_name} - "
@@ -550,11 +555,18 @@ def main(cli_args=None):
     target_labels = df_train[hps.data.target_column]
 
     if not args.use_precomputed:
-        utils.compute_spectrogram_stats_from_dataset(
-            df_train, 
-            hps.data, 
-            pickle_path=f"{hps.model_dir}/wav_stats.pickle"
-        )
+        if hps.data.acoustic_feature and hps.data.mean_std_norm:
+            utils.compute_spectrogram_stats_from_dataset(
+                df_train, 
+                hps.data, 
+                pickle_path=f"{hps.model_dir}/wav_stats.pickle"
+            )
+        else:
+            utils.compute_wav_stats(
+                df_train, 
+                "path_file", 
+                pickle_path=f"{hps.model_dir}/wav_stats.pickle"
+            )
 
     # =============================================================
     # SECTION: Model Setup
@@ -581,6 +593,9 @@ def main(cli_args=None):
     # SECTION: Setup Logger, Dataloader
     # =============================================================
     fold_thr = []
+    oof_p = np.zeros(len(df_train), dtype=float)
+    oof_label = np.zeros(len(df_train), dtype=float)
+    
     splitter, num_folds = create_data_split(df_train, target_labels, use_kfold=hps.train.use_Kfold, 
                                             n_splits=10, random_state=RNG_SEED)
     for fold_outter, (inner_idx, test_idx) in enumerate(splitter):
@@ -650,12 +665,19 @@ def main(cli_args=None):
                                             use_precomputed=args.use_precomputed,
                                             precomputed_dir=args.precomputed_dir)
         write_results_to_file("result_overall.txt", results_dict, f"{hps.model_dir}", {0: "Test " + str(fold_outter)})
+        
+        oof_p[test_idx] = results_dict[0]["raw_data"]['probs'].reshape(-1)
+        oof_label[test_idx] = results_dict[0]["raw_data"]['labels'].reshape(-1)
         fold_thr.append(runner_lightning.probs_threshold)
         if os.path.exists(production_path):
             os.remove(production_path)
 
     with open(f"{hps.model_dir}/info_run.pkl", "wb") as f:
-        pickle.dump({"fold_thr": fold_thr}, f)
+        pickle.dump({
+            "fold_thr": fold_thr, 
+            "oof_p": oof_p, 
+            "oof_label": oof_label, 
+            }, f)
     
     # if not args.eval and hps.train.use_Kfold:
     #     best_fold_idx, production_path = select_best_fold(fold_metrics, fold_checkpoints, hps.model_dir, logger)

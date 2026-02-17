@@ -81,114 +81,26 @@ import layers
 #         # Maxout(d_in = config.embeddings, d_out = config.hidden_size, pool_size = 3),
 #         return torch.stack(pooled_list)
 
-class Res2NetVanilla(nn.Module):
-    def __init__(self,
-                 dummy_input,
-                 feature_dim: int = 39,
-                 embed_dim=192,
-                 pooling_func='TSTP',
-                 output_dim: int = 2, **kwargs):
-        super(Res2NetVanilla, self).__init__()
-
-        block = getattr(layers, "BasicBlockRes2Net")
-        num_blocks = [3, 4, 6, 3]
-        m_channels = 32
-
-        self.in_planes = m_channels
-        self.feature_dim = feature_dim
-
-        def _downsample_freq(h: int, stages: int = 3) -> int:
-            for _ in range(stages):
-                h = (h - 1) // 2 + 1
-            return h
-        self.stats_dim = _downsample_freq(feature_dim) * m_channels * 8
-
-        self.conv1 = nn.Conv2d(1,
-                               m_channels,
-                               kernel_size=3,
-                               stride=1,
-                               padding=1,
-                               bias=False)
-        self.bn1 = nn.BatchNorm2d(m_channels)
-        self.layer1 = self._make_layer(block,
-                                       m_channels,
-                                       num_blocks[0],
-                                       stride=1)
-        self.layer2 = self._make_layer(block,
-                                       m_channels * 2,
-                                       num_blocks[1],
-                                       stride=2)
-        self.layer3 = self._make_layer(block,
-                                       m_channels * 4,
-                                       num_blocks[2],
-                                       stride=2)
-        self.layer4 = self._make_layer(block,
-                                       m_channels * 8,
-                                       num_blocks[3],
-                                       stride=2)
-
-        self.pool = modules.TSTP(in_dim=self.stats_dim * block.expansion)
-        self.pool_out_dim = self.pool.get_out_dim()
-
-        self.classifier = nn.Sequential(
-            nn.Linear(self.pool_out_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, output_dim)
-        )
-
-    def _make_layer(self, block, planes, num_blocks, stride):
-        strides = [stride] + [1] * (num_blocks - 1)
-        layers = []
-        for stride in strides:
-            layers.append(block(self.in_planes, planes, stride))
-            self.in_planes = planes * block.expansion
-        return nn.Sequential(*layers)
-
-    def get_frame_level_feat(self, x):
-        # for outer interface
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.layer4(out)
-
-        # out = out.transpose(1, 3)
-        # out = torch.flatten(out, 2, -1)
-        return out
-
-    def forward(self, x, **kwargs):
-        """
-        x: (B, n_mels, T) mel-spectrogram frames
-        """
-        x = x.unsqueeze_(1)
-        x = self.get_frame_level_feat(x)
-
-        stats = self.pool(x)
-
-        disease_logits = self.classifier(stats)
-        return {
-            "disease_logits": disease_logits,
-        }
-
-
 class ResNet34ManualClassifier(nn.Module):
     def __init__(
         self,
-        dummy_input,
         feature_dim: int = 39,
-        output_dim: int = 2, **kwargs
+        resnet_type: str = "resnet18",  # ["resnet18", "resnet34", "resnet50", "resnet101"]
+        num_layers_resnet: int = 4,
+        hidden_dim_classifier: int = 128,
+        dropout: float = 0.5,
+        output_dim: int = 1, **kwargs
     ):
         super().__init__()
 
-        self.encoder1 = modules.Resnet34Manual(feature_dim=feature_dim)
+        self.encoder1 = modules.Resnet34Manual(resnet_type=resnet_type, feature_dim=feature_dim, num_layers=num_layers_resnet)
         self.pool_out_dim = self.encoder1.pool.get_out_dim()
 
         self.classifier = nn.Sequential(
-            nn.Linear(self.pool_out_dim, 128),
+            nn.Linear(self.pool_out_dim, hidden_dim_classifier),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(128, output_dim)
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim_classifier, output_dim)
         )
 
     def forward(self, x, tabular_ids=None, **kwargs):
@@ -241,150 +153,6 @@ class ResNet34CBAMClassifier(nn.Module):
             "embeddings": stats,
         }
 
-class ResNet34MultiEncoderClassifier(nn.Module):
-    def __init__(
-        self,
-        dummy_input,
-        feature_dim: int = 39,
-        output_dim: int = 2, **kwargs
-    ):
-        super().__init__()
-
-        self.feature_dim = feature_dim
-        self.encoders = nn.ModuleList([
-            modules.Resnet34Manual(feature_dim=feature_dim)
-            for _ in range(3)
-        ])
-        self.pool_out_dim = self.encoders[0].pool.get_out_dim()
-
-        self.fusion_logits = nn.Parameter(torch.zeros(3))
-        self.classifier = nn.Sequential(
-            nn.Linear(self.pool_out_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(128, output_dim)
-        )
-
-    def forward(self, x, tabular_ids=None, **kwargs):
-        """
-        x: (B, n_mels, T) mel-spectrogram frames
-        """
-        streams = torch.split(x, self.feature_dim, dim=1)
-        feats = []
-        for encoder, s in zip(self.encoders, streams):
-            z = encoder(s.unsqueeze(1))   # (B, 64, T')
-            feats.append(z)
-
-        feats = torch.stack(feats, dim=1)      # (B, 3, 128)
-        w = torch.softmax(self.fusion_logits[:feats.size(1)], dim=0)
-        fused = torch.sum(feats * w[None, :, None], dim=1)
-        
-        disease_logits = self.classifier(fused)
-        return {
-            "disease_logits": disease_logits,
-        }
-
-class ResNet34HalfClassifier(nn.Module):
-    def __init__(self, dummy_input,
-        feature_dim: int = 39,
-        output_dim: int = 2, **kwargs):
-        super().__init__()
-
-        block = modules.BasicBlock
-        num_blocks = [3, 4, 6, 3]
-        m_channels = 32
-
-        def _downsample_freq(h: int, stages: int = 3) -> int:
-            for _ in range(stages):
-                h = (h - 1) // 2 + 1
-            return h
-        
-        self.in_planes = m_channels
-        self.feature_dim = feature_dim
-        self.stats_dim = _downsample_freq(feature_dim) * m_channels * 8
-
-        self.conv1 = nn.Conv2d(1,
-                               m_channels,
-                               kernel_size=3,
-                               stride=1,
-                               padding=1,
-                               bias=False)
-        self.bn1 = nn.BatchNorm2d(m_channels)
-        self.layer1 = self._make_layer(block,
-                                       m_channels,
-                                       num_blocks[0],
-                                       stride=1)
-        self.layer2 = self._make_layer(block,
-                                       m_channels * 2,
-                                       num_blocks[1],
-                                       stride=2)
-        self.layer3 = self._make_layer(block,
-                                       m_channels * 4,
-                                       num_blocks[2],
-                                       stride=2)
-        
-        channel = 128
-        self.se_channel = nn.Sequential(
-            nn.Linear(channel, channel // 8),
-            nn.ReLU(),
-            nn.Linear(channel // 8, channel),
-            nn.Sigmoid()
-        )
-
-        self.asp_freq = modules.AttentiveStatisticsPooling(channels=channel)
-        self.asp_time = modules.AttentiveStatisticsPooling(channels=channel)
-
-        self.classifier = nn.Sequential(
-            nn.Linear(4 * channel, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, output_dim)
-        )
-
-    def _make_layer(self, block, planes, num_blocks, stride):
-        strides = [stride] + [1] * (num_blocks - 1)
-        layers = []
-        for stride in strides:
-            layers.append(block(self.in_planes, planes, stride))
-            self.in_planes = planes * block.expansion
-        return nn.Sequential(*layers)
-
-
-    def forward(self, x, tabular_ids=None, **kwargs):
-        """
-        x: (B, n_mels, T) mel-spectrogram frames
-        """
-        x = x.unsqueeze_(1)
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.layer1(out)
-        out = self.layer2(out) # [128, 64, 40, 28]
-        out = self.layer3(out) # [128, 64, 40, 28]
-
-        B, C, _, _ = out.shape
-        pooled_c = out.mean(dim=(2, 3))          # [B, C]
-        attn_c = self.se_channel(pooled_c)                # [B, C]
-        out = out * attn_c.view(B, C, 1, 1)
-        
-        # Frequency ASP
-        x_f = out.mean(dim=3)                    # [B, C, F]
-        stats_f, attn_f = self.asp_freq(x_f)   # attn_f: [B, F]
-
-        # Time ASP
-        x_t = out.mean(dim=2)                    # [B, C, T]
-        stats_t, attn_t = self.asp_time(x_t)   # attn_t: [B, T]
-
-        # Fusion
-        feats = torch.cat([stats_f, stats_t], dim=1)
-        disease_logits = self.classifier(feats)
-
-        return {
-            "disease_logits": disease_logits,
-            "attn_channel": attn_c,   # [B, C]
-            "attn_freq": attn_f,      # [B, F]
-            "attn_time": attn_t       # [B, T]
-        }
-
-
 class LSTMAudioClassifier1(nn.Module):
     def __init__(self, dummy_input, feature_dim = 80, hidden_size = 1024, output_dim = 1, **kwargs):
         super(LSTMAudioClassifier1, self).__init__()
@@ -425,97 +193,6 @@ class LSTMAudioClassifier1(nn.Module):
             "embeddings": embedding,
         }
 
-class BiLSTMClassifier(nn.Module):
-    def __init__(
-        self,
-        dummy_input,
-        feature_dim: int = 39,
-        hidden_size: int = 512,
-        num_layers: int = 2,
-        dropout: float = 0.1,
-        use_tabular: bool = False,
-        fusion_type: str = "film",  # ["gating", "cross_attn", "film"]
-        output_dim: int = 2, **kwargs
-    ):
-        super().__init__()
-
-        self.lstm = nn.LSTM(
-            input_size=feature_dim,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0.0,
-            bidirectional=True,
-            batch_first=True,
-        )
-
-        self.pool = modules.TemporalStatsPooling()
-        self.audio_project = nn.Sequential(
-            nn.Linear(hidden_size * 4, hidden_size),  # * 2 normal, *4 TSP
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, 256)
-        )
-
-        self.use_tabular = use_tabular
-        if self.use_tabular:
-            self.tabular_encoder = nn.Sequential(
-                nn.Linear(4, 32),
-                nn.BatchNorm1d(32),
-                nn.ReLU(),
-                nn.Dropout(0.5),
-                nn.Linear(32, 128),
-                nn.ReLU(),
-            )
-
-            # Project tabular → audio space
-            self.tabular_project = nn.Linear(128, 256)
-
-            # Gate: decides how much tabular matters
-            self.gate = nn.Sequential(
-                nn.Linear(128, 256),
-                nn.Sigmoid()
-            )
-            fusion_dim = 256
-        else:
-            fusion_dim = 256
-
-        self.classifier = nn.Sequential(
-            nn.Linear(fusion_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(128, output_dim)
-        )
-
-    def forward(self, x, tabular_ids=None, **kwargs):
-        """
-        x: (B, n_mels, T) mel-spectrogram frames
-        """
-        x = x.permute(0, 2, 1)
-        audio_feat, _ = self.lstm(x)           # (B, T, 2H)
-        
-        audio_feat = self.pool(audio_feat)
-        #w = F.softmax(self.pool(audio_feat), dim=1)   # (B, T, 1)
-        #audio_feat = torch.sum(w * audio_feat, dim=1)
-        
-        # audio_feat = audio_feat.mean(dim=1)           # temporal pooling
-        audio_feat = self.audio_project(audio_feat)      # (B, num_classes)
-
-        if self.use_tabular:
-            assert tabular_ids is not None
-
-            tab_feat = self.tabular_encoder(tabular_ids)   # (B, 64)
-            tab_proj = self.tabular_project(tab_feat)      # (B, 256)
-            gate = self.gate(tab_feat)                     # (B, 256)
-
-            fused = audio_feat + gate * tab_proj
-        else:
-            fused = audio_feat
-
-        disease_logits = self.classifier(fused)
-        return {
-            "disease_logits": disease_logits,
-        }
-
 class BiLSTMSelfAttASPClassifier(nn.Module):
     def __init__(
         self,
@@ -528,6 +205,7 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
         output_dim: int = 1, 
         use_tabular: bool = False,
         fusion_type: str = "cross_attn",  # ["gating", "cross_attn", "film"]
+        att_head_fusion: int = 2,
         **kwargs
     ):
         super().__init__()
@@ -580,7 +258,7 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
         if self.use_tabular and fusion_type == "cross_attn":
             self.cross_attn = nn.MultiheadAttention(
                 embed_dim=fusion_dim,
-                num_heads=att_head,
+                num_heads=att_head_fusion,
                 batch_first=True
             )
             self.ca_norm = nn.LayerNorm(fusion_dim)
@@ -648,7 +326,7 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
         }
 
 class PEFTWavLM_Try1(nn.Module):
-    def __init__(self, input_size, output_dim, lora_rank, lora_alpha, target_modules, spk_dim, **kwargs):
+    def __init__(self, feature_dim, dropout, hidden_dim_classifier, output_dim, lora_rank, lora_alpha, target_modules, spk_dim, **kwargs):
         super(PEFTWavLM_Try1, self).__init__()
 
         from transformers import WavLMModel
@@ -664,17 +342,17 @@ class PEFTWavLM_Try1(nn.Module):
             task_type=TaskType.FEATURE_EXTRACTION,
             r=lora_rank,
             lora_alpha=lora_alpha,
-            lora_dropout=0.1,
+            lora_dropout=dropout,
             target_modules=target_modules,
         )
         self.backbone_model = get_peft_model(self.backbone_model, lora_config)
 
-        self.pool = modules.AttentiveStatisticsPooling(channels=input_size)
+        self.pool = modules.AttentiveStatisticsPooling(channels=feature_dim)
         self.classifier = nn.Sequential(
-            nn.Linear(input_size * 2, 128),
+            nn.Linear(feature_dim * 2, hidden_dim_classifier),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, output_dim)
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim_classifier, output_dim)
         )
 
     def disabled_calc_additional_loss(self, embeddings, labels):
@@ -880,100 +558,4 @@ class AST_Try1(nn.Module):
 
         return {
             "disease_logits": disease_logits,
-        }
-
-class TemporalAttention(nn.Module):
-    """
-    Additive attention over time.
-    Input: (B, T, D)
-    Output: (B, D), (B, T)
-    """
-    def __init__(self, dim):
-        super().__init__()
-        self.attn = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.Tanh(),
-            nn.Linear(dim, 1, bias=False)
-        )
-
-    def forward(self, x, mask=None):
-        # x: (B, T, D)
-        scores = self.attn(x).squeeze(-1)  # (B, T)
-
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
-
-        weights = F.softmax(scores, dim=1)  # (B, T)
-        pooled = torch.sum(x * weights.unsqueeze(-1), dim=1)  # (B, D)
-        return pooled, weights
-
-
-class CNN_BiLSTM_Attention(nn.Module):
-    def __init__(
-        self,
-        dummy_input,
-        feature_dim: int = 39,
-        hidden_size: int = 256,
-        num_layers: int = 1,
-        output_dim: int = 2, 
-        cnn_channels=(1, 32, 64),
-        pool_kernel=(2, 2),
-        **kwargs
-    ):
-        super().__init__()
-
-        # CNN
-        self.conv1 = nn.Conv2d(cnn_channels[0], cnn_channels[1], 3, padding=1)
-        self.conv2 = nn.Conv2d(cnn_channels[1], cnn_channels[2], 3, padding=1)
-        self.pool = nn.MaxPool2d(pool_kernel)
-
-        freq_after_pool = feature_dim // (pool_kernel[0] ** 2)
-        cnn_out_dim = cnn_channels[2] * freq_after_pool
-
-        # Dim reduction
-        self.dense = nn.Linear(cnn_out_dim, hidden_size)
-
-        # BiLSTM
-        self.bilstm = nn.LSTM(
-            input_size=hidden_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            bidirectional=True,
-        )
-
-        # Attention pooling
-        self.attention = TemporalAttention(hidden_size * 2)
-
-        # Output head
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.3),
-            nn.Linear(hidden_size * 2, output_dim),
-        )
-
-    def forward(self, x, mask=None, **kwargs):
-        """
-        x: (B, n_mels, T)
-        mask: (B, T') optional, after CNN pooling
-        """
-        x = x.unsqueeze(1)  # (B, 1, n_mels, T)
-
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        # (B, C, F', T')
-
-        x = x.permute(0, 3, 1, 2).contiguous()
-        B, T, C, Freq = x.shape
-        x = x.view(B, T, C * Freq)
-
-        x = F.relu(self.dense(x))
-        x, _ = self.bilstm(x)
-
-        # Attention pooling over time
-        x, attn_weights = self.attention(x, mask)
-
-        disease_logits = self.classifier(x)
-        return {
-            "disease_logits": disease_logits,
-            "attn_weights": attn_weights,
         }

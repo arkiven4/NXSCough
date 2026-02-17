@@ -35,12 +35,12 @@
     "rezize_size": [64, 256],
 
     "tabular_feature": true,
-    "acoustic_feature": true,
+    "acoustic_feature": false,
     "feature_type": "logmel",
     "delta_feature": false,
     "deltadelta_feature": false,
 
-    "multimask_augment": true,
+    "multimask_augment": false,
     "multimask_prob": 0.2,
     "tau": 0.10,
     "nu": 0.10,
@@ -64,19 +64,24 @@
     "pooling_model": "ResNet34ManualClassifier",
     "feature_dim": 80,
     "output_dim": 1,
-    "dropout": 0.34,
+    "dropout": 0.5,
+    "hidden_dim_classifier": 64,
     "use_tabular": false,
 
     "hidden_size": 64,
-    "lstmnum_layers": 3,
-    "att_head": 4,
-    "hidden_dim_classifier": 256,
+    "lstmnum_layers": 1,
+    "att_head": 2,
+    "att_head_fusion": 2,
+    "fusion_type": "film",
 
+    "resnet_type": "resnet18",
+    "num_layers_resnet": 4,
+    
     "lora_finetune": true,
     "adapter_hidden_dim": 128,
     "embedding_prompt_dim": 5,
-    "lora_rank": 16,
-    "lora_alpha": 32,
+    "lora_rank": 32,
+    "lora_alpha": 64,
     "target_modules": [ "q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2", "conv_out", "proj1", "proj2" ]
   }
 }

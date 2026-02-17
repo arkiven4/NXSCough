@@ -471,7 +471,6 @@ class CBAM(nn.Module):
 
 class BasicBlock(nn.Module):
     expansion = 1
-
     def __init__(self, in_planes, planes, stride=1):
         super(BasicBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_planes,
@@ -501,6 +500,42 @@ class BasicBlock(nn.Module):
     def forward(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+    
+class Bottleneck(nn.Module):
+    expansion = 4
+    def __init__(self, in_planes, planes, stride=1):
+        super(Bottleneck, self).__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes,
+                               planes,
+                               kernel_size=3,
+                               stride=stride,
+                               padding=1,
+                               bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv3 = nn.Conv2d(planes,
+                               self.expansion * planes,
+                               kernel_size=1,
+                               bias=False)
+        self.bn3 = nn.BatchNorm2d(self.expansion * planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion * planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes,
+                          self.expansion * planes,
+                          kernel_size=1,
+                          stride=stride,
+                          bias=False), nn.BatchNorm2d(self.expansion * planes))
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = F.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
         out += self.shortcut(x)
         out = F.relu(out)
         return out
@@ -616,15 +651,31 @@ class TSTP(nn.Module):
         return self.out_dim
 
 class Resnet34Manual(nn.Module):
-    def __init__(self, feature_dim):
+    def __init__(self, resnet_type, feature_dim, num_layers=4):
         super(Resnet34Manual, self).__init__()
 
-        block = BasicBlock
-        num_blocks = [3, 4, 6, 3]
+        assert 1 <= num_layers <= 4, "num_layers must be between 1 and 4"
+
+        if resnet_type == "resnet18":
+            block = BasicBlock
+            num_blocks = [2, 2, 2, 2]
+        elif resnet_type == "resnet34":
+            block = BasicBlock
+            num_blocks = [3, 4, 6, 3]
+        elif resnet_type == "resnet50":
+            block = Bottleneck
+            num_blocks = [3, 4, 6, 3]
+        elif resnet_type == "resnet101":
+            block = Bottleneck
+            num_blocks = [3, 4, 23, 3]
+
+        self.num_layers = num_layers
         m_channels = 32
+        channel_mults = [1, 2, 4, 8]   # per-layer channel multipliers
+        strides = [1, 2, 2, 2]          # per-layer strides
 
         def _downsample_freq(h: int, stages: int = 3) -> int:
-            # Compute frequency downsampling after 3 stride-2 stages precisely:
+            # Compute frequency downsampling after stride-2 stages precisely:
             # H_next = floor((H - 1) / 2) + 1 for k=3, p=1, s=2
             for _ in range(stages):
                 h = (h - 1) // 2 + 1
@@ -632,15 +683,21 @@ class Resnet34Manual(nn.Module):
         
         self.in_planes = m_channels
         self.feature_dim = feature_dim
-        self.stats_dim = _downsample_freq(feature_dim) * m_channels * 8
+
+        # Number of stride-2 stages depends on how many layers are used
+        num_stride2_stages = max(0, num_layers - 1)  # layer1 has stride=1
+        last_channels = m_channels * channel_mults[num_layers - 1]
+        self.stats_dim = _downsample_freq(feature_dim, stages=num_stride2_stages) * last_channels
 
         self.conv1 = nn.Conv2d(1, m_channels, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(m_channels)
 
-        self.layer1 = self._make_layer(block, m_channels, num_blocks[0], stride=1)
-        self.layer2 = self._make_layer(block, m_channels * 2, num_blocks[1], stride=2)
-        self.layer3 = self._make_layer(block, m_channels * 4, num_blocks[2], stride=2)
-        self.layer4 = self._make_layer(block, m_channels * 8, num_blocks[3], stride=2)
+        self.res_layers = nn.ModuleList()
+        for i in range(num_layers):
+            self.res_layers.append(
+                self._make_layer(block, m_channels * channel_mults[i], num_blocks[i], stride=strides[i])
+            )
+
         self.pool = TSTP(in_dim=self.stats_dim * block.expansion)
 
     def _make_layer(self, block, planes, num_blocks, stride):
@@ -656,11 +713,9 @@ class Resnet34Manual(nn.Module):
         x: (B, n_mels, T) mel-spectrogram frames
         """
         out = F.relu(self.bn1(self.conv1(x)))
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.layer4(out)  # torch.Size([128, 256, 10, 7])
-        stats = self.pool(out)  # torch.Size([128, 5120])
+        for layer in self.res_layers:
+            out = layer(out)
+        stats = self.pool(out)
         return stats
 
 class ResNetCBAM(nn.Module):
