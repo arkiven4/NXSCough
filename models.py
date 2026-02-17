@@ -419,7 +419,7 @@ class PEFTWavLM_Try1(nn.Module):
         }
     
 class PEFTQwen3_Try1(nn.Module):
-    def __init__(self, input_size, output_dim, lora_rank, lora_alpha, target_modules, spk_dim, **kwargs):
+    def __init__(self, dropout, hidden_dim_classifier, output_dim, lora_rank, lora_alpha, target_modules, spk_dim, **kwargs):
         super(PEFTQwen3_Try1, self).__init__()
 
         from peft import get_peft_model, LoraConfig, TaskType
@@ -477,10 +477,10 @@ class PEFTQwen3_Try1(nn.Module):
 
         self.pool = modules.AttentiveStatisticsPooling(channels=self.audiotower_hidden_dim)
         self.classifier = nn.Sequential(
-            nn.Linear(self.audiotower_hidden_dim * 2, 128),
+            nn.Linear(self.audiotower_hidden_dim * 2, hidden_dim_classifier),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, output_dim)
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim_classifier, output_dim)
         )
 
     def after_cnn_len(self, L):

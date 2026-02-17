@@ -35,7 +35,7 @@
     "rezize_size": [64, 256],
 
     "tabular_feature": true,
-    "acoustic_feature": false,
+    "acoustic_feature": true,
     "feature_type": "logmel",
     "delta_feature": false,
     "deltadelta_feature": false,
@@ -80,8 +80,8 @@
     "lora_finetune": true,
     "adapter_hidden_dim": 128,
     "embedding_prompt_dim": 5,
-    "lora_rank": 32,
-    "lora_alpha": 64,
+    "lora_rank": 16,
+    "lora_alpha": 32,
     "target_modules": [ "q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2", "conv_out", "proj1", "proj2" ]
   }
 }

@@ -111,6 +111,7 @@ def sample_folds(n_folds:int, weights:np.array, tau:float) -> Tuple[List,Dict]:
         train_ids = np.random.permutation(np.concatenate(temp))
         fold_splits.append((train_ids,test_ids))
     return fold_splits, fold_id
+
 # def get_sample_probs(weights: np.ndarray, tau: float) -> np.ndarray:
 #     if tau == 0:
 #         raise ValueError("tau=0 should use deterministic sorting")
@@ -363,7 +364,7 @@ def main(cli_args=None):
     logger.info(f"✨ Using Model: {hps.model.pooling_model}")
     logger.info(f"======================================")
     
-    pool_net, pool_model = train.setup_model(hps, is_init=args.init)
+    pool_net = train.setup_model(hps, is_init=args.init)
     # =============================================================
     # SECTION: Setup Logger, Dataloader
     # =============================================================
@@ -425,7 +426,7 @@ def main(cli_args=None):
 
             # Prepare data loaders
             train_loader, val_loader = train.prepare_fold_data(
-                train_fold, val_fold, hps, fold, collate_fn,
+                train_fold, val_fold, hps, collate_fn,
                 use_precomputed=args.use_precomputed,
                 precomputed_dir=args.precomputed_dir
             )

@@ -92,7 +92,6 @@ def load_data(hps):
     df_train = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.train')
     df_train = df_train.reset_index(drop=True)
     df_train = df_train[hps.data.column_order]
-
     try:
         df_test = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hps.data.metadata_csv}.test')
         df_test = df_test.reset_index(drop=True)
@@ -122,10 +121,8 @@ def get_collate_fn(hps):
 
 def setup_model(hps, is_init=True):
     """Load or initialize model based on configuration."""
-    hps.model.spk_dim = 0
     if is_init:
         pool_net = getattr(models, hps.model.pooling_model)
-        pool_model = pool_net(**hps.model)
         shutil.copy2('./models.py', f'{hps.model_dir}/model_net.py.bak')
     else:
         temp_path = tempfile.NamedTemporaryFile(suffix=".py", delete=False).name
@@ -135,9 +132,7 @@ def setup_model(hps, is_init=True):
         sys.modules["model_net"] = model_modules
         spec.loader.exec_module(model_modules)
         pool_net = getattr(model_modules, hps.model.pooling_model)
-        pool_model = pool_net(**hps.model)
-    
-    return pool_net, pool_model
+    return pool_net
 
 
 def create_data_split(df_train, target_labels, use_kfold=True, n_splits=5, test_size=0.2, random_state=42):
@@ -216,25 +211,10 @@ def create_sampler(train_fold, hps):
     return sampler
 
 
-def prepare_fold_data(train_fold, val_fold, hps, fold, collate_fn, use_precomputed=False, precomputed_dir=None):
+def prepare_fold_data(train_fold, val_fold, hps, collate_fn, use_precomputed=False, precomputed_dir=None):
     # """Prepare datasets and dataloaders for a fold."""
-    # # Skip statistics computation if using precomputed features
-    # if not use_precomputed:
-    #     # Compute statistics
-    #     if hps.data.acoustic_feature and hps.data.mean_std_norm:
-    #         utils.compute_spectrogram_stats_from_dataset(
-    #             train_fold, 
-    #             hps.data, 
-    #             pickle_path=f"{hps.model_dir}/wav_stats.pickle"
-    #         )
-    #     else:
-    #         utils.compute_wav_stats(
-    #             train_fold, 
-    #             "path_file", 
-    #             pickle_path=f"{hps.model_dir}/wav_stats.pickle"
-    #         )
-    
     # Load precomputed feature mappings if enabled
+
     train_data = train_fold
     val_data = val_fold
     feature_path_col = None
@@ -399,7 +379,7 @@ def stratified_group_holdout(y: np.ndarray, g: np.ndarray, test_size: float, see
     # fallback: no guarantee, but return last attempt
     return mask_tr, mask_ca
 
-def evaluate_on_dataset(runner_lightning, trainer, df, hps, best_fold_idx, collate_fn, db_column=None, use_precomputed=False, precomputed_dir=None):
+def evaluate_on_dataset(runner_lightning, trainer, df, hps, collate_fn, db_column=None, use_precomputed=False, precomputed_dir=None):
     """Evaluate model on dataset, optionally grouped by database type."""
     # TODO : Refine for PRECOMPUTED
     results_dict = {}
@@ -520,8 +500,8 @@ def parse_args():
     parser.add_argument("--batch_size", type=int)
     parser.add_argument("--use_precomputed", action="store_true", help="Use precomputed features")
     parser.add_argument("--precomputed_dir", type=str, default=None, help="Directory with precomputed features")
+    parser.add_argument("--use_tensorboard", action="store_true")
     return parser
-
 
 def main(cli_args=None):
     parser = parse_args()
@@ -533,12 +513,12 @@ def main(cli_args=None):
     model_dir = os.path.join("./logs", args.model_name)
     os.makedirs(model_dir, exist_ok=True)
 
-    if not args.eval:
+    tb_process = None
+    if args.use_tensorboard:
         port = utils.get_free_port()
-        subprocess.Popen(
+        tb_process = subprocess.Popen(
             ["tensorboard", "--logdir", model_dir, "--port", str(port), "--host", "0.0.0.0"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     else:
         port = None
@@ -557,14 +537,12 @@ def main(cli_args=None):
     if not args.use_precomputed:
         if hps.data.acoustic_feature and hps.data.mean_std_norm:
             utils.compute_spectrogram_stats_from_dataset(
-                df_train, 
-                hps.data, 
+                df_train, hps.data, 
                 pickle_path=f"{hps.model_dir}/wav_stats.pickle"
             )
         else:
             utils.compute_wav_stats(
-                df_train, 
-                "path_file", 
+                df_train, "path_file", 
                 pickle_path=f"{hps.model_dir}/wav_stats.pickle"
             )
 
@@ -582,10 +560,8 @@ def main(cli_args=None):
     logger.info(f"✨ Use Rawboost Augment: {hps.data.augment_rawboost}")
     logger.info(f"✨ Padding Type: {hps.data.pad_types}")
     logger.info(f"✨ Using Model: {hps.model.pooling_model}")
-    if not args.eval:
+    if args.use_tensorboard:
         logger.info(f"✨ Tensorboard: http://100.101.198.75:{port}/#scalars&_smoothingWeight=0")
-    else:
-        logger.info(f"✨ Running in EVAL mode")
     logger.info(f"======================================")
 
     pool_net, pool_model = setup_model(hps, is_init=args.init)
@@ -596,8 +572,7 @@ def main(cli_args=None):
     oof_p = np.zeros(len(df_train), dtype=float)
     oof_label = np.zeros(len(df_train), dtype=float)
     
-    splitter, num_folds = create_data_split(df_train, target_labels, use_kfold=hps.train.use_Kfold, 
-                                            n_splits=10, random_state=RNG_SEED)
+    splitter, num_folds = create_data_split(df_train, target_labels, use_kfold=hps.train.use_Kfold, n_splits=10, random_state=RNG_SEED)
     for fold_outter, (inner_idx, test_idx) in enumerate(splitter):
         logger.info(f"\n{'='*20} Fold {fold_outter+1}/{num_folds} {'='*20}")
 
@@ -611,11 +586,10 @@ def main(cli_args=None):
         val_fold = inner_fold.iloc[mask_cp].reset_index(drop=True)
             
         train_loader, val_loader = prepare_fold_data(
-            train_fold, val_fold, hps, 0, collate_fn,
+            train_fold, val_fold, hps, collate_fn,
             use_precomputed=args.use_precomputed,
             precomputed_dir=args.precomputed_dir
         )
-        # oof_probs = np.zeros(len(val_fold))
 
         pool_model = pool_net(**hps.model)
         checkpoint_callback = ModelCheckpoint(
@@ -652,16 +626,16 @@ def main(cli_args=None):
         production_path = os.path.join(f"{hps.model_dir}/{fold_outter}", "best_model.ckpt")
         shutil.move(trainer.checkpoint_callback.best_model_path, production_path)
 
+        trainer = L.Trainer(accelerator="gpu" if torch.cuda.is_available() else "cpu", devices="auto")
         runner_lightning = lightning_wrapper.CoughClassificationRunner.load_from_checkpoint(
             os.path.join(f"{hps.model_dir}/{fold_outter}", "best_model.ckpt"),
             model=pool_model, hps=hps, custom_logger=logger)
         runner_lightning.eval()
-        trainer = L.Trainer(accelerator="gpu" if torch.cuda.is_available() else "cpu", devices="auto")
 
         runner_lightning.calibrate_threshold = True
         trainer.test(runner_lightning, dataloaders=val_loader)
 
-        results_dict = evaluate_on_dataset(runner_lightning, trainer, test_fold, hps, 0, collate_fn,
+        results_dict = evaluate_on_dataset(runner_lightning, trainer, test_fold, hps, collate_fn,
                                             use_precomputed=args.use_precomputed,
                                             precomputed_dir=args.precomputed_dir)
         write_results_to_file("result_overall.txt", results_dict, f"{hps.model_dir}", {0: "Test " + str(fold_outter)})
@@ -669,6 +643,7 @@ def main(cli_args=None):
         oof_p[test_idx] = results_dict[0]["raw_data"]['probs'].reshape(-1)
         oof_label[test_idx] = results_dict[0]["raw_data"]['labels'].reshape(-1)
         fold_thr.append(runner_lightning.probs_threshold)
+        
         if os.path.exists(production_path):
             os.remove(production_path)
 
@@ -678,6 +653,13 @@ def main(cli_args=None):
             "oof_p": oof_p, 
             "oof_label": oof_label, 
             }, f)
+
+    if tb_process is not None:
+        tb_process.terminate()
+        try:
+            tb_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            tb_process.kill()
     
     # if not args.eval and hps.train.use_Kfold:
     #     best_fold_idx, production_path = select_best_fold(fold_metrics, fold_checkpoints, hps.model_dir, logger)
@@ -799,7 +781,6 @@ def main(cli_args=None):
     # # SECTION: Cleaning
     # # =============================================================
     # cleanup_fold_directories(hps.model_dir, best_fold_idx)
-
 
 if __name__ == "__main__":
     main()

@@ -467,12 +467,13 @@ class CoughDatasetsProcessorCollate():
         PARAMS
         ------
         batch: [text_normalized, mel_normalized]
+        (Index, wavname, wav1, wav2, dse_id, int(spk_id), int(gndr_id), tabular)
         """
-        wav_name = [x[0] for x in batch]
-        wavs = [x[1].squeeze().numpy() for x in batch]  # list[np.ndarray]
-        dse_ids = torch.stack([x[3].squeeze(0) for x in batch])
-        spk_ids = torch.stack([torch.tensor(x[4]) for x in batch])
-        gndr_ids = torch.stack([torch.tensor(x[5]) for x in batch])
+        wav_name = [x[1] for x in batch]
+        wavs = [x[2].squeeze().numpy() for x in batch]  # list[np.ndarray]
+        dse_ids = torch.stack([x[4].squeeze(0) for x in batch])
+        spk_ids = torch.stack([torch.tensor(x[5]) for x in batch])
+        gndr_ids = torch.stack([torch.tensor(x[6]) for x in batch])
 
         audio_inputs = self.processor.feature_extractor(
             wavs,
@@ -492,7 +493,7 @@ class CoughDatasetsProcessorCollate():
             dtype=wav_padded.dtype
         )
 
-        return wav_name, wav_padded, dummy_wav, attention_masks, dse_ids, [spk_ids, None, gndr_ids]
+        return wav_name, wav_padded, dummy_wav, attention_masks, dse_ids, [spk_ids, None, gndr_ids, None]
 
 
 class CoughDetectionRatioBatchSampler(Sampler):

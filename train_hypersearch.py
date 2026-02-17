@@ -59,27 +59,8 @@ cmap = cm.get_cmap("viridis")
 #######################################################################
 # MAIN SCRIPT
 #######################################################################
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--init", action="store_true")
-    parser.add_argument("--eval", action="store_true")
-    parser.add_argument("--model_name", type=str, default="try_wavlmlora_downstream")
-    parser.add_argument("--config_path", type=str, default="configs/ssl_finetuning.json")
-
-    parser.add_argument("--feature_dim", type=int)
-    parser.add_argument("--pooling_model", type=str)
-    parser.add_argument("--feature_type", type=str)
-    parser.add_argument("--delta_feature", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--deltadelta_feature", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--batch_size", type=int)
-    parser.add_argument("--use_precomputed", action="store_true", help="Use precomputed features")
-    parser.add_argument("--precomputed_dir", type=str, default=None, help="Directory with precomputed features")
-    return parser
-
-
 def main(cli_args=None):
-    parser = parse_args()
+    parser = train.parse_args()
     args = parser.parse_args(cli_args)
 
     RNG_SEED = 42
@@ -88,19 +69,10 @@ def main(cli_args=None):
     model_dir = os.path.join("./logs", args.model_name)
     os.makedirs(model_dir, exist_ok=True)
 
-    if not args.eval:
-        port = utils.get_free_port()
-        subprocess.Popen(
-            ["tensorboard", "--logdir", model_dir, "--port", str(port), "--host", "0.0.0.0"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    else:
-        port = None
-
     config_path = args.config_path if args.init else os.path.join(model_dir, "config.json")
     hps = train.load_config(config_path, model_dir, args)
     hps.model.spk_dim = 0
+    pool_net = train.setup_model(hps, is_init=args.init)
 
     # =============================================================
     # SECTION: Loading Data
@@ -111,8 +83,7 @@ def main(cli_args=None):
 
     if not args.use_precomputed:
         utils.compute_spectrogram_stats_from_dataset(
-            df_train,
-            hps.data,
+            df_train, hps.data,
             pickle_path=f"{hps.model_dir}/wav_stats.pickle"
         )
 
@@ -130,30 +101,24 @@ def main(cli_args=None):
     logger.info(f"✨ Use Rawboost Augment: {hps.data.augment_rawboost}")
     logger.info(f"✨ Padding Type: {hps.data.pad_types}")
     logger.info(f"✨ Using Model: {hps.model.pooling_model}")
-    if not args.eval:
-        logger.info(f"✨ Tensorboard: http://100.101.198.75:{port}/#scalars&_smoothingWeight=0")
-    else:
-        logger.info(f"✨ Running in EVAL mode")
     logger.info(f"======================================")
 
-    pool_net, pool_model = train.setup_model(hps, is_init=args.init)
     # =============================================================
     # SECTION: Setup Logger, Dataloader
     # =============================================================
-    
     def sample_params(trial):
         params = {
             "hidden_dim_classifier": trial.suggest_categorical("hidden_dim_classifier", [32, 64, 128, 192, 256, 384, 512]),
             "dropout": trial.suggest_float("dropout", 0.1, 0.7),
 
-            # "hidden_size": trial.suggest_categorical("hidden_size", [32, 64, 128, 192, 256, 384, 512]),
-            # "lstmnum_layers": trial.suggest_int("lstmnum_layers", 1, 4),
-            # "att_head": trial.suggest_categorical("att_head", [1, 2, 4, 8]),
+            "hidden_size": trial.suggest_categorical("hidden_size", [32, 64, 128, 192, 256, 384, 512]),
+            "lstmnum_layers": trial.suggest_int("lstmnum_layers", 1, 4),
+            "att_head": trial.suggest_categorical("att_head", [1, 2, 4, 8]),
             # "att_head_fusion": trial.suggest_categorical("att_head_fusion", [1, 2, 4, 8]),
             # "fusion_type": trial.suggest_categorical("fusion_type", ["gating", "cross_attn", "film"]),
             
-            "resnet_type": trial.suggest_categorical("resnet_type", ["resnet18", "resnet34", "resnet50", "resnet101"]),
-            "num_layers_resnet": trial.suggest_int("num_layers_resnet", 1, 4),
+            # "resnet_type": trial.suggest_categorical("resnet_type", ["resnet18", "resnet34", "resnet50", "resnet101"]),
+            # "num_layers_resnet": trial.suggest_int("num_layers_resnet", 1, 4),
         }
         return params
 
@@ -175,7 +140,7 @@ def main(cli_args=None):
             val_fold = inner_fold.iloc[mask_cp].reset_index(drop=True)
             
             train_loader, val_loader = train.prepare_fold_data(
-                train_fold, val_fold, hps, 0, collate_fn,
+                train_fold, val_fold, hps, collate_fn,
                 use_precomputed=args.use_precomputed,
                 precomputed_dir=args.precomputed_dir
             )
@@ -188,14 +153,12 @@ def main(cli_args=None):
                 save_top_k=1,
                 mode="min",
             )
-
-            tb_logger = TensorBoardLogger(save_dir=f"{hps.model_dir}/{fold_outter}", sub_dir="train")
             early_stopping = EarlyStopping(monitor="val/loss", patience=7, mode="min", verbose=False)
-            runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[])  # Bcs i use Sampler
+
+            runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[])
             trainer = L.Trainer(
                 max_epochs=10000,
                 callbacks=[checkpoint_callback, early_stopping],
-                logger=tb_logger,
                 accelerator="gpu" if torch.cuda.is_available() else "cpu",
                 devices="auto",
                 default_root_dir=f"{hps.model_dir}/{fold_outter}",
@@ -206,28 +169,23 @@ def main(cli_args=None):
             production_path = os.path.join(f"{hps.model_dir}/{fold_outter}", "best_model.ckpt")
             shutil.move(trainer.checkpoint_callback.best_model_path, production_path)
 
+            trainer = L.Trainer(accelerator="gpu" if torch.cuda.is_available() else "cpu", devices="auto")
             runner_lightning = lightning_wrapper.CoughClassificationRunner.load_from_checkpoint(
                 os.path.join(f"{hps.model_dir}/{fold_outter}", "best_model.ckpt"),
                 model=pool_model, hps=hps, custom_logger=logger
             )
             runner_lightning.eval()
-            trainer = L.Trainer(accelerator="gpu" if torch.cuda.is_available() else "cpu", devices="auto")
-
+            
             runner_lightning.calibrate_threshold = True
             trainer.test(runner_lightning, dataloaders=val_loader)
 
-            results_dict = train.evaluate_on_dataset(runner_lightning, trainer, test_fold, hps, 0, collate_fn,
+            results_dict = train.evaluate_on_dataset(runner_lightning, trainer, test_fold, hps, collate_fn,
                                                     use_precomputed=args.use_precomputed,
                                                     precomputed_dir=args.precomputed_dir)[0]
 
             fold_scores.append(results_dict['metrics'].get('test_bacc', 0.0))
             if os.path.exists(production_path):
                 os.remove(production_path)
-
-            # # ---- pruning signal ----
-            # trial.report(np.mean(fold_scores), fold_outter)
-            # if trial.should_prune():
-            #     raise optuna.TrialPruned()
         
         mean_acc = np.mean(fold_scores)
         std_acc = np.std(fold_scores)
