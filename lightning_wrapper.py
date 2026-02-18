@@ -188,9 +188,10 @@ class CoughClassificationRunner(L.LightningModule):
         self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=False, logger=True)
 
     def on_test_epoch_start(self):
-        self.test_preds = []
         self.test_labels = []
         self.test_probs = []
+        self.test_preds = []
+        self.test_patient_ids = []
 
     def test_step(self, batch, batch_idx):
         _, audio1, audio2, attention_masks, dse_ids, [patient_ids, _, tabular_ids, _] = batch
@@ -208,15 +209,17 @@ class CoughClassificationRunner(L.LightningModule):
         self.test_preds.append(preds.cpu())
         self.test_labels.append(labels.cpu())
         self.test_probs.append(probs.cpu())
+        self.test_patient_ids.append(patient_ids.cpu())
 
     def on_test_epoch_end(self):
-        preds = torch.cat(self.test_preds).numpy()
         labels = torch.cat(self.test_labels).numpy()
         probs = torch.cat(self.test_probs).numpy()
+        preds = torch.cat(self.test_preds).numpy()
+        patient_ids = torch.cat(self.test_patient_ids).numpy()
 
         #if self.test_raw:
         #self.test_raw = False
-        self.test_outputs = {"labels": labels, "probs": probs, "preds": preds}
+        self.test_outputs = {"labels": labels, "probs": probs, "preds": preds, "patient_ids": patient_ids}
 
         if self.calibrator != None:
             probs = self.calibrator.transform(probs.reshape(-1))

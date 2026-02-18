@@ -51,6 +51,11 @@ from cough_datasets import (
     CoughDiseaseBinaryBatchSampler,
     PatientBatchSampler, AutoPatientBatchSampler
 )
+from sklearn.metrics import (
+    confusion_matrix, accuracy_score,
+    balanced_accuracy_score,
+    roc_auc_score, roc_curve
+)
 
 torch.set_float32_matmul_precision("medium")
 cmap = cm.get_cmap("viridis")
@@ -72,12 +77,20 @@ def set_seed(seed: int = 42) -> None:
     print(f"Random seed set as {seed}")
 
 
-def get_sample_probs(weights:np.array, tau:float) -> np.array:
-    '''
-    Gets sampling probability based on weights
-    '''
-    exp_i = np.exp(weights/tau)
-    return exp_i/np.sum(exp_i)
+# def get_sample_probs(weights:np.array, tau:float) -> np.array:
+#     '''
+#     Gets sampling probability based on weights
+#     '''
+#     exp_i = np.exp(weights/tau)
+#     return exp_i/np.sum(exp_i)
+
+def get_sample_probs(weights: np.ndarray, tau: float) -> np.ndarray:
+    if tau == 0:
+        raise ValueError("tau=0 should use deterministic sorting")
+    z = weights / tau
+    z = z - np.max(z)  # stable softmax
+    exp_z = np.exp(z)
+    return exp_z / exp_z.sum()
 
 def sample_folds(n_folds:int, weights:np.array, tau:float) -> Tuple[List,Dict]:
     '''
@@ -112,94 +125,96 @@ def sample_folds(n_folds:int, weights:np.array, tau:float) -> Tuple[List,Dict]:
         fold_splits.append((train_ids,test_ids))
     return fold_splits, fold_id
 
-# def get_sample_probs(weights: np.ndarray, tau: float) -> np.ndarray:
-#     if tau == 0:
-#         raise ValueError("tau=0 should use deterministic sorting")
-#     z = weights / tau
-#     z = z - np.max(z)  # stable softmax
-#     exp_z = np.exp(z)
-#     return exp_z / exp_z.sum()
-
-
-# def sample_folds_grouped(
-#     n_folds: int,
-#     memory: np.ndarray,
-#     participant_ids: np.ndarray,
-#     tau: float,
-#     random_state: int = None
-# ) -> Tuple[List[Tuple[np.ndarray, np.ndarray]], Dict]:
-
-#     rng = np.random.default_rng(random_state)
-
-#     # --------------------------------------------------
-#     # 1. Aggregate memory at participant level
-#     # --------------------------------------------------
-#     unique_pids, inverse = np.unique(participant_ids, return_inverse=True)
-#     pid_memory_sum = np.bincount(inverse, weights=memory)
-#     pid_count = np.bincount(inverse)
-#     pid_memory = pid_memory_sum / pid_count
-
-#     n_groups = len(unique_pids)
-
-#     # --------------------------------------------------
-#     # 2. Temperature-weighted permutation of groups
-#     # --------------------------------------------------
-#     if tau == 0:
-#         ordering = np.argsort(pid_memory)[::-1]
-#     elif np.isinf(tau):
-#         ordering = rng.permutation(n_groups)
-#     else:
-#         p = get_sample_probs(pid_memory, tau)
-#         ordering = rng.choice(n_groups, size=n_groups, replace=False, p=p)
-
-#     # --------------------------------------------------
-#     # 3. Split groups evenly
-#     # --------------------------------------------------
-#     group_folds = np.array_split(ordering, n_folds)
-
-#     fold_splits = []
-#     fold_id = {}
-
-#     for i in range(n_folds):
-#         test_group_idx = group_folds[i]
-#         train_group_idx = np.concatenate([g for j, g in enumerate(group_folds) if j != i])
-
-#         test_pids = unique_pids[test_group_idx]
-#         train_pids = unique_pids[train_group_idx]
-
-#         test_mask = np.isin(participant_ids, test_pids)
-#         train_mask = np.isin(participant_ids, train_pids)
-
-#         test_ids = np.where(test_mask)[0]
-#         train_ids = np.where(train_mask)[0]
-
-#         fold_splits.append((train_ids, test_ids))
-
-#     fold_id["group_memory"] = pid_memory
-#     fold_id["group_order"] = ordering
-
-#     return fold_splits, fold_id
-
-# -------------------------------------------------
-# Variance-driven temperature schedule
-# -------------------------------------------------
-def update_tau_variance(tau, memory, alpha=2.0, tau_min=1e-4, tau_max=10.0):
+def sample_folds_grouped(n_folds: int, weights: np.ndarray,
+    tau: float, participant_ids: np.ndarray) -> Tuple[List, Dict]:
     """
+    Weighted fold sampling with temperature τ, ensuring that
+    each participant appears in only ONE fold.
+    """
+
+    # --- unique participants ---
+    unique_pids, pid_inverse = np.unique(participant_ids, return_inverse=True)
+    n_participants = len(unique_pids)
+
+    # --- aggregate participant weights (mean is safest) ---
+    part_weights = np.zeros(n_participants)
+    for i in range(n_participants):
+        part_weights[i] = weights[pid_inverse == i].mean()
+
+    # --- compute sampling probabilities ---
+    p_i = get_sample_probs(part_weights, tau)
+
+    if tau < 1e-4:
+        ordering = np.argsort(part_weights)[::-1]
+    elif tau > 1e4:
+        ordering = np.random.permutation(n_participants)
+    else:
+        ordering = np.random.choice(
+            n_participants,
+            size=n_participants,
+            replace=False,
+            p=p_i
+        )
+
+    # --- split participants into best/rest/worst ---
+    fold_id = {"best": [], "rest": [], "worst": []}
+
+    fold_size = int(n_participants / n_folds)
+
+    fold_id["best"] = ordering[:fold_size]
+    fold_id["rest"] = ordering[fold_size:(n_folds - 1) * fold_size]
+    fold_id["worst"] = ordering[(n_folds - 1) * fold_size:]
+
+    # split rest into n_folds-2 parts
+    rest_ids = fold_id["rest"]
+    chunk = int(np.ceil(len(rest_ids) / (n_folds - 2)))
+
+    rest_ids = [
+        rest_ids[i * chunk:(i + 1) * chunk]
+        for i in range(n_folds - 2)
+    ]
+
+    part_folds = [fold_id["best"]] + rest_ids + [fold_id["worst"]]
+
+    # --- expand participant folds → sample index folds ---
+    fold_splits = []
+
+    for i in range(n_folds):
+        temp = part_folds.copy()
+
+        test_pids = temp.pop(i)
+        train_pids = np.concatenate(temp)
+
+        # map participants → sample indices
+        test_mask = np.isin(pid_inverse, test_pids)
+        train_mask = np.isin(pid_inverse, train_pids)
+
+        test_ids = np.random.permutation(np.where(test_mask)[0])
+        train_ids = np.random.permutation(np.where(train_mask)[0])
+
+        fold_splits.append((train_ids, test_ids))
+
+    return fold_splits, fold_id
+
+# -------------------------------------------------
+# tau Updater schedule
+# -------------------------------------------------
+def update_tau_variance(tau, memory, alpha=5.0, tau_min=1e-4, tau_max=10.0):
+    """
+    Variance-driven temperature schedule
     Decrease tau when memory variance is large (signal clear),
     increase tau when variance is small (need exploration).
+    Larger alpha -> tau decreases faster when variance is high
     """
     var = np.var(memory)
     tau_new = tau * np.exp(-alpha * var)
     return float(np.clip(tau_new, tau_min, tau_max))
 
-# -------------------------------------------------
-# Validation-metric feedback schedule
-# -------------------------------------------------
-def update_tau_validation(tau, fold_metrics, beta=1.5,
-                          tau_min=1e-4, tau_max=10.0):
+def update_tau_validation(tau, fold_metrics, beta=1.5, tau_min=1e-4, tau_max=10.0):
     """
-    If fold std is high → increase tau (too greedy).
-    If std is low → decrease tau (can exploit).
+    Validation-metric feedback schedule
+    If fold std is high (too greedy) → increase tau  -> (need exploration).
+    If std is low (can exploit) → decrease tau  -> (signal clear).
     """
     std = np.std(fold_metrics)
     tau_new = tau * np.exp(beta * std)
@@ -208,10 +223,7 @@ def update_tau_validation(tau, fold_metrics, beta=1.5,
 # -------------------------------------------------
 # Noisy Rate Adaptive
 # -------------------------------------------------
-def update_noisy_drop_variance(memory,
-                               drop_min=0.1,
-                               drop_max=0.9,
-                               scale=5.0):
+def update_noisy_drop_variance(memory, drop_min=0.1, drop_max=0.9, scale=5.0):
     """
     Increase drop rate as memory variance increases.
     """
@@ -220,9 +232,7 @@ def update_noisy_drop_variance(memory,
     return float(np.clip(drop, drop_min, drop_max))
 
 
-def update_noisy_drop_gmm(memory,
-                          drop_min=0.1,
-                          drop_max=0.9):
+def update_noisy_drop_gmm(memory, drop_min=0.1, drop_max=0.9):
     mem = memory.reshape(-1, 1)
 
     gmm = GaussianMixture(n_components=2, random_state=0)
@@ -237,12 +247,8 @@ def update_noisy_drop_gmm(memory,
     drop = drop_min + (drop_max - drop_min) * sep_scaled
     return float(np.clip(drop, drop_min, drop_max))
 
-def update_noisy_drop_validation(current_drop,
-                                 prev_val_mean,
-                                 current_val_mean,
-                                 step=0.05,
-                                 drop_min=0.05,
-                                 drop_max=0.95):
+def update_noisy_drop_validation(current_drop, prev_val_mean, current_val_mean,
+                                 step=0.05, drop_min=0.05, drop_max=0.95):
     """
     Increase drop if validation improves,
     decrease if validation degrades.
@@ -276,50 +282,6 @@ def estimate_noise_threshold_gmm(memory):
     # midpoint between clusters (robust + simple)
     threshold = float((noisy_mean + clean_mean) / 2.0)
     return threshold
-
-
-def safe_minmax_scale(x, eps=1e-8):
-    arr = np.asarray(x, dtype=np.float64)
-    span = arr.max() - arr.min()
-    if span < eps:
-        return np.full_like(arr, 0.5, dtype=np.float64)
-    return (arr - arr.min()) / (span + eps)
-
-
-def select_identified_with_warmup(memory,
-                                  threshold,
-                                  run_idx,
-                                  warmup_runs=10,
-                                  max_ratio=0.10,
-                                  cap_after_warmup=False):
-    """
-    Select noisy IDs with warmup cap.
-    During warmup, cap grows linearly up to max_ratio.
-    After warmup, cap is optional via cap_after_warmup.
-    """
-    candidate = np.where(memory <= threshold)[0]
-    if len(candidate) == 0:
-        return np.array([], dtype=np.int64), 0.0
-
-    in_warmup = run_idx < warmup_runs
-    if in_warmup:
-        warmup_factor = min(1.0, (run_idx + 1) / max(1, warmup_runs))
-        cap_ratio = max_ratio * warmup_factor
-        cap_n = int(np.floor(cap_ratio * len(memory)))
-    elif cap_after_warmup:
-        cap_ratio = max_ratio
-        cap_n = int(np.floor(cap_ratio * len(memory)))
-    else:
-        cap_ratio = len(candidate) / max(1, len(memory))
-        cap_n = len(candidate)
-
-    if cap_n <= 0:
-        return np.array([], dtype=np.int64), cap_ratio
-
-    candidate_sorted = candidate[np.argsort(memory[candidate])]  # ascending => worst first
-    selected = candidate_sorted[:min(cap_n, len(candidate_sorted))]
-    return selected.astype(np.int64), cap_ratio
-
 
 #######################################################################
 # MAIN SCRIPT
@@ -369,49 +331,43 @@ def main(cli_args=None):
     # SECTION: Setup Logger, Dataloader
     # =============================================================
     N_RUNS = 100
-    N_FOLDS = 6 # beta ↓ when N_FOLDS ↑
+    N_FOLDS = 7 # beta ↓ when N_FOLDS ↑
     RANDOM_STATE = 1
     TAU = 2
 
     NOISY_DROP = 0.1 # Dropping bottom N * NOISY_DROP of the dataset 
-    Objective_Function_Weights = [0.6, 0.15, 0.25]
-    Youden_Weights = [1.3, 0.7]
-    WARMUP_RUNS = max(10, int(0.1 * N_RUNS))
-    MAX_IDENTIFIED_RATIO = 0.10
-    CAP_AFTER_WARMUP = False
+    WEIGHT_OBJ_FUNC = [1.0, 0.0, 0.0]
+    WEIGHT_YOUDEN = [1.3, 0.7]
 
-    kf = KFold(n_splits=N_FOLDS, random_state=RANDOM_STATE, shuffle=True)
-    fold_splits = list(kf.split(df_train, target_labels))
+    sgkf = StratifiedGroupKFold(n_splits=N_FOLDS, random_state=RANDOM_STATE, shuffle=True)
+    fold_splits = list(sgkf.split(X=df_train, y=target_labels, groups=df_train["participant"]))
+    #kf = KFold(n_splits=N_FOLDS, random_state=RANDOM_STATE, shuffle=True)
+    #fold_splits = list(kf.split(df_train, target_labels))
 
-    monitor_metrics = {
+    runs_metadata = {
         'N_RUNS': N_RUNS,
         'N_FOLDS': N_FOLDS,
-        'Objective_Function_Weights': Objective_Function_Weights,
-        'Youden_Weights': Youden_Weights,
+        'WEIGHT_OBJ_FUNC': WEIGHT_OBJ_FUNC,
+        'WEIGHT_YOUDEN': WEIGHT_YOUDEN,
         'runs': {}
     }
-
-    memory = np.zeros_like(target_labels, dtype=np.float64)
+    
     identified = []
+    memory = np.zeros_like(target_labels, dtype=np.float64)
     for run_idx, seed in enumerate(range(RANDOM_STATE, RANDOM_STATE + N_RUNS)):
         logger.info(f"\n{'='*20} Run {seed}/{N_RUNS} {'='*20}")
         set_seed(seed)
-        test_labels = []
-        test_probs = []
-        test_preds = []
-        test_accs = []
-        test_youden = []
-        test_sens = []
-        test_spec = []
-        test_ids = []
-        test_patient_ids = []
-        test_thresholds = []
-
+        
+        test_metadata = {
+            "labels": [],
+            "probs": [],
+            "patient_ids": [],
+            "ids": [],
+        }
         for fold, (train_idx, test_idx) in enumerate(fold_splits):
-            logger.info(f"\n{'='*20} Fold {fold+1}/{N_FOLDS} {'='*20}")
             if len(identified) > 0:
-                NOISY_DROP = update_noisy_drop_variance(memory)
-                # NOISY_DROP = update_noisy_drop_gmm(memory)
+                #NOISY_DROP = update_noisy_drop_variance(memory)
+                NOISY_DROP = update_noisy_drop_gmm(memory)
                 drop_idx = np.random.permutation(identified)[:int(NOISY_DROP * len(identified))]
                 train_idx = list(set(train_idx) - set(drop_idx))
 
@@ -424,7 +380,6 @@ def main(cli_args=None):
             train_fold = trainval_fold.iloc[mask_proper].reset_index(drop=True)
             val_fold = trainval_fold.iloc[mask_cp].reset_index(drop=True)
 
-            # Prepare data loaders
             train_loader, val_loader = train.prepare_fold_data(
                 train_fold, val_fold, hps, collate_fn,
                 use_precomputed=args.use_precomputed,
@@ -432,235 +387,102 @@ def main(cli_args=None):
             )
 
             pool_model = pool_net(**hps.model)
-            checkpoint_callback = ModelCheckpoint(
-                dirpath=f"{hps.model_dir}/fold_{fold}",
-                monitor="val/loss",
-                filename=f"pool_fold{fold}_{{epoch:02d}}",
-                save_top_k=1,
-                mode="min",
-            )
-
-            tb_logger = TensorBoardLogger(save_dir=hps.model_dir, name=f"fold_{fold}", sub_dir="train")
-            early_stopping = EarlyStopping(monitor="val/loss", patience=7, mode="min", verbose=False)
             runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[])
-            trainer = L.Trainer(
-                max_epochs=1000,
-                callbacks=[checkpoint_callback, early_stopping],
-                logger=tb_logger,
-                accelerator="gpu" if torch.cuda.is_available() else "cpu",
-                devices="auto",
+
+            checkpoint_callback = ModelCheckpoint(
+                dirpath=f"{hps.model_dir}/fold_{fold}", monitor="val/loss",
+                filename=f"pool_fold{fold}_{{epoch:02d}}", save_top_k=1, mode="min",
+            )
+            early_stopping = EarlyStopping(monitor="val/loss", patience=7, mode="min", verbose=False)
+            trainer = L.Trainer(max_epochs=1000, callbacks=[checkpoint_callback, early_stopping],
+                accelerator="gpu" if torch.cuda.is_available() else "cpu", devices="auto",
                 default_root_dir=hps.model_dir
             )
-
             trainer.fit(runner_lightning, train_dataloaders=train_loader, val_dataloaders=val_loader)
             
             runner_lightning.calibrate_threshold = True
-            trainer.test(runner_lightning, dataloaders=val_loader)[0]
+            trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
             optimized_threshold = runner_lightning.probs_threshold
-            test_thresholds.append(optimized_threshold)
 
-            # Prepare test data
-            test_data = test_fold
-            if args.use_precomputed and args.precomputed_dir:
-                mapping_train = pd.read_csv(os.path.join(args.precomputed_dir, "feature_mapping_train.csv"))
-                test_data = test_fold.merge(
-                    mapping_train[['path_file', 'feature_path']], 
-                    on='path_file', 
-                    how='left'
-                )
-                feature_path_col = list(test_data.columns).index('feature_path')
-            
-            test_dataset = CoughDatasets(
-                test_data.values, 
-                hps.data,
-                wav_stats_path=f"{hps.model_dir}/wav_stats.pickle" if not args.use_precomputed else None, 
-                train=False,
-                use_precomputed=args.use_precomputed
+            _, test_loader = train.prepare_fold_data(
+                test_fold, test_fold, hps, collate_fn,
+                use_precomputed=args.use_precomputed,
+                precomputed_dir=args.precomputed_dir
             )
+            trainer.test(runner_lightning, dataloaders=test_loader, ckpt_path="best")
+            result_fold = runner_lightning.test_outputs
+
+            test_metadata["labels"].append(result_fold['labels'])
+            test_metadata["probs"].append(result_fold['probs'])
+            test_metadata["patient_ids"].append(result_fold['patient_ids'])
+            test_metadata["ids"].append(test_idx)
             
-            if args.use_precomputed and args.precomputed_dir:
-                test_dataset.set_feature_path_column(feature_path_col)
-            test_loader = DataLoader(
-                test_dataset, 
-                num_workers=28, 
-                shuffle=False, 
-                batch_size=hps.train.batch_size,
-                pin_memory=True, 
-                collate_fn=collate_fn
-            )
-
-            pool_model = pool_net(**hps.model)
-            runner_lightning = lightning_wrapper.CoughClassificationRunner.load_from_checkpoint(
-                trainer.checkpoint_callback.best_model_path,     
-                model=pool_model,
-                hps=hps, custom_logger=logger
-            ).cuda()
-            runner_lightning.eval()
-            runner_lightning.probs_threshold = optimized_threshold
-
-            fold_test_labels = []
-            fold_test_probs = []
-            fold_test_preds = []
-            fold_test_patient_ids = []
-            with torch.no_grad():
-                for idx, batch in tqdm(enumerate(test_loader), total=len(test_loader)):
-                    _, audio, _, attention_masks, dse_ids, [patient_ids, _, _, _] = batch
-                    audio = audio.cuda()
-                    attention_masks = attention_masks.cuda()
-                    out_model = runner_lightning.model.forward(audio, attention_mask=attention_masks)
-                    logits = out_model['disease_logits']
-
-                    probs = torch.sigmoid(logits).squeeze(-1)  # [B]
-                    preds = (probs >= runner_lightning.probs_threshold).long().cpu().detach().numpy()
-                    labels = torch.argmax(dse_ids, dim=1).cpu().detach().numpy()
-
-                    fold_test_labels.extend(labels)
-                    fold_test_probs.extend(probs.cpu().detach().numpy())
-                    fold_test_preds.extend(preds)
-                    fold_test_patient_ids.extend(patient_ids.cpu().detach().numpy())
-
-            temp_labels = np.array(fold_test_labels)
-            temp_preds = np.array(fold_test_preds)
-            cm = confusion_matrix(temp_labels, temp_preds, labels=[0, 1])
-            assert cm.shape == (2, 2), f"Expected binary confusion matrix, got {cm.shape}"
-            TN, FP = cm[0, 0], cm[0, 1]
-            FN, TP = cm[1, 0], cm[1, 1]
-            sens = TP / (TP + FN) if (TP + FN) > 0 else 0.0   # TB recall
-            spec = TN / (TN + FP) if (TN + FP) > 0 else 0.0   # non-TB recall
-            b_acc = 0.5 * (sens + spec)
-            youden = Youden_Weights[0] * sens + Youden_Weights[1] * spec - 1.0
-            
-            test_labels.append(fold_test_labels)
-            test_probs.append(fold_test_probs)
-            test_preds.append(fold_test_preds)
-            test_accs.append(b_acc)
-            test_youden.append(youden)
-            test_sens.append(sens)
-            test_spec.append(spec)
-            test_ids.append(test_idx)
-            test_patient_ids.append(fold_test_patient_ids)
-            
-        number_ids = [len(i) for i in test_ids]
-        test_labels_all = np.concatenate(test_labels)
-        pred_probs_all = np.concatenate(test_probs)
-        test_ids_all = np.concatenate(test_ids)
-        test_patient_ids_all = np.concatenate(test_patient_ids)
-        threshold_all = np.concatenate([[test_thresholds[i]] * number_ids[i] for i in range(N_FOLDS)])
-
-        test_accs_np = np.asarray(test_accs, dtype=np.float64)
-        test_youden_np = np.asarray(test_youden, dtype=np.float64)
-
-        weights_acc = np.max(test_accs_np) - test_accs_np # distance from best fold, distance = 0, larger value.
-        weights_acc = safe_minmax_scale(weights_acc) # 0 - 1 Norm
-        weights_acc = 1 - weights_acc # Best fold → weight ≈ 1
-        weights_acc = np.concatenate([[weights_acc[i]]*number_ids[i] for i in range(N_FOLDS)])
-
-        weights_youden = np.max(test_youden_np) - test_youden_np # distance from best fold, distance = 0, larger value.
-        weights_youden = safe_minmax_scale(weights_youden) # 0 - 1 Norm
-        weights_youden = 1 - weights_youden # Best fold → weight ≈ 1
-        weights_youden = np.concatenate([[weights_youden[i]]*number_ids[i] for i in range(N_FOLDS)])
-        
-        #idx_temp = np.stack((np.arange(len(test_labels_all)), test_labels_all))
-        #temp =  pred_probs_all[idx_temp[0,:], idx_temp[1,:]] # For Multiclass, Extract Only True Probs
-        # “How confident is the model that the ground-truth label is correct?”
-        temp = np.where(test_labels_all == 1, pred_probs_all, 1 - pred_probs_all)
-        weights_probs_conf = safe_minmax_scale(temp)
-        weights_probs_margin = safe_minmax_scale(np.abs(pred_probs_all - threshold_all))
-        weights_probs = 0.7 * weights_probs_conf + 0.3 * weights_probs_margin
-
-        # Adaptive objective weights: add more fold-level regularization after warmup.
-        progress = min(1.0, run_idx / max(1, N_RUNS - 1))
-        objective_weights = np.asarray(Objective_Function_Weights, dtype=np.float64).copy()
-        objective_weights[1] = min(0.30, objective_weights[1] + 0.10 * progress)
-        objective_weights[0] = max(0.45, objective_weights[0] - 0.10 * progress)
-        objective_weights = objective_weights / objective_weights.sum()
-
-        weights = (
-            objective_weights[0] * weights_probs
-            + objective_weights[1] * weights_acc
-            + objective_weights[2] * weights_youden
-        )
+        test_labels_all = np.concatenate(test_metadata["labels"])
+        pred_probs_all = np.concatenate(test_metadata["probs"])
+        test_patient_ids_all = np.concatenate(test_metadata["patient_ids"])
+        number_ids = [len(i) for i in test_metadata["ids"]]
+        test_ids_all = np.concatenate(test_metadata["ids"])
         order = np.argsort(test_ids_all)
-        weights = weights[order]
-        
-        # Participant Aggregatiion
-        test_patient_ids_all = test_patient_ids_all[order]
-        _, inverse = np.unique(test_patient_ids_all, return_inverse=True)
-        pid_sum = np.bincount(inverse, weights=weights)
-        pid_cnt = np.bincount(inverse)
-        pid_mean = pid_sum / pid_cnt
-        weights = pid_mean[inverse]
 
-        ema_keep = 0.9 if run_idx < WARMUP_RUNS else 0.7
-        memory = (1.0 - ema_keep) * weights + ema_keep * memory
+        # weights_acc = np.max(test_accs_np) - test_accs_np # distance from best fold, distance = 0, larger value.
+        # weights_acc = safe_minmax_scale(weights_acc) # 0 - 1 Norm
+        # weights_acc = 1 - weights_acc # Best fold → weight ≈ 1
+        # weights_acc = np.concatenate([[weights_acc[i]]*number_ids[i] for i in range(N_FOLDS)])
+        
+        # “How confident is the model that the ground-truth label is correct?”
+        # idx_temp = np.stack((np.arange(len(test_labels_all)), test_labels_all))
+        # temp =  pred_probs_all[idx_temp[0,:], idx_temp[1,:]] # For Multiclass, Extract Only True Probs
+        temp = np.where(test_labels_all == 1, pred_probs_all, 1 - pred_probs_all)
+        weights_probs = (temp - temp.min()) / (temp.max() - temp.min() + 1e-8)
+        weights = weights_probs #+ Objective_Function_Weights[1] * weights_acc
+        weights = weights[order]
+
+        # # Participant Aggregatiion
+        # test_patient_ids_all = test_patient_ids_all[order]
+        # _, inverse = np.unique(test_patient_ids_all, return_inverse=True)
+        # pid_sum = np.bincount(inverse, weights=weights)
+        # pid_cnt = np.bincount(inverse)
+        # pid_mean = pid_sum / pid_cnt
+        # weights = pid_mean[inverse]
+
+        memory = 0.3 * weights + 0.7 * memory
 
         TAU = update_tau_variance(TAU, memory) # 1) variance-driven
         #TAU = update_tau_validation(TAU, test_youden) # 2) validation-feedback (use Youden or b_acc)
         MEMORY_NOISE_THRES = estimate_noise_threshold_gmm(memory)
 
-        fold_splits, fold_ids = sample_folds(N_FOLDS, memory, TAU)
-        # fold_splits, fold_ids = sample_folds_grouped(
-        #     N_FOLDS,
-        #     memory,
-        #     participant_ids=df_train["participant"].values,
-        #     tau=TAU,
-        #     random_state=seed
-        # )
-        identified, warmup_cap_ratio = select_identified_with_warmup(
-            memory,
-            MEMORY_NOISE_THRES,
-            run_idx=run_idx,
-            warmup_runs=WARMUP_RUNS,
-            max_ratio=MAX_IDENTIFIED_RATIO,
-            cap_after_warmup=CAP_AFTER_WARMUP,
-        )
-        np.save(f"{hps.model_dir}/memory.npy", memory)
-        monitor_metrics['runs'][seed] = {
-            'test_accs': test_accs,
-            'test_sens': test_sens,
-            'test_spec': test_spec,
-            'test_youden': test_youden,
-            'confidence': memory,
+        #fold_splits, _ = sample_folds(N_FOLDS, memory, TAU)
+        fold_splits, _ = sample_folds_grouped(N_FOLDS, memory, participant_ids=df_train["participant"].values, tau=TAU, random_state=seed)
+        identified = np.where(memory <= MEMORY_NOISE_THRES)[0]
+
+        runs_metadata['runs'][seed] = {
+            'metrics': {
+                'confidence_mean': np.mean(memory[memory > MEMORY_NOISE_THRES]),
+                'identified_ratio': len(identified) / len(df_train),
+                'roc-auc': roc_auc_score(test_labels_all, pred_probs_all),
+            },
             'TAU': TAU,
             'MEMORY_NOISE_THRES': MEMORY_NOISE_THRES,
-            'NOISY_DROP': NOISY_DROP,
-            'objective_weights': objective_weights,
-            'warmup_cap_ratio': warmup_cap_ratio,
-            'identified_ratio': len(identified) / len(df_train),
-            'percentage_datasets': 1 - round(len(identified) / len(df_train), 2),
-            'percentage_positivedata': round((train_fold[hps.data.target_column] == 1).sum() / len(df_train), 2),
-            'percentage_negativedata': round((train_fold[hps.data.target_column] == 0).sum() / len(df_train), 2),
+            'memory': memory,
         }
-        with open(os.path.join(hps.model_dir, "info_recov.pkl"), "wb") as f:
-            pickle.dump(monitor_metrics, f)
 
-        metrics = ['test_accs', 'test_sens', 'test_spec', 'test_youden', 'confidence', 'TAU', 'MEMORY_NOISE_THRES', 'NOISY_DROP',
-                   'identified_ratio', 'warmup_cap_ratio', 'percentage_datasets', 'percentage_positivedata', 'percentage_negativedata']
-        for metric in metrics:
+        for metric in runs_metadata['runs'][seed]['metrics'].keys():
             values_mean = []
-            for runs, values in monitor_metrics['runs'].items():
-                values_mean.append(np.mean(values[metric]))
+            for runs, values in runs_metadata['runs'].items():
+                values_mean.append(values['metrics'][metric])
             plt.figure()
             plt.plot(values_mean)
-            plt.xlabel("Run Index")
+            plt.xlabel("Runs")
             plt.ylabel(metric)
             plt.title(f"{metric} across runs")
             plt.grid(True)
             plt.savefig(f"{hps.model_dir}/{metric}_across_runs.png", dpi=300, bbox_inches="tight")
             plt.close()
-        
-    identified, _ = select_identified_with_warmup(
-        memory,
-        MEMORY_NOISE_THRES,
-        run_idx=N_RUNS - 1,
-        warmup_runs=WARMUP_RUNS,
-        max_ratio=MAX_IDENTIFIED_RATIO,
-        cap_after_warmup=CAP_AFTER_WARMUP,
-    )
-    np.save(f"{hps.model_dir}/identified.npy", identified)
-    with open(os.path.join(hps.model_dir, "info_recov.pkl"), "wb") as f:
-        pickle.dump(monitor_metrics, f)
-    
 
+        np.save(f"{hps.model_dir}/memory.npy", memory)
+        np.save(f"{hps.model_dir}/identified.npy", identified)
+        with open(os.path.join(hps.model_dir, "runs_metadata.pkl"), "wb") as f:
+            pickle.dump(runs_metadata, f)
+    
 if __name__ == "__main__":
     main()
