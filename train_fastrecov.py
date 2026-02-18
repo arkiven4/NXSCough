@@ -15,6 +15,7 @@ import tempfile
 import warnings
 import glob
 from typing import Dict, List, Tuple
+from pathlib import Path
 
 # Third-party imports
 import librosa
@@ -402,7 +403,6 @@ def main(cli_args=None):
             
             runner_lightning.calibrate_threshold = True
             trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
-            optimized_threshold = runner_lightning.probs_threshold
 
             _, test_loader = train.prepare_fold_data(
                 test_fold, test_fold, hps, collate_fn,
@@ -452,7 +452,7 @@ def main(cli_args=None):
         MEMORY_NOISE_THRES = estimate_noise_threshold_gmm(memory)
 
         #fold_splits, _ = sample_folds(N_FOLDS, memory, TAU)
-        fold_splits, _ = sample_folds_grouped(N_FOLDS, memory, participant_ids=df_train["participant"].values, tau=TAU, random_state=seed)
+        fold_splits, _ = sample_folds_grouped(N_FOLDS, memory, participant_ids=df_train["participant"].values, tau=TAU)
         identified = np.where(memory <= MEMORY_NOISE_THRES)[0]
 
         runs_metadata['runs'][seed] = {
@@ -483,6 +483,10 @@ def main(cli_args=None):
         np.save(f"{hps.model_dir}/identified.npy", identified)
         with open(os.path.join(hps.model_dir, "runs_metadata.pkl"), "wb") as f:
             pickle.dump(runs_metadata, f)
+
+        for d in Path(hps.model_dir).glob("fold_*"):
+            if d.is_dir():
+                shutil.rmtree(d)
     
 if __name__ == "__main__":
     main()

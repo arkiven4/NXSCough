@@ -111,14 +111,14 @@ def main(cli_args=None):
             "hidden_dim_classifier": trial.suggest_categorical("hidden_dim_classifier", [32, 64, 128, 192, 256, 384, 512]),
             "dropout": trial.suggest_float("dropout", 0.1, 0.7),
 
-            "hidden_size": trial.suggest_categorical("hidden_size", [32, 64, 128, 192, 256, 384, 512]),
-            "lstmnum_layers": trial.suggest_int("lstmnum_layers", 1, 4),
-            "att_head": trial.suggest_categorical("att_head", [1, 2, 4, 8]),
+            # "hidden_size": trial.suggest_categorical("hidden_size", [32, 64, 128, 192, 256, 384, 512]),
+            # "lstmnum_layers": trial.suggest_int("lstmnum_layers", 1, 4),
+            # "att_head": trial.suggest_categorical("att_head", [1, 2, 4, 8]),
             # "att_head_fusion": trial.suggest_categorical("att_head_fusion", [1, 2, 4, 8]),
             # "fusion_type": trial.suggest_categorical("fusion_type", ["gating", "cross_attn", "film"]),
             
-            # "resnet_type": trial.suggest_categorical("resnet_type", ["resnet18", "resnet34", "resnet50", "resnet101"]),
-            # "num_layers_resnet": trial.suggest_int("num_layers_resnet", 1, 4),
+            "resnet_type": trial.suggest_categorical("resnet_type", ["resnet18", "resnet34", "resnet50", "resnet101"]),
+            "num_layers_resnet": trial.suggest_int("num_layers_resnet", 1, 4),
         }
         return params
 

@@ -64,7 +64,7 @@
     "pooling_model": "ResNet34ManualClassifier",
     "feature_dim": 80,
     "output_dim": 1,
-    "dropout": 0.5,
+    "dropout": 0.53,
     "hidden_dim_classifier": 64,
     "use_tabular": false,
 

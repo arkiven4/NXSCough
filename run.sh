@@ -73,7 +73,7 @@ python train.py  --init --model_name resnetbest_logmel --pooling_model ResNet34M
 
 
 # =========================================== Active learning  ==========================================================
-python train_fastrecov.py  --init --model_name try4 --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
+python train_fastrecov.py  --init --model_name fastrecov1_patientfolds --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel 
 
 
