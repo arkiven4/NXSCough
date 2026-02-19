@@ -200,7 +200,7 @@ class CoughClassificationRunner(L.LightningModule):
         dse_ids = dse_ids.float()
         labels = torch.argmax(dse_ids, dim=1)
         if logits.shape[-1] == 1:
-            probs = torch.sigmoid(logits)     # [B]
+            probs = torch.sigmoid(logits).squeeze(-1)     # [B]
             preds = (probs >= self.probs_threshold).long()     # [B]
         else:
             probs = torch.softmax(logits, dim=1)

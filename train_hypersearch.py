@@ -156,14 +156,9 @@ def main(cli_args=None):
             early_stopping = EarlyStopping(monitor="val/loss", patience=7, mode="min", verbose=False)
 
             runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[])
-            trainer = L.Trainer(
-                max_epochs=10000,
-                callbacks=[checkpoint_callback, early_stopping],
+            trainer = L.Trainer(max_epochs=10000, callbacks=[checkpoint_callback, early_stopping],
                 accelerator="gpu" if torch.cuda.is_available() else "cpu",
-                devices="auto",
-                default_root_dir=f"{hps.model_dir}/{fold_outter}",
-                deterministic=True,
-            )
+                devices="auto", default_root_dir=f"{hps.model_dir}/{fold_outter}", deterministic=True)
             trainer.fit(runner_lightning, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
             production_path = os.path.join(f"{hps.model_dir}/{fold_outter}", "best_model.ckpt")

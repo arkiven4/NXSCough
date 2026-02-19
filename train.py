@@ -52,6 +52,21 @@ from cough_datasets import (
 torch.set_float32_matmul_precision("medium")
 cmap = cm.get_cmap("viridis")
 
+
+class NonSingletonCollate:
+    """Ensure the collated batch has at least `min_batch_size` samples."""
+
+    def __init__(self, base_collate, min_batch_size=2):
+        self.base_collate = base_collate
+        self.min_batch_size = min_batch_size
+
+    def __call__(self, batch):
+        if 0 < len(batch) < self.min_batch_size:
+            # Duplicate the last sample so we don't drop data while
+            # avoiding problematic singleton batches (e.g., BatchNorm).
+            batch = list(batch) + [batch[-1]] * (self.min_batch_size - len(batch))
+        return self.base_collate(batch)
+
 #######################################################################
 # REUSABLE FUNCTIONS
 #######################################################################
@@ -262,6 +277,9 @@ def prepare_fold_data(train_fold, val_fold, hps, collate_fn, use_precomputed=Fal
     #sampler = None
     
     # Create dataloaders
+    # Wrap train collate to avoid singleton last batch without dropping data.
+    train_collate_fn = NonSingletonCollate(collate_fn, min_batch_size=2)
+
     train_loader = DataLoader(
         train_dataset, 
         num_workers=28, 
@@ -269,7 +287,7 @@ def prepare_fold_data(train_fold, val_fold, hps, collate_fn, use_precomputed=Fal
         batch_size=hps.train.batch_size,
         #batch_sampler=sampler,
         pin_memory=True, 
-        collate_fn=collate_fn
+        collate_fn=train_collate_fn
     )
     val_loader = DataLoader(
         val_dataset, 

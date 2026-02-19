@@ -303,6 +303,7 @@ def main(cli_args=None):
     df_train, _ = train.load_data(hps)
     collate_fn = train.get_collate_fn(hps)
     target_labels = df_train[hps.data.target_column]
+    print(target_labels.shape)
 
     if not args.use_precomputed:
         utils.compute_spectrogram_stats_from_dataset(
@@ -355,6 +356,7 @@ def main(cli_args=None):
     
     identified = []
     memory = np.zeros_like(target_labels, dtype=np.float64)
+    print(memory.shape)
     for run_idx, seed in enumerate(range(RANDOM_STATE, RANDOM_STATE + N_RUNS)):
         logger.info(f"\n{'='*20} Run {seed}/{N_RUNS} {'='*20}")
         set_seed(seed)
@@ -395,7 +397,7 @@ def main(cli_args=None):
                 filename=f"pool_fold{fold}_{{epoch:02d}}", save_top_k=1, mode="min",
             )
             early_stopping = EarlyStopping(monitor="val/loss", patience=7, mode="min", verbose=False)
-            trainer = L.Trainer(max_epochs=1000, callbacks=[checkpoint_callback, early_stopping],
+            trainer = L.Trainer(max_epochs=10000, callbacks=[checkpoint_callback, early_stopping],
                 accelerator="gpu" if torch.cuda.is_available() else "cpu", devices="auto",
                 default_root_dir=hps.model_dir
             )
@@ -468,7 +470,7 @@ def main(cli_args=None):
 
         for metric in runs_metadata['runs'][seed]['metrics'].keys():
             values_mean = []
-            for runs, values in runs_metadata['runs'].items():
+            for _, values in runs_metadata['runs'].items():
                 values_mean.append(values['metrics'][metric])
             plt.figure()
             plt.plot(values_mean)
