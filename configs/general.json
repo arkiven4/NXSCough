@@ -74,8 +74,8 @@
     "att_head_fusion": 2,
     "fusion_type": "film",
 
-    "resnet_type": "resnet18",
-    "num_layers_resnet": 4,
+    "resnet_type": "resnet101",
+    "num_layers_resnet": 1,
     
     "lora_finetune": true,
     "adapter_hidden_dim": 128,

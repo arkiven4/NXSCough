@@ -582,7 +582,7 @@ def main(cli_args=None):
         logger.info(f"✨ Tensorboard: http://100.101.198.75:{port}/#scalars&_smoothingWeight=0")
     logger.info(f"======================================")
 
-    pool_net, pool_model = setup_model(hps, is_init=args.init)
+    pool_net = setup_model(hps, is_init=args.init)
     # =============================================================
     # SECTION: Setup Logger, Dataloader
     # =============================================================

@@ -333,9 +333,9 @@ def main(cli_args=None):
     # SECTION: Setup Logger, Dataloader
     # =============================================================
     N_RUNS = 100
-    N_FOLDS = 7 # beta ↓ when N_FOLDS ↑
+    N_FOLDS = 10 # beta ↓ when N_FOLDS ↑
     RANDOM_STATE = 1
-    TAU = 2
+    TAU = 0.5
 
     NOISY_DROP = 0.1 # Dropping bottom N * NOISY_DROP of the dataset 
     WEIGHT_OBJ_FUNC = [1.0, 0.0, 0.0]
@@ -453,18 +453,21 @@ def main(cli_args=None):
         #TAU = update_tau_validation(TAU, test_youden) # 2) validation-feedback (use Youden or b_acc)
         MEMORY_NOISE_THRES = estimate_noise_threshold_gmm(memory)
 
-        #fold_splits, _ = sample_folds(N_FOLDS, memory, TAU)
-        fold_splits, _ = sample_folds_grouped(N_FOLDS, memory, participant_ids=df_train["participant"].values, tau=TAU)
+        fold_splits, _ = sample_folds(N_FOLDS, memory, TAU)
+        #fold_splits, _ = sample_folds_grouped(N_FOLDS, memory, participant_ids=df_train["participant"].values, tau=TAU)
         identified = np.where(memory <= MEMORY_NOISE_THRES)[0]
 
         runs_metadata['runs'][seed] = {
             'metrics': {
                 'confidence_mean': np.mean(memory[memory > MEMORY_NOISE_THRES]),
+                'memory_mean': np.mean(memory),
                 'identified_ratio': len(identified) / len(df_train),
                 'roc-auc': roc_auc_score(test_labels_all, pred_probs_all),
+                'TAU': TAU,
+                'MEMORY_NOISE_THRES': MEMORY_NOISE_THRES,
+                'NOISY_DROP': NOISY_DROP,
             },
-            'TAU': TAU,
-            'MEMORY_NOISE_THRES': MEMORY_NOISE_THRES,
+            'memory_mea': [0.3, 0.7],
             'memory': memory,
         }
 

@@ -58,15 +58,15 @@ python train_hypersearch.py  --init --model_name searchlstm10fold_logmel --pooli
 python train_hypersearch.py  --init --model_name searchlstm10fold_melspectogram --pooling_model BiLSTMSelfAttASPClassifier --feature_type melspectogram \
   --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/melspectogram
 
-python train_hypersearch.py  --init --model_name searchrlstm10fold_gammmaspectogram --pooling_model BiLSTMSelfAttASPClassifier --feature_type gammmaspectogram \
+python train_hypersearch.py  --init --model_name searchlstm10fold_gammmaspectogram --pooling_model BiLSTMSelfAttASPClassifier --feature_type gammmaspectogram \
   --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/gammmaspectogram
 
 python train_hypersearch.py  --init --model_name searchlstm10fold_spectogram --pooling_model BiLSTMSelfAttASPClassifier --feature_type spectogram \
   --feature_dim 1025 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/spectogram
 
 # =========================================== Train best hyperparameter  ==========================================================
-python train.py  --init --model_name bilstmbest_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
-  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
+python train.py  --init --model_name bilstmbest_mfcc --pooling_model BiLSTMSelfAttASPClassifier --feature_type mfcc \
+  --feature_dim 13 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/mfcc
 
 python train.py  --init --model_name resnetbest_logmel --pooling_model ResNet34ManualClassifier --feature_type logmel \
   --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
