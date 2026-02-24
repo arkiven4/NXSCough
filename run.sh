@@ -65,15 +65,15 @@ python train_hypersearch.py  --init --model_name searchlstm10fold_spectogram --p
   --feature_dim 1025 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/spectogram
 
 # =========================================== Train best hyperparameter  ==========================================================
-python train.py  --init --model_name bilstmbest_mfcc --pooling_model BiLSTMSelfAttASPClassifier --feature_type mfcc \
-  --feature_dim 13 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/mfcc
+python train.py  --init --model_name bilstmbestrecov_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
 
 python train.py  --init --model_name resnetbest_logmel --pooling_model ResNet34ManualClassifier --feature_type logmel \
   --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
 
 
 # =========================================== Active learning  ==========================================================
-python train_fastrecov.py  --init --model_name fastrecov1_patientfolds --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
+python train_fastrecov.py  --init --model_name fastrecov3_wavsfolds_fixmemory --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel 
 
 

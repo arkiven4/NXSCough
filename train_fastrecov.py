@@ -60,7 +60,7 @@ from sklearn.metrics import (
 
 torch.set_float32_matmul_precision("medium")
 cmap = cm.get_cmap("viridis")
-
+current_module = sys.modules[__name__]
 #######################################################################
 # REUSABLE FUNCTIONS
 #######################################################################
@@ -93,7 +93,7 @@ def get_sample_probs(weights: np.ndarray, tau: float) -> np.ndarray:
     exp_z = np.exp(z)
     return exp_z / exp_z.sum()
 
-def sample_folds(n_folds:int, weights:np.array, tau:float) -> Tuple[List,Dict]:
+def sample_folds(n_folds:int, weights:np.array, tau:float, **kwargs) -> Tuple[List,Dict]:
     '''
     Given weights of the sample, performs weighted sampling into n_folds taking temperature tau into account
     Bigger τ = more uniform, more random, less influence from weights.
@@ -126,8 +126,7 @@ def sample_folds(n_folds:int, weights:np.array, tau:float) -> Tuple[List,Dict]:
         fold_splits.append((train_ids,test_ids))
     return fold_splits, fold_id
 
-def sample_folds_grouped(n_folds: int, weights: np.ndarray,
-    tau: float, participant_ids: np.ndarray) -> Tuple[List, Dict]:
+def sample_folds_grouped(n_folds: int, weights: np.ndarray, tau: float, participant_ids: np.ndarray) -> Tuple[List, Dict]:
     """
     Weighted fold sampling with temperature τ, ensuring that
     each participant appears in only ONE fold.
@@ -284,6 +283,23 @@ def estimate_noise_threshold_gmm(memory):
     threshold = float((noisy_mean + clean_mean) / 2.0)
     return threshold
 
+def update_memory_alpha(weights: np.ndarray,
+    memory: np.ndarray, prev_alpha: float = 0.3,
+    alpha_min: float = 0.10, alpha_max: float = 0.60,
+    k: float = 5.0, smooth: float = 0.8) -> float:
+    """
+    Adaptive EMA alpha:
+    - larger drift |weights - memory| -> larger alpha (faster update)
+    - smaller drift -> smaller alpha (more smoothing)
+    """
+    drift = float(np.mean(np.abs(weights - memory)))  # in [0,1] after your min-max
+    raw_alpha = alpha_min + (alpha_max - alpha_min) * (1.0 - np.exp(-k * drift))
+    alpha = smooth * prev_alpha + (1.0 - smooth) * raw_alpha
+    return float(np.clip(alpha, alpha_min, alpha_max))
+
+def memory_alpha_fixated(weights: np.ndarray, memory: np.ndarray, prev_alpha: float = 0.3, **kwargs) -> float:
+    return 0.3
+
 #######################################################################
 # MAIN SCRIPT
 #######################################################################
@@ -307,8 +323,7 @@ def main(cli_args=None):
 
     if not args.use_precomputed:
         utils.compute_spectrogram_stats_from_dataset(
-            df_train, 
-            hps.data, 
+            df_train, hps.data, 
             pickle_path=f"{hps.model_dir}/wav_stats.pickle"
         )
 
@@ -332,45 +347,55 @@ def main(cli_args=None):
     # =============================================================
     # SECTION: Setup Logger, Dataloader
     # =============================================================
-    N_RUNS = 100
-    N_FOLDS = 10 # beta ↓ when N_FOLDS ↑
     RANDOM_STATE = 1
-    TAU = 0.5
-
     NOISY_DROP = 0.1 # Dropping bottom N * NOISY_DROP of the dataset 
-    WEIGHT_OBJ_FUNC = [1.0, 0.0, 0.0]
-    WEIGHT_YOUDEN = [1.3, 0.7]
-
-    sgkf = StratifiedGroupKFold(n_splits=N_FOLDS, random_state=RANDOM_STATE, shuffle=True)
+    MEM_ALPHA = 0.3
+    TAU = 5.0
+    
+    recov_config = {
+        "epoch": 100,
+        "n_fold": 10, # beta ↓ when N_FOLDS ↑
+        "weight_OF": [1.0, 0.0, 0.0],
+        "sample_fold_fn": "sample_folds", # sample_folds sample_folds_grouped
+        "noisy_drop_fn": "update_noisy_drop_gmm", # update_noisy_drop_variance update_noisy_drop_gmm
+        "memory_alpha_fn": "update_memory_alpha", # memory_alpha_fixated update_memory_alpha
+        "tau_update_fn": "update_tau_variance", # update_tau_validation update_tau_variance
+        "noise_thr_fn": "estimate_noise_threshold_gmm", # estimate_noise_threshold_gmm
+    }
+    with open(os.path.join(model_dir, "recov_config.json"), "w") as f:
+        json.dump(recov_config, f, indent=2)
+    hps_recov = utils.HParams(**recov_config)
+    
+    sgkf = StratifiedGroupKFold(n_splits=hps_recov.n_fold, random_state=RANDOM_STATE, shuffle=True)
     fold_splits = list(sgkf.split(X=df_train, y=target_labels, groups=df_train["participant"]))
     #kf = KFold(n_splits=N_FOLDS, random_state=RANDOM_STATE, shuffle=True)
     #fold_splits = list(kf.split(df_train, target_labels))
 
-    runs_metadata = {
-        'N_RUNS': N_RUNS,
-        'N_FOLDS': N_FOLDS,
-        'WEIGHT_OBJ_FUNC': WEIGHT_OBJ_FUNC,
-        'WEIGHT_YOUDEN': WEIGHT_YOUDEN,
-        'runs': {}
-    }
-    
     identified = []
     memory = np.zeros_like(target_labels, dtype=np.float64)
-    print(memory.shape)
-    for run_idx, seed in enumerate(range(RANDOM_STATE, RANDOM_STATE + N_RUNS)):
-        logger.info(f"\n{'='*20} Run {seed}/{N_RUNS} {'='*20}")
+    runs_metadata = {}    
+    runs_metadata[0] = {
+        'metrics': {
+            'confidence_mean': np.mean(memory[memory > 0.0]),
+            'memory_mean': np.mean(memory),
+            'identified_ratio': len(identified) / len(df_train),
+            'roc-auc': 0.0,
+            'TAU': TAU,
+            'MEMORY_NOISE_THRES': 0.0,
+            'NOISY_DROP': NOISY_DROP,
+            'MEM_ALPHA': MEM_ALPHA,
+        },
+        'memory': memory,
+    }
+    for run_idx, seed in enumerate(range(RANDOM_STATE, RANDOM_STATE + hps_recov.epoch)):
+        logger.info(f"\n{'='*20} Run {seed}/{hps_recov.epoch} {'='*20}")
         set_seed(seed)
-        
-        test_metadata = {
-            "labels": [],
-            "probs": [],
-            "patient_ids": [],
-            "ids": [],
+        test_metadata = {"labels": [], "probs": [],
+            "patient_ids": [], "ids": [],
         }
         for fold, (train_idx, test_idx) in enumerate(fold_splits):
             if len(identified) > 0:
-                #NOISY_DROP = update_noisy_drop_variance(memory)
-                NOISY_DROP = update_noisy_drop_gmm(memory)
+                NOISY_DROP = getattr(current_module, hps_recov.noisy_drop_fn)(memory)
                 drop_idx = np.random.permutation(identified)[:int(NOISY_DROP * len(identified))]
                 train_idx = list(set(train_idx) - set(drop_idx))
 
@@ -436,7 +461,7 @@ def main(cli_args=None):
         # temp =  pred_probs_all[idx_temp[0,:], idx_temp[1,:]] # For Multiclass, Extract Only True Probs
         temp = np.where(test_labels_all == 1, pred_probs_all, 1 - pred_probs_all)
         weights_probs = (temp - temp.min()) / (temp.max() - temp.min() + 1e-8)
-        weights = weights_probs #+ Objective_Function_Weights[1] * weights_acc
+        weights = weights_probs #+ hps_recov.weight_OF[0] * weights_acc
         weights = weights[order]
 
         # # Participant Aggregatiion
@@ -447,17 +472,16 @@ def main(cli_args=None):
         # pid_mean = pid_sum / pid_cnt
         # weights = pid_mean[inverse]
 
-        memory = 0.3 * weights + 0.7 * memory
+        MEM_ALPHA = getattr(current_module, hps_recov.memory_alpha_fn)(weights=weights, memory=memory, prev_alpha=MEM_ALPHA)
+        memory = MEM_ALPHA * weights + (1.0 - MEM_ALPHA) * memory
 
-        TAU = update_tau_variance(TAU, memory) # 1) variance-driven
-        #TAU = update_tau_validation(TAU, test_youden) # 2) validation-feedback (use Youden or b_acc)
-        MEMORY_NOISE_THRES = estimate_noise_threshold_gmm(memory)
-
-        fold_splits, _ = sample_folds(N_FOLDS, memory, TAU)
-        #fold_splits, _ = sample_folds_grouped(N_FOLDS, memory, participant_ids=df_train["participant"].values, tau=TAU)
+        TAU = getattr(current_module, hps_recov.tau_update_fn)(TAU, memory) # 1) variance-driven. memory -> test_youden 2) validation-feedback (use Youden or b_acc)
+        MEMORY_NOISE_THRES = getattr(current_module, hps_recov.noise_thr_fn)(memory)
+        
+        fold_splits, _ = getattr(current_module, hps_recov.sample_fold_fn)(hps_recov.n_fold, memory, TAU, participant_ids=df_train["participant"].values)
         identified = np.where(memory <= MEMORY_NOISE_THRES)[0]
 
-        runs_metadata['runs'][seed] = {
+        runs_metadata[seed] = {
             'metrics': {
                 'confidence_mean': np.mean(memory[memory > MEMORY_NOISE_THRES]),
                 'memory_mean': np.mean(memory),
@@ -466,14 +490,14 @@ def main(cli_args=None):
                 'TAU': TAU,
                 'MEMORY_NOISE_THRES': MEMORY_NOISE_THRES,
                 'NOISY_DROP': NOISY_DROP,
+                'MEM_ALPHA': MEM_ALPHA,
             },
-            'memory_mea': [0.3, 0.7],
             'memory': memory,
         }
 
-        for metric in runs_metadata['runs'][seed]['metrics'].keys():
+        for metric in runs_metadata[seed]['metrics'].keys():
             values_mean = []
-            for _, values in runs_metadata['runs'].items():
+            for _, values in runs_metadata.items():
                 values_mean.append(values['metrics'][metric])
             plt.figure()
             plt.plot(values_mean)

@@ -549,6 +549,11 @@ def main(cli_args=None):
     # SECTION: Loading Data
     # =============================================================
     df_train, _ = load_data(hps)
+    print(df_train.shape)
+    identified = np.load("/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/logs/fastrecov1_wavsfolds/identified.npy")
+    df_train = df_train.drop(df_train.index[identified])
+    print(df_train.shape)
+
     collate_fn = get_collate_fn(hps)
     target_labels = df_train[hps.data.target_column]
 
