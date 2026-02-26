@@ -460,7 +460,8 @@ def main(cli_args=None):
         # idx_temp = np.stack((np.arange(len(test_labels_all)), test_labels_all))
         # temp =  pred_probs_all[idx_temp[0,:], idx_temp[1,:]] # For Multiclass, Extract Only True Probs
         temp = np.where(test_labels_all == 1, pred_probs_all, 1 - pred_probs_all)
-        weights_probs = (temp - temp.min()) / (temp.max() - temp.min() + 1e-8)
+        #weights_probs = (temp - temp.min()) / (temp.max() - temp.min() + 1e-8) # Why We 0 1 Norm?
+        weights_probs = 1 - (temp.max() - temp)
         weights = weights_probs #+ hps_recov.weight_OF[0] * weights_acc
         weights = weights[order]
 

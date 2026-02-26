@@ -65,7 +65,7 @@ python train_hypersearch.py  --init --model_name searchlstm10fold_spectogram --p
   --feature_dim 1025 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/spectogram
 
 # =========================================== Train best hyperparameter  ==========================================================
-python train.py  --init --model_name bilstmbestrecov_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
+python train.py  --init --model_name bilstmsymptoms_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
   --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
 
 python train.py  --init --model_name resnetbest_logmel --pooling_model ResNet34ManualClassifier --feature_type logmel \
@@ -73,9 +73,12 @@ python train.py  --init --model_name resnetbest_logmel --pooling_model ResNet34M
 
 
 # =========================================== Active learning  ==========================================================
-python train_fastrecov.py  --init --model_name fastrecov3_wavsfolds_fixmemory --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
+python train_fastrecov.py  --init --model_name fastrecov5_wavsfolds_originalweight --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel 
 
+python train.py --init --model_name bilstmrecov_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
+ --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel  \
+ --use_fastrecov --fastrecov_dir logs/fastrecov5_wavsfolds_originalweight
 
 # =========================================== Others  ==========================================================
 # "lora_rank": 64, "lora_alpha": 128,
@@ -85,8 +88,12 @@ python train.py --init --model_name wavlmasp_peft --pooling_model PEFTWavLM_Try1
 python train.py --init --model_name qwenasp_peft --pooling_model PEFTQwen3_Try1 --feature_dim 1024 --config_path configs/general.json 
 
 
+# ============================================ 323232  ==========================================================
 
+python train_hypersearch.py  --init --model_name searchlstm10fold_logmel_rocglobal --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
 
+# ============================================ 323232  ==========================================================
 
 python train_nmfolds.py  --init --model_name bilstm_mfcc --pooling_model BiLSTMSelfAttASPClassifier --feature_type mfcc \
   --feature_dim 13 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/mfcc

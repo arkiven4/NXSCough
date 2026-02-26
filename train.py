@@ -117,6 +117,59 @@ def load_data(hps):
     return df_train, df_test
 
 
+def apply_fastrecov_filter(df_train, fastrecov_dir, logger=None):
+    """Drop FastReCoV-identified noisy samples from training dataframe.
+
+    Expected file from `train_fastrecov.py`:
+      - identified.npy : np.ndarray of row indices (in original df_train order)
+    """
+    identified_path = os.path.join(fastrecov_dir, "identified.npy")
+    if not os.path.exists(identified_path):
+        msg = f"FastReCoV file not found: {identified_path}. Skip filtering."
+        if logger:
+            logger.warning(msg)
+        else:
+            print(msg)
+        return df_train
+
+    identified = np.load(identified_path)
+    identified = np.asarray(identified).astype(int).reshape(-1)
+
+    if identified.size == 0:
+        msg = "FastReCoV identified set is empty. Skip filtering."
+        if logger:
+            logger.info(msg)
+        else:
+            print(msg)
+        return df_train
+
+    valid_idx = identified[(identified >= 0) & (identified < len(df_train))]
+    valid_idx = np.unique(valid_idx)
+
+    if valid_idx.size == 0:
+        msg = "FastReCoV identified indices are out of range. Skip filtering."
+        if logger:
+            logger.warning(msg)
+        else:
+            print(msg)
+        return df_train
+
+    keep_mask = np.ones(len(df_train), dtype=bool)
+    keep_mask[valid_idx] = False
+    filtered_df = df_train.iloc[keep_mask].reset_index(drop=True)
+
+    msg = (
+        f"Applied FastReCoV filtering from {identified_path} | "
+        f"dropped={len(valid_idx)} kept={len(filtered_df)} original={len(df_train)}"
+    )
+    if logger:
+        logger.info(msg)
+    else:
+        print(msg)
+
+    return filtered_df
+
+
 def get_collate_fn(hps):
     """Get appropriate collate function based on model type."""
     if "qwen" in hps.model.pooling_model.lower():
@@ -518,6 +571,8 @@ def parse_args():
     parser.add_argument("--batch_size", type=int)
     parser.add_argument("--use_precomputed", action="store_true", help="Use precomputed features")
     parser.add_argument("--precomputed_dir", type=str, default=None, help="Directory with precomputed features")
+    parser.add_argument("--use_fastrecov", action="store_true", help="Filter noisy samples using FastReCoV identified.npy")
+    parser.add_argument("--fastrecov_dir", type=str, default=None, help="Directory that contains FastReCoV outputs (identified.npy)")
     parser.add_argument("--use_tensorboard", action="store_true")
     return parser
 
@@ -549,10 +604,10 @@ def main(cli_args=None):
     # SECTION: Loading Data
     # =============================================================
     df_train, _ = load_data(hps)
-    print(df_train.shape)
-    identified = np.load("/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/logs/fastrecov1_wavsfolds/identified.npy")
-    df_train = df_train.drop(df_train.index[identified])
-    print(df_train.shape)
+
+    if args.use_fastrecov:
+        fastrecov_dir = args.fastrecov_dir if args.fastrecov_dir else model_dir
+        df_train = apply_fastrecov_filter(df_train, fastrecov_dir)
 
     collate_fn = get_collate_fn(hps)
     target_labels = df_train[hps.data.target_column]

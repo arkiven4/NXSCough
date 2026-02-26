@@ -15,6 +15,7 @@ import tempfile
 import warnings
 import glob
 from itertools import product
+from pathlib import Path
 
 # Third-party imports
 import librosa
@@ -37,6 +38,8 @@ from torchvision import datasets, transforms
 from tqdm import tqdm
 from sklearn.isotonic import IsotonicRegression
 import optuna
+from sklearn.metrics import log_loss
+from sklearn.metrics import roc_auc_score
 
 # Local imports
 import commons
@@ -145,8 +148,10 @@ def main(cli_args=None):
                 use_precomputed=args.use_precomputed,
                 precomputed_dir=args.precomputed_dir
             )
-            
+
             pool_model = pool_net(feature_dim=hps.model.feature_dim, use_tabular=False, **now_params)
+            runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[])
+            
             checkpoint_callback = ModelCheckpoint(
                 dirpath=f"{hps.model_dir}/{fold_outter}",
                 monitor="val/loss",
@@ -155,39 +160,46 @@ def main(cli_args=None):
                 mode="min",
             )
             early_stopping = EarlyStopping(monitor="val/loss", patience=7, mode="min", verbose=False)
-
-            runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[])
             trainer = L.Trainer(max_epochs=10000, callbacks=[checkpoint_callback, early_stopping],
                 accelerator="gpu" if torch.cuda.is_available() else "cpu",
                 devices="auto", default_root_dir=f"{hps.model_dir}/{fold_outter}", deterministic=True)
             trainer.fit(runner_lightning, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
-            production_path = os.path.join(f"{hps.model_dir}/{fold_outter}", "best_model.ckpt")
-            shutil.move(trainer.checkpoint_callback.best_model_path, production_path)
-
-            trainer = L.Trainer(accelerator="gpu" if torch.cuda.is_available() else "cpu", devices="auto")
-            runner_lightning = lightning_wrapper.CoughClassificationRunner.load_from_checkpoint(
-                os.path.join(f"{hps.model_dir}/{fold_outter}", "best_model.ckpt"),
-                model=pool_model, hps=hps, custom_logger=logger
-            )
-            runner_lightning.eval()
-            
             runner_lightning.calibrate_threshold = True
-            trainer.test(runner_lightning, dataloaders=val_loader)
+            trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
 
-            results_dict = train.evaluate_on_dataset(runner_lightning, trainer, test_fold, hps, collate_fn,
-                                                    use_precomputed=args.use_precomputed,
-                                                    precomputed_dir=args.precomputed_dir)[0]
+            _, test_loader = train.prepare_fold_data(
+                test_fold, test_fold, hps, collate_fn,
+                use_precomputed=args.use_precomputed,
+                precomputed_dir=args.precomputed_dir
+            )
+            trainer.test(runner_lightning, dataloaders=test_loader, ckpt_path="best")
+            result_fold = runner_lightning.test_outputs
 
-            fold_scores.append(results_dict['metrics'].get('test_bacc', 0.0))
-            if os.path.exists(production_path):
-                os.remove(production_path)
+            test_metadata["labels"].append(result_fold['labels'])
+            test_metadata["probs"].append(result_fold['probs'])
+
+            tn, fp, fn, tp = confusion_matrix(result_fold['labels'], result_fold['preds']).ravel()
+            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0   # Recall / TPR
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0   # TNR
+            bacc = (sensitivity + specificity) / 2
+            #fold_scores.append(bacc)
+            fold_scores.append(roc_auc_score(result_fold['labels'], result_fold['probs']))
+
+        test_labels_all = np.concatenate(test_metadata["labels"])
+        pred_probs_all = np.concatenate(test_metadata["probs"])
         
-        mean_acc = np.mean(fold_scores)
-        std_acc = np.std(fold_scores)
+        #final_score = -log_loss(test_labels_all, pred_probs_all)
+        final_score = roc_auc_score(test_labels_all, pred_probs_all)
 
-        alpha = 0.0
-        final_score = mean_acc - alpha * std_acc
+        # mean_acc = np.mean(fold_scores)
+        # std_acc = np.std(fold_scores)
+        # alpha = 0.0
+        # final_score = mean_acc - alpha * std_acc
+
+        for d in Path(hps.model_dir).glob("fold_*"):
+            if d.is_dir():
+                shutil.rmtree(d)
         return final_score
 
     study = optuna.create_study(direction="maximize")

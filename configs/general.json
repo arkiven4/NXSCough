@@ -64,15 +64,15 @@
     "pooling_model": "ResNet34ManualClassifier",
     "feature_dim": 80,
     "output_dim": 1,
-    "dropout": 0.53,
+    "dropout":  0.5,
     "hidden_dim_classifier": 64,
     "use_tabular": false,
 
     "hidden_size": 64,
     "lstmnum_layers": 1,
     "att_head": 2,
-    "att_head_fusion": 2,
-    "fusion_type": "film",
+    "att_head_fusion": 1,
+    "fusion_type": "gating",
 
     "resnet_type": "resnet101",
     "num_layers_resnet": 1,
