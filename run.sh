@@ -64,6 +64,14 @@ python train_hypersearch.py  --init --model_name searchlstm10fold_gammmaspectogr
 python train_hypersearch.py  --init --model_name searchlstm10fold_spectogram --pooling_model BiLSTMSelfAttASPClassifier --feature_type spectogram \
   --feature_dim 1025 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/spectogram
 
+
+python precompute_features.py \
+  --config configs/general.json  \
+  --output_dir ./precomputed_features/logmel_cirdz \
+  --feature_type logmel
+
+python train_hypersearch.py  --init --model_name searchlstmcirdz_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel_cirdz
 # =========================================== Train best hyperparameter  ==========================================================
 python train.py  --init --model_name bilstmsymptoms_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
   --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
@@ -79,6 +87,9 @@ python train_fastrecov.py  --init --model_name fastrecov5_wavsfolds_originalweig
 python train.py --init --model_name bilstmrecov_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel  \
  --use_fastrecov --fastrecov_dir logs/fastrecov5_wavsfolds_originalweight
+
+python train_fastrecov_positive.py  --init --model_name fastrecovpositive_wavsfolds_02noisethre --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel  \
+ --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
 
 # =========================================== Others  ==========================================================
 # "lora_rank": 64, "lora_alpha": 128,

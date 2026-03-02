@@ -199,7 +199,7 @@ def sample_folds_grouped(n_folds: int, weights: np.ndarray, tau: float, particip
 # -------------------------------------------------
 # tau Updater schedule
 # -------------------------------------------------
-def update_tau_variance(tau, memory, alpha=5.0, tau_min=1e-4, tau_max=10.0):
+def update_tau_variance(tau, memory, alpha=8.0, tau_min=1e-4, tau_max=10.0):
     """
     Variance-driven temperature schedule
     Decrease tau when memory variance is large (signal clear),
@@ -232,7 +232,7 @@ def update_noisy_drop_variance(memory, drop_min=0.1, drop_max=0.9, scale=5.0):
     return float(np.clip(drop, drop_min, drop_max))
 
 
-def update_noisy_drop_gmm(memory, drop_min=0.1, drop_max=0.9):
+def update_noisy_drop_gmm(memory, drop_min=0.2, drop_max=0.9):
     mem = memory.reshape(-1, 1)
 
     gmm = GaussianMixture(n_components=2, random_state=0)
@@ -263,12 +263,16 @@ def update_noisy_drop_validation(current_drop, prev_val_mean, current_val_mean,
 # -------------------------------------------------
 # GMM-based threshold between clean vs noisy clusters
 # -------------------------------------------------
-def estimate_noise_threshold_gmm(memory, alpha=0.5):
+def estimate_noise_threshold_gmm(memory):
     """
     Fit 2-component Gaussian mixture and
     return intersection midpoint between means.
-    < 0.5 shifts toward clean_mean
     """
+    if memory is None or len(memory) == 0:
+        return 0.0
+    if len(memory) < 2:
+        return float(np.mean(memory))
+
     mem = memory.reshape(-1, 1)
 
     gmm = GaussianMixture(n_components=2, covariance_type="full", random_state=0)
@@ -281,13 +285,14 @@ def estimate_noise_threshold_gmm(memory, alpha=0.5):
     clean_mean = means[order[1]]
 
     # midpoint between clusters (robust + simple)
-    #threshold = float((noisy_mean + clean_mean) / 2.0)
+    # threshold = float((noisy_mean + clean_mean) / 2.0)
+    alpha = 0.2   # < 0.5 shifts toward clean_mean
     threshold = alpha * noisy_mean + (1 - alpha) * clean_mean
     return threshold
 
 def update_memory_alpha(weights: np.ndarray,
     memory: np.ndarray, prev_alpha: float = 0.3,
-    alpha_min: float = 0.10, alpha_max: float = 0.60,
+    alpha_min: float = 0.10, alpha_max: float = 0.75,
     k: float = 5.0, smooth: float = 0.8) -> float:
     """
     Adaptive EMA alpha:
@@ -301,6 +306,13 @@ def update_memory_alpha(weights: np.ndarray,
 
 def memory_alpha_fixated(weights: np.ndarray, memory: np.ndarray, prev_alpha: float = 0.3, **kwargs) -> float:
     return 0.3
+
+
+def safe_mean(values: np.ndarray) -> float:
+    values = np.asarray(values)
+    if values.size == 0:
+        return 0.0
+    return float(np.mean(values))
 
 #######################################################################
 # MAIN SCRIPT
@@ -321,6 +333,12 @@ def main(cli_args=None):
     df_train, _ = train.load_data(hps)
     collate_fn = train.get_collate_fn(hps)
     target_labels = df_train[hps.data.target_column]
+    target_values = target_labels.to_numpy()
+    positive_value = 1 if np.any(target_values == 1) else np.max(target_values)
+    positive_mask = target_values == positive_value
+    positive_indices = np.where(positive_mask)[0]
+    if len(positive_indices) == 0:
+        raise ValueError("No positive TB samples found in training data.")
     print(target_labels.shape)
 
     if not args.use_precomputed:
@@ -350,20 +368,19 @@ def main(cli_args=None):
     # SECTION: Setup Logger, Dataloader
     # =============================================================
     RANDOM_STATE = 1
-    NOISY_DROP = 0.1 # Dropping bottom N * NOISY_DROP of the dataset 
+    NOISY_DROP = 0.2 # Dropping bottom N * NOISY_DROP of the dataset
     MEM_ALPHA = 0.3
-    TAU = 5.0
+    TAU = 2.0
     
     recov_config = {
         "epoch": 100,
         "n_fold": 10, # beta ↓ when N_FOLDS ↑
         "weight_OF": [1.0, 0.0, 0.0],
         "sample_fold_fn": "sample_folds", # sample_folds sample_folds_grouped
-        "noisy_drop_fn": "update_noisy_drop_variance", # update_noisy_drop_variance update_noisy_drop_gmm
+        "noisy_drop_fn": "update_noisy_drop_gmm", # update_noisy_drop_variance update_noisy_drop_gmm
         "memory_alpha_fn": "update_memory_alpha", # memory_alpha_fixated update_memory_alpha
         "tau_update_fn": "update_tau_variance", # update_tau_validation update_tau_variance
         "noise_thr_fn": "estimate_noise_threshold_gmm", # estimate_noise_threshold_gmm
-        "noise_threshold_gmm_alpha": 0.1, 
     }
     with open(os.path.join(model_dir, "recov_config.json"), "w") as f:
         json.dump(recov_config, f, indent=2)
@@ -375,13 +392,14 @@ def main(cli_args=None):
     #fold_splits = list(kf.split(df_train, target_labels))
 
     identified = []
-    memory = np.zeros_like(target_labels, dtype=np.float64)
+    memory = np.zeros(len(df_train), dtype=np.float64)
     runs_metadata = {}    
+    positive_memory = memory[positive_mask]
     runs_metadata[0] = {
         'metrics': {
-            'confidence_mean': np.mean(memory[memory > 0.0]),
-            'memory_mean': np.mean(memory),
-            'identified_ratio': len(identified) / len(df_train),
+            'confidence_mean': safe_mean(positive_memory[positive_memory > 0.0]),
+            'memory_mean': safe_mean(positive_memory),
+            'identified_ratio': len(identified) / max(len(positive_indices), 1),
             'roc-auc': 0.0,
             'TAU': TAU,
             'MEMORY_NOISE_THRES': 0.0,
@@ -398,7 +416,7 @@ def main(cli_args=None):
         }
         for fold, (train_idx, test_idx) in enumerate(fold_splits):
             if len(identified) > 0:
-                NOISY_DROP = getattr(current_module, hps_recov.noisy_drop_fn)(memory)
+                NOISY_DROP = getattr(current_module, hps_recov.noisy_drop_fn)(memory[positive_mask])
                 drop_idx = np.random.permutation(identified)[:int(NOISY_DROP * len(identified))]
                 train_idx = list(set(train_idx) - set(drop_idx))
 
@@ -462,9 +480,8 @@ def main(cli_args=None):
         # “How confident is the model that the ground-truth label is correct?”
         # idx_temp = np.stack((np.arange(len(test_labels_all)), test_labels_all))
         # temp =  pred_probs_all[idx_temp[0,:], idx_temp[1,:]] # For Multiclass, Extract Only True Probs
-        temp = np.where(test_labels_all == 1, pred_probs_all, 1 - pred_probs_all)
-        #weights_probs = (temp - temp.min()) / (temp.max() - temp.min() + 1e-8) # Why We 0 1 Norm?
-        weights_probs = 1 - (temp.max() - temp)
+        temp = np.where(test_labels_all == positive_value, pred_probs_all, 1 - pred_probs_all)
+        weights_probs = (temp - temp.min()) / (temp.max() - temp.min() + 1e-8)
         weights = weights_probs #+ hps_recov.weight_OF[0] * weights_acc
         weights = weights[order]
 
@@ -480,16 +497,19 @@ def main(cli_args=None):
         memory = MEM_ALPHA * weights + (1.0 - MEM_ALPHA) * memory
 
         TAU = getattr(current_module, hps_recov.tau_update_fn)(TAU, memory) # 1) variance-driven. memory -> test_youden 2) validation-feedback (use Youden or b_acc)
-        MEMORY_NOISE_THRES = getattr(current_module, hps_recov.noise_thr_fn)(memory, alpha=hps_recov.noise_threshold_gmm_alpha)
+        positive_memory = memory[positive_mask]
+        MEMORY_NOISE_THRES = getattr(current_module, hps_recov.noise_thr_fn)(positive_memory)
         
         fold_splits, _ = getattr(current_module, hps_recov.sample_fold_fn)(hps_recov.n_fold, memory, TAU, participant_ids=df_train["participant"].values)
-        identified = np.where(memory <= MEMORY_NOISE_THRES)[0]
+        identified_positive_local = np.where(positive_memory <= MEMORY_NOISE_THRES)[0]
+        identified = positive_indices[identified_positive_local]
+        clean_positive_memory = positive_memory[positive_memory > MEMORY_NOISE_THRES]
 
         runs_metadata[seed] = {
             'metrics': {
-                'confidence_mean': np.mean(memory[memory > MEMORY_NOISE_THRES]),
-                'memory_mean': np.mean(memory),
-                'identified_ratio': len(identified) / len(df_train),
+            'confidence_mean': safe_mean(clean_positive_memory),
+            'memory_mean': safe_mean(positive_memory),
+            'identified_ratio': len(identified) / max(len(positive_indices), 1),
                 'roc-auc': roc_auc_score(test_labels_all, pred_probs_all),
                 'TAU': TAU,
                 'MEMORY_NOISE_THRES': MEMORY_NOISE_THRES,

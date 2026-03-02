@@ -130,7 +130,7 @@ def main(cli_args=None):
         fold_scores = []
         test_metadata = {"labels": [], "probs": []}
 
-        splitter_outter, num_folds_outter = train.create_data_split(df_train, target_labels, use_kfold=True, n_splits=10, random_state=RNG_SEED)
+        splitter_outter, num_folds_outter = train.create_data_split(df_train, target_labels, use_kfold=True, n_splits=hps.train.n_Kfold, random_state=RNG_SEED)
         for fold_outter, (inner_idx, test_idx) in enumerate(splitter_outter):
             logger.info(f"\n{'='*20} Outter Fold {fold_outter+1}/{num_folds_outter} {'='*20}")
 
