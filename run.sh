@@ -67,11 +67,11 @@ python train_hypersearch.py  --init --model_name searchlstm10fold_spectogram --p
 
 python precompute_features.py \
   --config configs/general.json  \
-  --output_dir ./precomputed_features/logmel_cirdz \
+  --output_dir ./precomputed_features/logmel_combinedb \
   --feature_type logmel
 
-python train_hypersearch.py  --init --model_name searchlstmcirdz_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
-  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel_cirdz
+python train_hypersearch.py  --init --model_name searchlstmcombinednosampler_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel_combinedb
 # =========================================== Train best hyperparameter  ==========================================================
 python train.py  --init --model_name bilstmsymptoms_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
   --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel

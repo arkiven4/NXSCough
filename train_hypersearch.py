@@ -84,6 +84,11 @@ def main(cli_args=None):
     collate_fn = train.get_collate_fn(hps)
     target_labels = df_train[hps.data.target_column]
 
+    labels_temp = torch.tensor(target_labels.values)
+    num_pos = (labels_temp == 1).sum()
+    num_neg = (labels_temp == 0).sum()
+    pos_weight = num_neg / (num_pos + 1e-8)
+
     if not args.use_precomputed:
         utils.compute_spectrogram_stats_from_dataset(
             df_train, hps.data,
@@ -111,10 +116,10 @@ def main(cli_args=None):
     # =============================================================
     def sample_params(trial):
         params = {
-            "hidden_dim_classifier": trial.suggest_categorical("hidden_dim_classifier", [32, 64, 128, 192, 256, 384, 512]),
-            "dropout": trial.suggest_float("dropout", 0.1, 0.7),
+            "hidden_dim_classifier": trial.suggest_categorical("hidden_dim_classifier", [8, 16, 32, 64, 128, 192, 256, 384, 512]),
+            "dropout": trial.suggest_float("dropout", 0.1, 0.9),
 
-            "hidden_size": trial.suggest_categorical("hidden_size", [32, 64, 128, 192, 256, 384, 512]),
+            "hidden_size": trial.suggest_categorical("hidden_size", [8, 16, 32, 64, 128, 192, 256, 384, 512]),
             "lstmnum_layers": trial.suggest_int("lstmnum_layers", 1, 4),
             "att_head": trial.suggest_categorical("att_head", [1, 2, 4, 8]),
             # "att_head_fusion": trial.suggest_categorical("att_head_fusion", [1, 2, 4, 8]),
@@ -150,7 +155,7 @@ def main(cli_args=None):
             )
 
             pool_model = pool_net(feature_dim=hps.model.feature_dim, use_tabular=False, **now_params)
-            runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[])
+            runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=pos_weight)
             
             checkpoint_callback = ModelCheckpoint(
                 dirpath=f"{hps.model_dir}/{fold_outter}",
@@ -203,7 +208,7 @@ def main(cli_args=None):
         return final_score
 
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=40) # 70 -> 5 fold, 35 -> 10 fold
+    study.optimize(objective, n_trials=70) # 70 -> 5 fold, 35 -> 10 fold
 
     print("Best params:", study.best_trial.params)
     print("Best stability-aware score:", study.best_value)

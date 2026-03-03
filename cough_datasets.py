@@ -253,11 +253,12 @@ class CoughDatasets(torch.utils.data.Dataset):
         
         audio = utils.load_audio_sample(filename, self.sampling_rate, self.saming_length, self.desired_length, fade_samples_ratio=self.fade_samples_ratio,
                                         pad_types=self.pad_types, train=self.train)  # repeat zero
+                                        
         audio = audio - audio.mean(dim=-1, keepdim=True)
-        
-        peak = audio.abs().max()
-        audio = audio / (peak + 1e-8)
-        audio = torch.tanh(audio)
+        audio = audio / (torch.max(torch.abs(audio)) + 1e-8)
+        # peak = audio.abs().max()
+        # audio = audio / (peak + 1e-8)
+        # audio = torch.tanh(audio)
 
         if self.pad_types != "synthesis" and self.cough_detection:
             if audio.shape[-1] < end_index:

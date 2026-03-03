@@ -22,7 +22,7 @@ import loss_functions
 
 
 class CoughClassificationRunner(L.LightningModule):
-    def __init__(self, model, hps, custom_logger, class_weights=[], probs_threshold=0.5):
+    def __init__(self, model, hps, custom_logger, class_weights=None, probs_threshold=0.5):
         super().__init__()
         self.model = model
         self.hps = hps
@@ -33,7 +33,7 @@ class CoughClassificationRunner(L.LightningModule):
         self.generate_figure = False
         self.test_raw = False
         self.calibrator = None
-        self.loss_fn = loss_functions.get_losses_fn(hps.train.loss_function)
+        self.loss_fn = loss_functions.get_losses_fn(hps.train.loss_function, class_weights=class_weights)
 
         # =============================================================
         # SECTION: Additional Setupo

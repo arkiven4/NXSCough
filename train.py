@@ -326,8 +326,8 @@ def prepare_fold_data(train_fold, val_fold, hps, collate_fn, use_precomputed=Fal
         val_dataset.set_feature_path_column(feature_path_col)
     
     # Create sampler
-    sampler = create_sampler(train_fold, hps)
-    #sampler = None
+    #sampler = create_sampler(train_fold, hps)
+    sampler = None
     
     # Create dataloaders
     # Wrap train collate to avoid singleton last batch without dropping data.
@@ -336,7 +336,7 @@ def prepare_fold_data(train_fold, val_fold, hps, collate_fn, use_precomputed=Fal
     train_loader = DataLoader(
         train_dataset, 
         num_workers=28, 
-        sampler=sampler, 
+        #sampler=sampler, 
         batch_size=hps.train.batch_size,
         #batch_sampler=sampler,
         pin_memory=True, 

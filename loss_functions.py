@@ -3,9 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class BCELossFn(nn.Module):
-    def __init__(self):
+    def __init__(self, class_weights=None):
         super().__init__()
-        self.bce = nn.BCEWithLogitsLoss()
+        if class_weights is not None:
+            print("Use Weighted Loss")
+            print(class_weights)
+            class_weights = torch.tensor([class_weights], dtype=torch.float32)
+        self.bce = nn.BCEWithLogitsLoss(pos_weight=class_weights)
 
     def forward(self, out_model, batchs):
         logits = out_model["disease_logits"]
@@ -394,13 +398,13 @@ class PatientAwareLoss(nn.Module):
         patient_labels = torch.stack(patient_labels).float()
         return [self.bce(patient_logits, patient_labels)]
 
-def get_losses_fn(loss_type="BCELossFn"):
+def get_losses_fn(loss_type="BCELossFn", class_weights=None):
     loss_cls = globals().get(loss_type)
     if loss_cls is None:
         loss_cls = globals().get("BCELossFn")
-        return loss_cls()
+        return loss_cls(class_weights=class_weights)
         #raise ValueError(f"Unknown loss type: {loss_type}")
-    return loss_cls()
+    return loss_cls(class_weights=class_weights)
 
 
 
