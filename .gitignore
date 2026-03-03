@@ -7,6 +7,7 @@ baklogs_*/
 lightning_logs/
 preprocessed_data
 precomputed_features
+pretrained/
 *.zip
 data/TB_resample/
 test.ipynb
