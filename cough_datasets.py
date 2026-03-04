@@ -20,6 +20,7 @@ import torchvision.transforms as transforms
 import joblib
 import librosa
 import opensmile
+from gammatone.gtgram import gtgram
 
 import utils
 import commons
@@ -50,9 +51,129 @@ SMILE_CLIENTS = {
     for fs in FEATURE_SETS
 }
 
-viridis_lut = torch.tensor(cm.get_cmap(
-    "viridis").colors, dtype=torch.float32)  # (256,4)
+viridis_lut = torch.tensor(cm.get_cmap("viridis").colors, dtype=torch.float32)  # (256,4)
 viridis_lut = viridis_lut[:, :3]
+
+
+def build_wav_transform(hparams, sampling_rate):
+    """Return the appropriate waveform-to-feature transform callable for the given hparams."""
+    feature_type = hparams.feature_type
+
+    if feature_type == "mfcc":
+        return lambda wav: torch.tensor(
+            librosa.feature.mfcc(
+                y=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
+                sr=sampling_rate,
+                n_fft=hparams.filter_length,
+                win_length=hparams.win_length,
+                hop_length=hparams.hop_length,
+                n_mfcc=13,
+            ),
+            dtype=torch.float32,
+        )
+
+    elif feature_type == "chroma":
+        return lambda wav: torch.tensor(
+            librosa.feature.chroma_stft(
+                y=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
+                sr=sampling_rate,
+                n_fft=hparams.filter_length,
+                win_length=hparams.win_length,
+                hop_length=hparams.hop_length,
+                n_chroma=12,
+                tuning=0.0,
+            ),
+            dtype=torch.float32,
+        )
+
+    elif feature_type == "melspectogram":
+        return lambda wav: torch.tensor(
+            librosa.power_to_db(
+                librosa.feature.melspectrogram(
+                    y=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
+                    sr=hparams.sampling_rate,
+                    n_mels=hparams.n_mel_channels,
+                    fmin=hparams.mel_fmin,
+                    fmax=hparams.mel_fmax,
+                    n_fft=hparams.filter_length,
+                    hop_length=hparams.hop_length,
+                    power=2.0,
+                ),
+                ref=np.max,
+            ),
+            dtype=torch.float32,
+        )
+
+    elif feature_type == "logmel":
+        return lambda wav: torch.tensor(
+            np.log(
+                librosa.feature.melspectrogram(
+                    y=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
+                    sr=hparams.sampling_rate,
+                    n_mels=hparams.n_mel_channels,
+                    n_fft=hparams.filter_length,
+                    hop_length=hparams.hop_length,
+                    win_length=hparams.win_length,
+                ) + 1e-6
+            ),
+            dtype=torch.float32,
+        )
+
+    elif feature_type == "gammmaspectogram":
+        return lambda wav: torch.tensor(
+            np.log(
+                gtgram(
+                    wave=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
+                    fs=hparams.sampling_rate,
+                    channels=hparams.n_mel_channels,
+                    f_min=hparams.mel_fmin,
+                    f_max=hparams.mel_fmax,
+                    window_time=hparams.filter_length / hparams.sampling_rate,
+                    hop_time=hparams.hop_length / hparams.sampling_rate,
+                ) + 1e-8
+            ),
+            dtype=torch.float32,
+        )
+
+    elif feature_type == "spectogram":
+        return lambda wav: torch.tensor(
+            librosa.power_to_db(
+                np.abs(librosa.stft(
+                    y=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
+                    n_fft=hparams.filter_length,
+                    hop_length=hparams.hop_length,
+                )) ** 2,
+                ref=np.max,
+            ),
+            dtype=torch.float32,
+        )
+
+    elif feature_type == "fbank_ast":
+        from transformers import AutoFeatureExtractor
+        feature_extractor_ast = AutoFeatureExtractor.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
+        return lambda wav: (
+            feature_extractor_ast(
+                wav.squeeze(0), sampling_rate=sampling_rate, return_tensors="pt"
+            )["input_values"][0].T
+        )
+
+    elif feature_type == "opensmile":
+        scaler = joblib.load("precomputed_stats/opensmile_global_scaler.pkl")
+        return lambda wav: torch.tensor(
+            scaler.transform(
+                pd.concat(
+                    [
+                        client.process_signal(wav, sampling_rate)
+                        .reset_index(drop=True)
+                        .add_prefix(f"{fs_name}__")
+                        for fs_name, client in SMILE_CLIENTS.items()
+                    ],
+                    axis=1,
+                ).fillna(0.0).values
+            ).T,
+            dtype=torch.float32,
+        )
+    return None
 
 
 class CoughDatasets(torch.utils.data.Dataset):
@@ -60,10 +181,32 @@ class CoughDatasets(torch.utils.data.Dataset):
         self.audiopaths_and_text = data_numpy
         self.train = getattr(hparams, "train", train)
         self.use_precomputed = use_precomputed
+        self._init_hparams(hparams)
 
+        if self.augment_data:
+            # ["apply_speed_perturbation", "apply_pitch_shift", "apply_reverb", "add_background_noise", "apply_random_gain"]
+            self.data_augmentator = DataAugmentator(
+                None,
+                augmentation_noises_labels_path="/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_noises_speechs_labels.tsv",
+                augmentation_rirs_directory=None,
+                augmentation_rirs_labels_path="/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_rirs_labels.tsv",
+                augmentation_window_size_secs=5.5, augmentation_probability=[0.3, 0.25, 0.2, 0.25, 0.0]) # 0.3, 0.15, 0.2, 0.4, 0.0
+
+        if self.mean_std_norm and not self.use_precomputed:
+            with open(wav_stats_path, 'rb') as f:
+                stats = pickle.load(f)
+                self.wav_stats = stats
+
+        self.wav_transform = None
+        if hparams.acoustic_feature and not self.use_precomputed:
+            self.wav_transform = build_wav_transform(hparams, self.sampling_rate)
+
+    def _init_hparams(self, hparams):
+        """Unpack all hparams fields into instance attributes."""
         self.hop_length = getattr(hparams, "hop_length", None)
         self.max_wav_value = getattr(hparams, "max_wav_value", None)
         self.mean_std_norm = getattr(hparams, "mean_std_norm", False)
+        self.cmvn_norm = getattr(hparams, "cmvn_norm", False)
         self.per_band_norm = getattr(hparams, "per_band_norm", False)
         self.sampling_rate = getattr(hparams, "sampling_rate", None)
         self.saming_length = getattr(hparams, "saming_length", None)
@@ -95,309 +238,87 @@ class CoughDatasets(torch.utils.data.Dataset):
         self.cough_detection = getattr(hparams, "cough_detection", False)
         self.processor = None
 
-        if self.augment_data:
-            # ["apply_speed_perturbation", "apply_pitch_shift", "apply_reverb", "add_background_noise", "apply_random_gain"]
-            self.data_augmentator = DataAugmentator(
-                None,
-                augmentation_noises_labels_path="/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_noises_speechs_labels.tsv",
-                augmentation_rirs_directory=None,
-                augmentation_rirs_labels_path="/run/media/fourier/Data1/Pras/Interspeech2025/RIRS_NOISES/data_augmentation_rirs_labels.tsv",
-                # 0.3, 0.15, 0.2, 0.4, 0.0
-                augmentation_window_size_secs=5.5, augmentation_probability=[0.3, 0.25, 0.2, 0.25, 0.0])
-
-        if self.mean_std_norm and not self.use_precomputed:
-            with open(wav_stats_path, 'rb') as f:
-                stats = pickle.load(f)
-                self.wav_stats = stats
-
-        self.wav_transform = None
-        if hparams.acoustic_feature and not self.use_precomputed:
-            if hparams.feature_type == "mfcc":
-                self.wav_transform = lambda wav: torch.tensor(librosa.feature.mfcc(
-                    y=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
-                    sr=self.sampling_rate,
-                    n_fft=hparams.filter_length,
-                    win_length=hparams.win_length,
-                    hop_length=hparams.hop_length,
-                    n_mfcc=13),
-                    dtype=torch.float32)
-            elif hparams.feature_type == "chroma":
-                self.wav_transform = lambda wav: torch.tensor(librosa.feature.chroma_stft(
-                    y=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
-                    sr=self.sampling_rate,
-                    n_fft=hparams.filter_length,
-                    win_length=hparams.win_length,
-                    hop_length=hparams.hop_length,
-                    n_chroma=12, tuning=0.0),
-                    dtype=torch.float32)
-            elif hparams.feature_type == "melspectogram":
-                self.wav_transform = lambda wav: torch.tensor(
-                    librosa.power_to_db(librosa.feature.melspectrogram(
-                        y=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
-                        sr=hparams.sampling_rate,
-                        n_mels=hparams.n_mel_channels,
-                        fmin=hparams.mel_fmin,
-                        fmax=hparams.mel_fmax,
-                        n_fft=hparams.filter_length,
-                        hop_length=hparams.hop_length,
-                        power=2.0,
-                    ), ref=np.max),  # How about the ref is 1.0
-                    dtype=torch.float32,
-                )
-            elif hparams.feature_type == "logmel":
-                self.wav_transform = lambda wav: torch.tensor(
-                    np.log(librosa.feature.melspectrogram(
-                        y=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
-                        sr=hparams.sampling_rate,
-                        n_mels=hparams.n_mel_channels,
-                        n_fft=hparams.filter_length,
-                        hop_length=hparams.hop_length,
-                        win_length=hparams.win_length,
-                    ) + 1e-6),
-                    dtype=torch.float32,
-                )
-            elif hparams.feature_type == "gammmaspectogram":
-                from gammatone.gtgram import gtgram
-                self.wav_transform = lambda wav: torch.tensor(
-                    np.log(gtgram(
-                        wave=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
-                        fs=hparams.sampling_rate,
-                        channels=hparams.n_mel_channels,
-                        f_min=hparams.mel_fmin,
-                        f_max=hparams.mel_fmax,
-                        window_time=hparams.filter_length / hparams.sampling_rate,
-                        hop_time=hparams.hop_length / hparams.sampling_rate,
-                    ) + 1e-8),
-                    dtype=torch.float32,
-                )
-            elif hparams.feature_type == "spectogram":
-                self.wav_transform = lambda wav: torch.tensor(
-                    librosa.power_to_db(np.abs(librosa.stft(
-                            y=wav.numpy() if isinstance(wav, torch.Tensor) else wav,
-                            n_fft=hparams.filter_length,
-                            hop_length=hparams.hop_length)) ** 2,
-                        ref=np.max,
-                    ),
-                    dtype=torch.float32
-                )
-            elif hparams.feature_type == "fbank_ast":
-                from transformers import AutoFeatureExtractor
-                feature_extractor_ast = AutoFeatureExtractor.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
-                #feature_extractor_ast.max_length = 150
-                self.wav_transform = lambda wav: (
-                    feature_extractor_ast(wav.squeeze(0), sampling_rate=self.sampling_rate, return_tensors="pt")['input_values'][0].T
-                )
-            elif hparams.feature_type == "opensmile":
-                self.scaler = joblib.load(
-                    "precomputed_stats/opensmile_global_scaler.pkl")
-                self.wav_transform = lambda wav: torch.tensor(self.scaler.transform(
-                    pd.concat(
-                        [client.process_signal(wav, self.sampling_rate)
-                         .reset_index(drop=True)
-                         .add_prefix(f"{fs_name}__")
-                         for fs_name, client in SMILE_CLIENTS.items()
-                         ],
-                        axis=1).fillna(0.0).values).T,
-                    dtype=torch.float32
-                )
-
-        if self.mix_audio == True:
-            self.probs = [1 / self.nClasses] * self.nClasses
-
-        random.seed(1234)
-    
-    # TODO:  MOove to INIT
+    # TODO: Move to INIT
     def set_feature_path_column(self, col_index):
         """Set the column index where precomputed feature paths are stored."""
         self.feature_path_col = col_index
 
     def get_mel_text_pair(self, audiopath_and_text):
-        if self.cough_detection == True:
-            wavname, dse_id, gndr_id, spk_id = audiopath_and_text[0], audiopath_and_text[1], 0, 0
-            filename = audiopath_and_text if self.use_precomputed else self.db_path + "/" + wavname
-            wav, dse_id = self.get_audio(filename, dse_id, start_index=audiopath_and_text[2], end_index=audiopath_and_text[3])
-            wav2 = torch.empty(0, dtype=wav.dtype, device="cpu")
-            return (wavname, wav, wav2, dse_id, int(spk_id), int(gndr_id))
-
         wavname, dse_id, gndr_id, spk_id = audiopath_and_text[0], audiopath_and_text[1], audiopath_and_text[2], audiopath_and_text[3]
-        # TODO: Direct FIletpath, no need pass Row
-        filename = audiopath_and_text if self.use_precomputed else self.db_path + "/" + wavname
-        wav1, dse_id = self.get_audio(filename, dse_id)
-        
-        tabular = np.zeros((1, 4))
-        wav2 = torch.empty(0, dtype=wav1.dtype, device="cpu")
-        if self.ssccl_training:
-            filename2 = audiopath_and_text if self.use_precomputed else self.db_path + "/" + wavname
-            wav2, _ = self.get_audio(filename2, always_augment=True)
+        if self.use_precomputed and hasattr(self, 'feature_path_col'):
+            wavname = audiopath_and_text[self.feature_path_col] 
 
+        wav1, dse_id = self.get_audio(wavname, dse_id)
+
+        tabular = np.zeros((1, 4))
         if self.tabular_feature:
             tabular = torch.from_numpy(audiopath_and_text[4:8].astype("float32")).reshape(1, -1)
-            
-        return (wavname, wav1, wav2, dse_id, int(spk_id), int(gndr_id), tabular)
+
+        return (wavname, wav1, dse_id, int(spk_id), int(gndr_id), tabular)
 
     def get_audio(self, filename, dse_id=None, always_augment=False, start_index=0, end_index=-1):
-        # Load precomputed features if available
-        if self.use_precomputed and hasattr(self, 'feature_path_col'):
-            # filename is actually the row data, extract feature path
-            feature_path = filename[self.feature_path_col] if isinstance(filename, (list, np.ndarray)) else filename
-            #if feature_path and pd.notna(feature_path) and os.path.exists(str(feature_path)):
-            audio = torch.load(feature_path)
-            audio = audio.unsqueeze(0)
-            eye = torch.eye(self.nClasses, dtype=torch.float32)
-            dse_id = eye[dse_id]
-            dse_id = dse_id.unsqueeze(0)
-            # if dse_id is not None and self.nClasses is not None:
-            #     # Note: mix_audio_sample expects non-transformed audio, skip for precomputed
-            #     pass
-            return audio, dse_id
-        
-        audio = utils.load_audio_sample(filename, self.sampling_rate, self.saming_length, self.desired_length, fade_samples_ratio=self.fade_samples_ratio,
-                                        pad_types=self.pad_types, train=self.train)  # repeat zero
-                                        
-        audio = audio - audio.mean(dim=-1, keepdim=True)
-        audio = audio / (torch.max(torch.abs(audio)) + 1e-8)
-        # peak = audio.abs().max()
-        # audio = audio / (peak + 1e-8)
-        # audio = torch.tanh(audio)
-
-        if self.pad_types != "synthesis" and self.cough_detection:
-            if audio.shape[-1] < end_index:
-                audio = audio[:, start_index:]
-            else:
-                audio = audio[:, start_index:end_index]
-
-        if self.augment_data and self.train:
-            if random.random() < self.augment_prob or always_augment:
-                audio = self.data_augmentator(audio, self.sampling_rate)
-
-        audio = audio.squeeze(0)
-        if self.augment_rawboost and self.train:
-            x = audio.numpy() if isinstance(audio, torch.Tensor) else audio
-            x = LnL_convolutive_noise(
-                x, 5, 5, 20, 8000, 100, 1000,
-                10, 100, 0, 0, 5, 20, self.sampling_rate
-            )
-            x = ISD_additive_noise(x, 10, 2)
-            audio = torch.as_tensor(x, dtype=audio.dtype)
-
-        if self.add_noise:
-            audio = audio + torch.rand_like(audio)
-
-        audio = audio.unsqueeze(0)
-        if dse_id is not None:  # and self.train:
-            audio, dse_id = self.mix_audio_sample(audio, dse_id)
-
-        if self.wav_transform is not None:
-            if self.feature_type == "opensmile":
-                audio = audio.numpy().reshape(-1)
-
-            audio = self.wav_transform(audio)  # [80, 224]
-            if self.per_band_norm:
-                mean = audio.mean(dim=1, keepdim=True)      # [F, 1]
-                std = audio.std(dim=1, keepdim=True)        # [F, 1]
-                audio = (audio - mean) / (std + 1e-6)
-
-            if self.multimask_augment and self.train:
-                if random.random() < self.multimask_prob:
-                    audio = audio_processing.multi_mask_spectrogram(
-                        audio, tau=int(audio.shape[1] * self.tau),
-                        nu=int(audio.shape[0] * self.nu),
-                        num_masks=self.num_masks)  # T, F
-
-            # Compute and normalize delta and deltadelta features separately
-            if self.delta_feature:
-                audio_np = audio.detach().cpu().numpy()
-
-                delta = torch.from_numpy(
-                    librosa.feature.delta(audio_np)
-                ).to(audio.device, dtype=audio.dtype)
-
-                delta2 = None
-                if self.deltadelta_feature:
-                    delta2 = torch.from_numpy(
-                        librosa.feature.delta(audio_np, order=2)
-                    ).to(audio.device, dtype=audio.dtype)
-
-                if self.mean_std_norm and 'mean_delta_db' in self.wav_stats:
-                    audio = (
-                        audio - self.wav_stats['mean_db']) / (self.wav_stats['std_db'] + 1e-6)
-                    if 'mean_delta_db' in self.wav_stats:
-                        delta = (
-                            delta - self.wav_stats['mean_delta_db']) / (self.wav_stats['std_delta_db'] + 1e-6)
-                    if delta2 is not None and 'mean_deltadelta_db' in self.wav_stats:
-                        delta2 = (delta2 - self.wav_stats['mean_deltadelta_db']) / (
-                            self.wav_stats['std_deltadelta_db'] + 1e-6)
-
-                audio = torch.cat([audio, delta], dim=0)
-                if delta2 is not None:
-                    audio = torch.cat([audio, delta2], dim=0)
-
-        if self.mean_std_norm and (not self.delta_feature or 'mean_delta_db' not in self.wav_stats or self.wav_transform is None):
-            audio = (audio - self.wav_stats['mean_db']) / (self.wav_stats['std_db'] + 1e-6)
-
-        if self.max_wav_value:
-            max_val = torch.max(torch.abs(audio))
-            audio = audio / max_val if max_val != 0 else audio
-
-        audio = audio.unsqueeze(0)
-        if self.mae_training:
-            audio = self.transform_train(audio.unsqueeze(0)).squeeze(0)
-
-        return audio, dse_id
-
-    def mix_audio_sample(self, wav, dse_id):
         dse_id = int(dse_id)
-        if not (self.mix_audio and self.train):
-            if self.nClasses == 1:
-                dse_id = torch.tensor([float(dse_id)], dtype=torch.float32)
-            else:
-                eye = torch.eye(self.nClasses, dtype=torch.float32)
-                dse_id = eye[dse_id]
-                dse_id = dse_id.unsqueeze(0)
-            return wav.squeeze(0), dse_id
+        eye = torch.eye(self.nClasses, dtype=torch.float32)
+        dse_id = eye[dse_id]
+        dse_id = dse_id.unsqueeze(0)
+    
+        if self.use_precomputed and hasattr(self, 'feature_path_col'):
+            audio = torch.load(filename)
+        else:
+            audio = utils.load_audio_sample(filename, self.sampling_rate, self.saming_length, self.desired_length, 
+                                            fade_samples_ratio=self.fade_samples_ratio, pad_types=self.pad_types, train=self.train)  # repeat zero
+            audio = audio.squeeze(0)
+            if self.train:
+                if self.augment_data:
+                    if random.random() < self.augment_prob or always_augment:
+                        audio = self.data_augmentator(audio.unsqueeze(0), self.sampling_rate).squeeze(0)
 
-        # r = np.array(random.random(), dtype=np.float32)
-        r = np.array(0.6 + 0.3 * random.random(), dtype=np.float32)
-        eye = np.eye(self.nClasses)
+                if self.augment_rawboost:
+                    x = audio.numpy() if isinstance(audio, torch.Tensor) else audio
+                    x = LnL_convolutive_noise( x, 5, 5, 20, 8000, 100, 1000, 10, 100, 0, 0, 5, 20, self.sampling_rate)
+                    x = ISD_additive_noise(x, 10, 2)
+                    audio = torch.as_tensor(x, dtype=audio.dtype)
 
-        while True:
-            random_class = random.choices(
-                range(self.nClasses), weights=self.probs, k=1)[0]
-            if dse_id == random_class:  # We Want the class to same
-                sampled_row = self.audiopaths_and_text[
-                    np.random.choice(
-                        np.where(self.audiopaths_and_text[:, 1] == random_class)[0])
-                ]
-                dse_id_rand = sampled_row[1]
-                # dse_id = (eye[dse_id] * r + eye[dse_id_rand] * (1 - r)).astype(np.float32)
-                # dse_id = torch.from_numpy(dse_id).unsqueeze(0)
-                break
+                if self.add_noise:
+                    audio = audio + torch.rand_like(audio)
 
-        wav_rand = utils.load_audio_sample(os.path.join(self.db_path, sampled_row[0]), self.sampling_rate, self.saming_length,
-                                           self.desired_length, fade_samples_ratio=self.fade_samples_ratio,
-                                           pad_types=self.pad_types, train=self.train)  # repeat zero
-        wav_rand = wav_rand - wav_rand.mean(dim=-1, keepdim=True)
+            if self.wav_transform is not None:
+                audio = self.wav_transform(audio)  # [80, 224]
+                audio = [audio.detach().cpu().numpy()]
+                if self.delta_feature:
+                    audio.append(librosa.feature.delta(audio[0]))
+                if self.deltadelta_feature:
+                    audio.append(librosa.feature.delta(audio[0], order=2))
+                audio = np.concatenate(audio, axis=0)
+                audio = torch.from_numpy(audio).float()
 
-        sound1 = wav.squeeze(0).numpy()
-        sound2 = wav_rand.squeeze(0).numpy()
-        size = min(len(sound1), len(sound2))
+            if self.mean_std_norm and hasattr(self, 'wav_stats'):
+                audio = (audio - self.wav_stats['mean_db']) / (self.wav_stats['std_db'] + 1e-6)
 
-        sound1 = sound1[:size]
-        sound2 = sound2[:size]
+            if self.cmvn_norm:
+                if audio.ndim >= 2:
+                    audio = (audio - audio.mean(dim=1, keepdim=True)) / (audio.std(dim=1, keepdim=True, unbiased=False) + 1e-16)
+                else:
+                    audio = (audio - audio.mean()) / (audio.std(unbiased=False) + 1e-16)
 
-        mixed = audio_processing.mix(
-            sound1, sound2, r, self.sampling_rate).astype(np.float32)
-        wav = torch.from_numpy(mixed)
+            if self.max_wav_value:
+                max_val = torch.max(torch.abs(audio))
+                audio = audio / max_val if max_val != 0 else audio
 
-        peak = wav.abs().max()
-        wav = wav / (peak + 1e-8)
-        wav = torch.tanh(wav)
+            # audio torch.Size([80, 32])
 
-        return wav, dse_id
+        if self.multimask_augment and random.random() < self.multimask_prob and self.train:
+            audio = audio_processing.multi_mask_spectrogram(
+                audio, tau=int(audio.shape[1] * self.tau),
+                nu=int(audio.shape[0] * self.nu),
+                num_masks=self.num_masks)  # T, F
+
+        audio = audio.unsqueeze(0)
+        return audio, dse_id
 
     def __getitem__(self, index):
         data = self.get_mel_text_pair(self.audiopaths_and_text[index])
-        return (index,) + data  # Prepend index to the tuple
+        return (index,) + data
 
     def __len__(self):
         return len(self.audiopaths_and_text)
@@ -411,12 +332,10 @@ class CoughDatasetsCollate:
         self.many_tabular = many_tabular
 
     def __call__(self, batch):
-        lengths1 = torch.tensor([x[2].shape[-1] for x in batch])
-        lengths2 = torch.tensor([x[3].shape[-1] for x in batch])
-        lengths_sorted1, idx = torch.sort(lengths1, descending=True)
-        lengths_sorted2, idx = torch.sort(lengths2, descending=True)
+        lengths = torch.tensor([x[2].shape[-1] for x in batch])
+        lengths_sorted, idx = torch.sort(lengths, descending=True)
 
-        max_len = lengths_sorted1[0]
+        max_len = lengths_sorted[0]
         bsz = len(batch)
 
         first_wav = batch[0][2]
@@ -424,34 +343,27 @@ class CoughDatasetsCollate:
 
         sorted_indices = torch.zeros(bsz, dtype=torch.long)
         wav_names = []
-        wav_padded1 = torch.zeros(
-            bsz, feature_dim, lengths_sorted1[0], dtype=first_wav.dtype)
-        wav_padded2 = torch.zeros(
-            bsz, feature_dim, lengths_sorted2[0], dtype=first_wav.dtype)
-        # wav_padded = torch.zeros(bsz, 3, 224, 224, dtype=first_wav.dtype)
+        wav_padded = torch.zeros(bsz, feature_dim, lengths_sorted[0], dtype=first_wav.dtype)
         attention_masks = torch.zeros(bsz, max_len)
 
         dse_ids = torch.zeros(bsz, self.many_data, dtype=torch.float32)
         spk_ids = torch.zeros(bsz, dtype=torch.long)
         gndr_ids = torch.zeros(bsz, dtype=torch.long)
         tabular_ids = torch.zeros(bsz, self.many_tabular, dtype=torch.float32)
-
         for i, j in enumerate(idx):
-            sample_idx, name, wav1, wav2, dse, spk, gndr, tblr = batch[j]
+            sample_idx, name, wav, dse, spk, gndr, tblr = batch[j]
             wav_names.append(name)
             sorted_indices[i] = sample_idx
 
-            wav_padded1[i, :, :wav1.shape[-1]] = wav1
-            wav_padded2[i, :, :wav2.shape[-1]] = wav2
-            # wav_padded[i, :, :, :wav_length] = wav
-            attention_masks[i, :wav1.shape[-1]] = 1
+            wav_padded[i, :, :wav.shape[-1]] = wav
+            attention_masks[i, :wav.shape[-1]] = 1
 
             dse_ids[i] = dse
             spk_ids[i] = spk
             gndr_ids[i] = gndr
             tabular_ids[i] = tblr.squeeze(0)
 
-        return wav_names, wav_padded1, wav_padded2, attention_masks, dse_ids, [spk_ids, gndr_ids, tabular_ids, sorted_indices]
+        return wav_names, wav_padded, None, attention_masks, dse_ids, [spk_ids, gndr_ids, tabular_ids, sorted_indices]
 
 
 class CoughDatasetsProcessorCollate():

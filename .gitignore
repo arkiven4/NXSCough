@@ -21,3 +21,4 @@ test.ipynb
 *.pickle
 *.ckpt
 pretrained/encoder-operaGT.ckpt
+precomputed_features_bak

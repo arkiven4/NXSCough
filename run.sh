@@ -67,16 +67,25 @@ python train_hypersearch.py  --init --model_name searchlstm10fold_spectogram --p
 
 python precompute_features.py \
   --config configs/general.json  \
-  --output_dir ./precomputed_features/logmel_combinedb \
+  --output_dir ./precomputed_features/logmel_dd \
   --feature_type logmel
 
-python train_hypersearch.py  --init --model_name searchlstmcombinednosampler_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
-  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel_combinedb
+python precompute_features.py \
+  --config configs/general.json  \
+  --output_dir ./precomputed_features/mfcc_dd \
+  --feature_type mfcc
+
+python train_hypersearch.py  --init --model_name search_bilstm_logmeldd --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
+  --feature_dim 240 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel_dd
 # =========================================== Train best hyperparameter  ==========================================================
-python train.py  --init --model_name bilstmsymptoms_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
+python train.py  --init --model_name try_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
   --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
 
 python train.py  --init --model_name resnetbest_logmel --pooling_model ResNet34ManualClassifier --feature_type logmel \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
+
+
+python train.py  --init --model_name bilstm_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
   --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
 
 

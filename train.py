@@ -612,6 +612,11 @@ def main(cli_args=None):
     collate_fn = get_collate_fn(hps)
     target_labels = df_train[hps.data.target_column]
 
+    labels_temp = torch.tensor(target_labels.values)
+    num_pos = (labels_temp == 1).sum()
+    num_neg = (labels_temp == 0).sum()
+    pos_weight = num_neg / (num_pos + 1e-8)
+
     if not args.use_precomputed:
         if hps.data.acoustic_feature and hps.data.mean_std_norm:
             utils.compute_spectrogram_stats_from_dataset(
@@ -623,7 +628,10 @@ def main(cli_args=None):
                 df_train, "path_file", 
                 pickle_path=f"{hps.model_dir}/wav_stats.pickle"
             )
-
+    
+    df_cirdz = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/metadata_cirdz.csv.train')
+    df_cirdz = df_cirdz.reset_index(drop=True)
+    df_cirdz = df_cirdz[hps.data.column_order]
     # =============================================================
     # SECTION: Model Setup
     # =============================================================
@@ -653,6 +661,11 @@ def main(cli_args=None):
     splitter, num_folds = create_data_split(df_train, target_labels, use_kfold=hps.train.use_Kfold, n_splits=10, random_state=RNG_SEED)
     for fold_outter, (inner_idx, test_idx) in enumerate(splitter):
         logger.info(f"\n{'='*20} Fold {fold_outter+1}/{num_folds} {'='*20}")
+        
+        # proportion of positive labels (class 1) Train: 0.30 30% of training samples are label=1 (positive/TB)
+        train_labels = target_labels.iloc[inner_idx]
+        test_labels = target_labels.iloc[test_idx]
+        print(f"Fold {fold_outter+1} | Train: {train_labels.mean():.2f} | Val: {test_labels.mean():.2f}")
 
         inner_fold = df_train.iloc[inner_idx].reset_index(drop=True)
         test_fold = df_train.iloc[test_idx].reset_index(drop=True)
@@ -680,7 +693,7 @@ def main(cli_args=None):
 
         tb_logger = TensorBoardLogger(save_dir=hps.model_dir, name=f"{fold_outter}", sub_dir="train")
         early_stopping = EarlyStopping(monitor="val/loss", patience=7, mode="min", verbose=False)
-        runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[]) # Bcs i use Sampler
+        runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=pos_weight)
         trainer = L.Trainer(
             max_epochs=1000,
             callbacks=[checkpoint_callback, early_stopping],
@@ -707,7 +720,7 @@ def main(cli_args=None):
         trainer = L.Trainer(accelerator="gpu" if torch.cuda.is_available() else "cpu", devices="auto")
         runner_lightning = lightning_wrapper.CoughClassificationRunner.load_from_checkpoint(
             os.path.join(f"{hps.model_dir}/{fold_outter}", "best_model.ckpt"),
-            model=pool_model, hps=hps, custom_logger=logger)
+            model=pool_model, hps=hps, custom_logger=logger, class_weights=pos_weight)
         runner_lightning.eval()
 
         runner_lightning.calibrate_threshold = True
@@ -722,6 +735,28 @@ def main(cli_args=None):
         oof_label[test_idx] = results_dict[0]["raw_data"]['labels'].reshape(-1)
         fold_thr.append(runner_lightning.probs_threshold)
         
+        results_dict = {}
+        loader = DataLoader(
+            CoughDatasets(
+                df_cirdz.values, 
+                hps.data,
+                wav_stats_path=f"{args.precomputed_dir}/wav_stats.pickle", 
+                train=False,
+                use_precomputed=False
+            ), 
+            num_workers=28, 
+            shuffle=False, 
+            batch_size=hps.train.batch_size,
+            pin_memory=True, 
+            collate_fn=collate_fn
+        )
+        results = trainer.test(runner_lightning, dataloaders=loader)[0]
+        results_dict[0] = {
+            "metrics": results,
+            "raw_data": runner_lightning.test_outputs,
+        }
+        write_results_to_file("result_overall.txt", results_dict, f"{hps.model_dir}", {0: "CIRDZ " + str(fold_outter)})
+
         if os.path.exists(production_path):
             os.remove(production_path)
 

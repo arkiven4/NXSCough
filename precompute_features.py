@@ -27,7 +27,6 @@ def precompute_features(df, hparams, output_dir, split_name="train"):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Compute wav statistics for normalization (only for train split)
     wav_stats_path = None
     if split_name == "train" and hparams.mean_std_norm:
         wav_stats_path = output_dir / "wav_stats.pickle"
@@ -39,7 +38,6 @@ def precompute_features(df, hparams, output_dir, split_name="train"):
         )
         print(f"Saved wav stats to {wav_stats_path}")
     elif split_name != "train" and hparams.mean_std_norm:
-        # For test/val splits, look for existing wav_stats from train split
         wav_stats_path = output_dir / "wav_stats.pickle"
         if wav_stats_path.exists():
             print(f"Using existing wav stats from {wav_stats_path}")
@@ -47,8 +45,6 @@ def precompute_features(df, hparams, output_dir, split_name="train"):
             print(f"Warning: wav_stats not found at {wav_stats_path}, proceeding without normalization")
             wav_stats_path = None
     
-    # Create CoughDatasets instance with train=False to disable augmentation
-    # but still use all the feature extraction logic
     print(f"Initializing CoughDatasets for feature extraction ({split_name} split)...")
     dataset = CoughDatasets(
         df.values,
@@ -58,7 +54,6 @@ def precompute_features(df, hparams, output_dir, split_name="train"):
         use_precomputed=False  # We're computing features, not loading them
     )
     
-    # Process each file
     feature_paths = []
     print(f"Precomputing features for {len(df)} files ({split_name} split)...")
     
@@ -93,7 +88,6 @@ def precompute_features(df, hparams, output_dir, split_name="train"):
             # Save features
             torch.save(features, feature_path)
             feature_paths.append(str(feature_path))
-            
         except Exception as e:
             print(f"Error processing {wavname}: {e}")
             import traceback
@@ -142,37 +136,26 @@ def main():
     parser.add_argument('--test_csv', type=str, default=None, help='Override test CSV path')
     
     args = parser.parse_args()
-    
-    # Load config
     with open(args.config) as f:
         config = json.load(f)
-    
-    # Override feature_type if provided
+
     if args.feature_type:
         config['data']['feature_type'] = args.feature_type
         print(f"Overriding feature_type to: {args.feature_type}")
     
     hparams = utils.HParams(**config)
-    
-    # Load dataframes
     if args.train_csv:
         df_train = pd.read_csv(args.train_csv)
     else:
-        df_train = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/{hparams.data.metadata_csv}.train')
+        df_train = pd.read_csv(f'data/{hparams.data.metadata_csv}.train')
     df_train = df_train.reset_index(drop=True)
     df_train = df_train[hparams.data.column_order]
     
     print(f"Loaded {len(df_train)} training samples")
+    precompute_features(
+        df_train, hparams.data,
+        args.output_dir, split_name="train")
     
-    # Precompute training features (this will compute wav_stats automatically)
-    train_feature_paths = precompute_features(
-        df_train,
-        hparams.data,
-        args.output_dir,
-        split_name="train"
-    )
-    
-    # Precompute test features if available (will use wav_stats from train)
     try:
         if args.test_csv:
             df_test = pd.read_csv(args.test_csv)
@@ -181,8 +164,7 @@ def main():
         df_test = df_test.reset_index(drop=True)
         
         print(f"\nLoaded {len(df_test)} test samples")
-        
-        test_feature_paths = precompute_features(
+        precompute_features(
             df_test,
             hparams.data,
             args.output_dir,
