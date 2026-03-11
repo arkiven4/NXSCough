@@ -20,7 +20,7 @@
     "max_wav_value": false,
     "mean_std_norm": false,
     "per_band_norm": false,
-    "cmvn_norm": true,
+    "cmvn_norm": false,
     
     "sampling_rate": 16000,
     "filter_length": 2048,
@@ -37,21 +37,21 @@
     "rezize_size": [64, 256],
 
     "tabular_feature": true,
-    "acoustic_feature": true,
+    "acoustic_feature": false,
     "feature_type": "logmel",
-    "delta_feature": true,
-    "deltadelta_feature": true,
+    "delta_feature": false,
+    "deltadelta_feature": false,
 
     "multimask_augment": false,
-    "multimask_prob": 0.4,
+    "multimask_prob": 0.5,
     "tau": 0.10,
     "nu": 0.10,
     "num_masks": 3,
 
-    "augment_data": true,
+    "augment_data": false,
     "augment_prob": 0.5,
-    "augment_rawboost": true,
-    "add_noise": true,
+    "augment_rawboost": false,
+    "add_noise": false,
 
     "cough_detection": false,
     "mix_audio": false,

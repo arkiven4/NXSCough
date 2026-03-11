@@ -61,13 +61,13 @@ class CoughClassificationRunner(L.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW([
-            {"params": self.model.parameters(), "lr": self.hps.train.learning_rate,
-             "weight_decay": self.hps.train.weight_decay},
+            {"params": self.model.parameters(), "lr": self.hps.train.learning_rate},
             # {"params": self.model.sscl_model.parameters(), "lr": 1e-5},
             # {"params": self.model.head.parameters(), "lr": self.hps.train.learning_rate},
             # {"params": self.center_loss.parameters(), "lr": self.hps.train.learning_rate},
-        ])
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=2)
+        ]) 
+        #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=2)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=60)
         return {
             "optimizer": optimizer,
             "lr_scheduler": {

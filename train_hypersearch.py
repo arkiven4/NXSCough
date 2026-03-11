@@ -50,11 +50,11 @@ import train
 from cough_datasets import (
     CoughDatasets,
     CoughDatasetsCollate,
-    CoughDatasetsProcessorCollate,
     CoughDetectionRatioBatchSampler,
     CoughDiseaseBinaryBatchSampler,
     PatientBatchSampler, AutoPatientBatchSampler
 )
+from precompute_features import precompute_features
 
 torch.set_float32_matmul_precision("medium")
 cmap = cm.get_cmap("viridis")
@@ -89,12 +89,6 @@ def main(cli_args=None):
     num_neg = (labels_temp == 0).sum()
     pos_weight = num_neg / (num_pos + 1e-8)
 
-    if not args.use_precomputed:
-        utils.compute_spectrogram_stats_from_dataset(
-            df_train, hps.data,
-            pickle_path=f"{hps.model_dir}/wav_stats.pickle"
-        )
-
     # =============================================================
     # SECTION: Model Setup
     # =============================================================
@@ -115,7 +109,7 @@ def main(cli_args=None):
     # SECTION: Setup Logger, Dataloader
     # =============================================================
     def sample_params(trial):
-        params = {
+        model_params = {
             "hidden_dim_classifier": trial.suggest_categorical("hidden_dim_classifier", [8, 16, 32, 64, 128, 192, 256, 384, 512]),
             "dropout": trial.suggest_float("dropout", 0.1, 0.9),
 
@@ -124,87 +118,155 @@ def main(cli_args=None):
             "att_head": trial.suggest_categorical("att_head", [1, 2, 4, 8]),
             # "att_head_fusion": trial.suggest_categorical("att_head_fusion", [1, 2, 4, 8]),
             # "fusion_type": trial.suggest_categorical("fusion_type", ["gating", "cross_attn", "film"]),
-            
+
             # "resnet_type": trial.suggest_categorical("resnet_type", ["resnet18", "resnet34", "resnet50", "resnet101"]),
             # "num_layers_resnet": trial.suggest_int("num_layers_resnet", 1, 4),
         }
-        return params
+
+        #multimask_augment = trial.suggest_categorical("multimask_augment", [True, False])
+
+        filter_length = trial.suggest_categorical("filter_length", [512, 1024, 2048])
+        win_length = trial.suggest_categorical("win_length", [256, 512, 1024])
+        win_length = min(win_length, filter_length)  # ensure win_length <= filter_length
+
+        data_params = {
+            # "multimask_augment": multimask_augment,
+            # "multimask_prob": trial.suggest_float("multimask_prob", 0.1, 0.8) if multimask_augment else 0.4,
+            # "tau": trial.suggest_float("tau", 0.01, 0.5) if multimask_augment else 0.10,
+            # "nu": trial.suggest_float("nu", 0.01, 0.5) if multimask_augment else 0.10,
+            # "num_masks": trial.suggest_int("num_masks", 1, 6) if multimask_augment else 3,
+
+            "filter_length": filter_length,
+            "hop_length": trial.suggest_categorical("hop_length", [32, 64, 128, 256, 512]),
+            "win_length": win_length,
+            "n_mel_channels": trial.suggest_categorical("n_mel_channels", [40, 64, 80, 128, 160]), # [6, 13, 13 * 2, 13 * 3, 13 * 4] [40, 64, 80, 128, 160]
+            "mel_fmin": trial.suggest_categorical("mel_fmin", [0, 20, 40, 80, 100, 120, 200, 400, 500, 600]),
+            "mel_fmax": trial.suggest_categorical("mel_fmax", [5000, 6000, 7000, 8000]),
+
+            "delta_feature": trial.suggest_categorical("delta_feature", [True, False]),
+            "deltadelta_feature": trial.suggest_categorical("deltadelta_feature", [True, False]),
+
+            # "augment_data": trial.suggest_categorical("augment_data", [True, False]),
+            # "augment_prob": trial.suggest_float("augment_prob", 0.1, 0.8),
+            # "augment_rawboost": trial.suggest_categorical("augment_rawboost", [True, False]),
+            # "add_noise": trial.suggest_categorical("add_noise", [True, False]),
+        }
+        return model_params, data_params
 
     def objective(trial):
-        now_params = sample_params(trial)
-        fold_scores = []
-        test_metadata = {"labels": [], "probs": []}
+        model_params, data_params = sample_params(trial)
 
-        splitter_outter, num_folds_outter = train.create_data_split(df_train, target_labels, use_kfold=True, n_splits=hps.train.n_Kfold, random_state=RNG_SEED)
-        for fold_outter, (inner_idx, test_idx) in enumerate(splitter_outter):
-            logger.info(f"\n{'='*20} Outter Fold {fold_outter+1}/{num_folds_outter} {'='*20}")
+        # hps.data.multimask_augment = data_params["multimask_augment"]
+        # hps.data.multimask_prob = data_params["multimask_prob"]
+        # hps.data.tau = data_params["tau"]
+        # hps.data.nu = data_params["nu"]
+        # hps.data.num_masks = data_params["num_masks"]
 
-            inner_fold = df_train.iloc[inner_idx].reset_index(drop=True)
-            test_fold = df_train.iloc[test_idx].reset_index(drop=True)
+        hps.data.filter_length = data_params["filter_length"]
+        hps.data.hop_length = data_params["hop_length"]
+        hps.data.win_length = data_params["win_length"]
+        hps.data.n_mel_channels = data_params["n_mel_channels"]
+        hps.data.mel_fmin = data_params["mel_fmin"]
+        hps.data.mel_fmax = data_params["mel_fmax"]
 
-            mask_proper, mask_cp = train.stratified_group_holdout(inner_fold[hps.data.target_column].values, inner_fold["participant"].values, 
-                                                                  test_size=0.15, seed=RNG_SEED + fold_outter)
+        hps.data.delta_feature = data_params["delta_feature"]
+        hps.data.deltadelta_feature = data_params["deltadelta_feature"]
 
-            train_fold = inner_fold.iloc[mask_proper].reset_index(drop=True)
-            val_fold = inner_fold.iloc[mask_cp].reset_index(drop=True)
+        # hps.data.augment_data = data_params["augment_data"]
+        # hps.data.augment_prob = data_params["augment_prob"]
+        # hps.data.augment_rawboost = data_params["augment_rawboost"]
+        # hps.data.add_noise = data_params["add_noise"]
+
+        feat_mult = 1
+        if data_params["delta_feature"]:
+            feat_mult += 1
+        if data_params["deltadelta_feature"]:
+            feat_mult += 1
+        hps.model.feature_dim = data_params["n_mel_channels"] * feat_mult
+        print(feat_mult)
+        print(data_params["n_mel_channels"])
+        print(hps.model.feature_dim)
+
+        # Precompute features for this trial's spectrogram config into a temp dir
+        trial_precomputed_dir = tempfile.mkdtemp(prefix=f"trial{trial.number}_", dir=hps.model_dir)
+        try:
+            logger.info(f"Precomputing features for trial {trial.number} -> {trial_precomputed_dir}")
+            precompute_features(df_train, hps.data, trial_precomputed_dir, split_name="train")
+
+            fold_scores = []
+            test_metadata = {"labels": [], "probs": []}
+
+            splitter_outter, num_folds_outter = train.create_data_split(df_train, target_labels, use_kfold=True, n_splits=hps.train.n_Kfold, random_state=RNG_SEED)
+            for fold_outter, (inner_idx, test_idx) in enumerate(splitter_outter):
+                logger.info(f"\n{'='*20} Outter Fold {fold_outter+1}/{num_folds_outter} {'='*20}")
+
+                inner_fold = df_train.iloc[inner_idx].reset_index(drop=True)
+                test_fold = df_train.iloc[test_idx].reset_index(drop=True)
+
+                mask_proper, mask_cp = train.stratified_group_holdout(inner_fold[hps.data.target_column].values, inner_fold["participant"].values, 
+                                                                      test_size=0.15, seed=RNG_SEED + fold_outter)
+
+                train_fold = inner_fold.iloc[mask_proper].reset_index(drop=True)
+                val_fold = inner_fold.iloc[mask_cp].reset_index(drop=True)
+                
+                train_loader, val_loader = train.prepare_fold_data(
+                    train_fold, val_fold, hps, collate_fn,
+                    use_precomputed=True,
+                    precomputed_dir=trial_precomputed_dir
+                )
+
+                pool_model = pool_net(feature_dim=hps.model.feature_dim, use_tabular=False, **model_params)
+                runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=pos_weight)
+                
+                checkpoint_callback = ModelCheckpoint(
+                    dirpath=f"{hps.model_dir}/fold_{fold_outter}",
+                    monitor="val/loss",
+                    filename=f"pool_{{epoch:02d}}",
+                    save_top_k=1,
+                    mode="min",
+                )
+                early_stopping = EarlyStopping(monitor="val/loss", patience=7, mode="min", verbose=False)
+                trainer = L.Trainer(max_epochs=10000, callbacks=[checkpoint_callback, early_stopping],
+                    accelerator="gpu" if torch.cuda.is_available() else "cpu",
+                    devices="auto", default_root_dir=f"{hps.model_dir}/fold_{fold_outter}", deterministic=True)
+                trainer.fit(runner_lightning, train_dataloaders=train_loader, val_dataloaders=val_loader)
+
+                runner_lightning.calibrate_threshold = True
+                trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
+
+                _, test_loader = train.prepare_fold_data(
+                    test_fold, test_fold, hps, collate_fn,
+                    use_precomputed=True,
+                    precomputed_dir=trial_precomputed_dir
+                )
+                trainer.test(runner_lightning, dataloaders=test_loader, ckpt_path="best")
+                result_fold = runner_lightning.test_outputs
+
+                test_metadata["labels"].append(result_fold['labels'])
+                test_metadata["probs"].append(result_fold['probs'])
+
+                tn, fp, fn, tp = confusion_matrix(result_fold['labels'], result_fold['preds']).ravel()
+                sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0   # Recall / TPR
+                specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0   # TNR
+                bacc = (sensitivity + specificity) / 2
+                #fold_scores.append(bacc)
+                fold_scores.append(roc_auc_score(result_fold['labels'], result_fold['probs']))
+
+            test_labels_all = np.concatenate(test_metadata["labels"])
+            pred_probs_all = np.concatenate(test_metadata["probs"])
             
-            train_loader, val_loader = train.prepare_fold_data(
-                train_fold, val_fold, hps, collate_fn,
-                use_precomputed=args.use_precomputed,
-                precomputed_dir=args.precomputed_dir
-            )
+            #final_score = -log_loss(test_labels_all, pred_probs_all)
+            final_score = roc_auc_score(test_labels_all, pred_probs_all)
 
-            pool_model = pool_net(feature_dim=hps.model.feature_dim, use_tabular=False, **now_params)
-            runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=pos_weight)
-            
-            checkpoint_callback = ModelCheckpoint(
-                dirpath=f"{hps.model_dir}/{fold_outter}",
-                monitor="val/loss",
-                filename=f"pool_{{epoch:02d}}",
-                save_top_k=1,
-                mode="min",
-            )
-            early_stopping = EarlyStopping(monitor="val/loss", patience=7, mode="min", verbose=False)
-            trainer = L.Trainer(max_epochs=10000, callbacks=[checkpoint_callback, early_stopping],
-                accelerator="gpu" if torch.cuda.is_available() else "cpu",
-                devices="auto", default_root_dir=f"{hps.model_dir}/{fold_outter}", deterministic=True)
-            trainer.fit(runner_lightning, train_dataloaders=train_loader, val_dataloaders=val_loader)
-
-            runner_lightning.calibrate_threshold = True
-            trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
-
-            _, test_loader = train.prepare_fold_data(
-                test_fold, test_fold, hps, collate_fn,
-                use_precomputed=args.use_precomputed,
-                precomputed_dir=args.precomputed_dir
-            )
-            trainer.test(runner_lightning, dataloaders=test_loader, ckpt_path="best")
-            result_fold = runner_lightning.test_outputs
-
-            test_metadata["labels"].append(result_fold['labels'])
-            test_metadata["probs"].append(result_fold['probs'])
-
-            tn, fp, fn, tp = confusion_matrix(result_fold['labels'], result_fold['preds']).ravel()
-            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0   # Recall / TPR
-            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0   # TNR
-            bacc = (sensitivity + specificity) / 2
-            #fold_scores.append(bacc)
-            fold_scores.append(roc_auc_score(result_fold['labels'], result_fold['probs']))
-
-        test_labels_all = np.concatenate(test_metadata["labels"])
-        pred_probs_all = np.concatenate(test_metadata["probs"])
-        
-        #final_score = -log_loss(test_labels_all, pred_probs_all)
-        final_score = roc_auc_score(test_labels_all, pred_probs_all)
-
-        # mean_acc = np.mean(fold_scores)
-        # std_acc = np.std(fold_scores)
-        # alpha = 0.0
-        # final_score = mean_acc - alpha * std_acc
-
-        for d in Path(hps.model_dir).glob("fold_*"):
-            if d.is_dir():
-                shutil.rmtree(d)
+            # mean_acc = np.mean(fold_scores)
+            # std_acc = np.std(fold_scores)
+            # alpha = 0.0
+            # final_score = mean_acc - alpha * std_acc
+        finally:
+            shutil.rmtree(trial_precomputed_dir, ignore_errors=True)
+            for d in Path(hps.model_dir).glob("fold_*"):
+                if d.is_dir():
+                    shutil.rmtree(d)
         return final_score
 
     study = optuna.create_study(direction="maximize")

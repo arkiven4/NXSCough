@@ -67,7 +67,9 @@ def build_wav_transform(hparams, sampling_rate):
                 n_fft=hparams.filter_length,
                 win_length=hparams.win_length,
                 hop_length=hparams.hop_length,
-                n_mfcc=13,
+                n_mfcc=hparams.n_mel_channels,
+                fmin=hparams.mel_fmin,
+                fmax=hparams.mel_fmax,
             ),
             dtype=torch.float32,
         )
@@ -114,6 +116,8 @@ def build_wav_transform(hparams, sampling_rate):
                     n_fft=hparams.filter_length,
                     hop_length=hparams.hop_length,
                     win_length=hparams.win_length,
+                    fmin=hparams.mel_fmin,
+                    fmax=hparams.mel_fmax,
                 ) + 1e-6
             ),
             dtype=torch.float32,
@@ -279,9 +283,6 @@ class CoughDatasets(torch.utils.data.Dataset):
                     x = ISD_additive_noise(x, 10, 2)
                     audio = torch.as_tensor(x, dtype=audio.dtype)
 
-                if self.add_noise:
-                    audio = audio + torch.rand_like(audio)
-
             if self.wav_transform is not None:
                 audio = self.wav_transform(audio)  # [80, 224]
                 audio = [audio.detach().cpu().numpy()]
@@ -291,6 +292,9 @@ class CoughDatasets(torch.utils.data.Dataset):
                     audio.append(librosa.feature.delta(audio[0], order=2))
                 audio = np.concatenate(audio, axis=0)
                 audio = torch.from_numpy(audio).float()
+
+            if self.add_noise and self.train:
+                audio = audio + torch.rand_like(audio)
 
             if self.mean_std_norm and hasattr(self, 'wav_stats'):
                 audio = (audio - self.wav_stats['mean_db']) / (self.wav_stats['std_db'] + 1e-6)
@@ -325,6 +329,9 @@ class CoughDatasets(torch.utils.data.Dataset):
 
 
 class CoughDatasetsCollate:
+    """Collates training batches, using a HuggingFace processor's feature extractor
+    when *processor* is provided, otherwise falling back to manual zero-padding."""
+
     def __init__(self, many_data=2, many_tabular=4, processor=None, sampling_rate=16000):
         self.processor = processor
         self.sampling_rate = sampling_rate
@@ -334,79 +341,49 @@ class CoughDatasetsCollate:
     def __call__(self, batch):
         lengths = torch.tensor([x[2].shape[-1] for x in batch])
         lengths_sorted, idx = torch.sort(lengths, descending=True)
-
-        max_len = lengths_sorted[0]
         bsz = len(batch)
 
-        first_wav = batch[0][2]
-        feature_dim = first_wav.shape[1] if first_wav.ndim == 3 else 1
-
-        sorted_indices = torch.zeros(bsz, dtype=torch.long)
         wav_names = []
-        wav_padded = torch.zeros(bsz, feature_dim, lengths_sorted[0], dtype=first_wav.dtype)
-        attention_masks = torch.zeros(bsz, max_len)
-
+        sorted_indices = torch.zeros(bsz, dtype=torch.long)
+        wavs_sorted = []
         dse_ids = torch.zeros(bsz, self.many_data, dtype=torch.float32)
         spk_ids = torch.zeros(bsz, dtype=torch.long)
         gndr_ids = torch.zeros(bsz, dtype=torch.long)
         tabular_ids = torch.zeros(bsz, self.many_tabular, dtype=torch.float32)
+
         for i, j in enumerate(idx):
             sample_idx, name, wav, dse, spk, gndr, tblr = batch[j]
             wav_names.append(name)
             sorted_indices[i] = sample_idx
-
-            wav_padded[i, :, :wav.shape[-1]] = wav
-            attention_masks[i, :wav.shape[-1]] = 1
-
+            wavs_sorted.append(wav)
             dse_ids[i] = dse
             spk_ids[i] = spk
             gndr_ids[i] = gndr
             tabular_ids[i] = tblr.squeeze(0)
 
+        if self.processor is not None:
+            raw_wavs = [w.squeeze().numpy() for w in wavs_sorted]
+            audio_inputs = self.processor.feature_extractor(
+                raw_wavs,
+                sampling_rate=self.sampling_rate,
+                return_tensors="pt",
+                truncation=False,
+                return_attention_mask=True,
+                padding=True,
+            )
+            wav_padded = audio_inputs["input_features"]       # [B, n_mels, T]
+            attention_masks = audio_inputs["attention_mask"]  # [B, T]
+        else:
+            first_wav = wavs_sorted[0]
+            feature_dim = first_wav.shape[1] if first_wav.ndim == 3 else 1
+            max_len = lengths_sorted[0]
+            wav_padded = torch.zeros(bsz, feature_dim, max_len, dtype=first_wav.dtype)
+            attention_masks = torch.zeros(bsz, max_len)
+            for i, wav in enumerate(wavs_sorted):
+                wav_padded[i, :, :wav.shape[-1]] = wav
+                attention_masks[i, :wav.shape[-1]] = 1
+
         return wav_names, wav_padded, None, attention_masks, dse_ids, [spk_ids, gndr_ids, tabular_ids, sorted_indices]
-
-
-class CoughDatasetsProcessorCollate():
-    """ Zero-pads model inputs and targets based on number of frames per step
-    """
-
-    def __init__(self, many_data=2, processor=None, sampling_rate=16000):
-        self.processor = processor
-        self.sampling_rate = sampling_rate
-        self.many_data = many_data
-
-    def __call__(self, batch):
-        """Collate's training batch from normalized text and mel-spectrogram
-        PARAMS
-        ------
-        batch: [text_normalized, mel_normalized]
-        (Index, wavname, wav1, wav2, dse_id, int(spk_id), int(gndr_id), tabular)
-        """
-        wav_name = [x[1] for x in batch]
-        wavs = [x[2].squeeze().numpy() for x in batch]  # list[np.ndarray]
-        dse_ids = torch.stack([x[4].squeeze(0) for x in batch])
-        spk_ids = torch.stack([torch.tensor(x[5]) for x in batch])
-        gndr_ids = torch.stack([torch.tensor(x[6]) for x in batch])
-
-        audio_inputs = self.processor.feature_extractor(
-            wavs,
-            sampling_rate=self.sampling_rate,
-            return_tensors="pt",
-            # padding="max_length",
-            truncation=False,  # ?
-            return_attention_mask=True,
-            padding=True
-        )
-        wav_padded = audio_inputs["input_features"]           # [B, n_mels, T]
-        attention_masks = audio_inputs["attention_mask"]      # [B, T]
-
-        B, n_mels, T = wav_padded.shape
-        dummy_wav = torch.empty(
-            (B, n_mels, T),
-            dtype=wav_padded.dtype
-        )
-
-        return wav_name, wav_padded, dummy_wav, attention_masks, dse_ids, [spk_ids, None, gndr_ids, None]
 
 
 class CoughDetectionRatioBatchSampler(Sampler):

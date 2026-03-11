@@ -1,0 +1,215 @@
+\documentclass[aspectratio=169]{beamer}
+
+\usetheme{Madrid}
+\usecolortheme{default}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{siunitx}
+
+\title{Mini Report: Unsupervised Refinement on Qwen3 Audio Embeddings}
+\author{NXSCough Experiments}
+\date{\today}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+\begin{frame}{Pipeline Summary}
+\begin{enumerate}
+  \item Extract embeddings with \texttt{Qwen3\_Extractor} (mean+std pooled representation).
+  \item Baseline supervised evaluation across 5 classifiers.
+  \item Harmonize embedding space with empirical Bayes ComBat.
+  \item Detect/remove outliers (Isolation Forest + centroid distance ensemble, 5\%).
+  \item Estimate acoustic TB likelihood (kNN + GMM posterior ensemble).
+  \item Relabel TB samples into:
+  \begin{itemize}
+    \item \textbf{Acoustic-TB} (high score),
+    \item \textbf{Label-only-TB} (low score), then filter label-only TB.
+  \end{itemize}
+\end{enumerate}
+\end{frame}
+
+\begin{frame}{Qwen3 Extractor Architecture}
+\begin{itemize}
+  \item Backbone: audio tower of \texttt{Qwen3-Omni-30B-A3B-Thinking}, used as a \textbf{frozen feature extractor}.
+  \item Audio pipeline:
+  \[
+    \text{wav} \rightarrow \text{Mel frontend} \rightarrow \text{Qwen3 audio encoder (3$\times$ CNN stride)} \rightarrow \text{frame embeddings}
+  \]
+  \item The encoder outputs frame-level hidden states with base dimension \textbf{2048}.
+  \item Temporal pooling: compute mean $\mu$ and standard deviation $\sigma$ over the time axis.
+  \item Final utterance embedding:
+  \[
+    z = [\mu\,;\,\sigma] \in \mathbb{R}^{4096}
+  \]
+  Concatenating mean and std doubles the dimension to \textbf{4096}, which is used for all downstream experiments.
+\end{itemize}
+\begin{block}{Goal}
+  Extract a fixed-length, TB-relevant audio representation from raw waveforms without any fine-tuning.
+\end{block}
+\end{frame}
+
+\begin{frame}{Classifier Evaluation Protocol}
+\begin{itemize}
+  \item Five classifiers are compared on the same embedding space:
+  \begin{itemize}
+    \item Logistic Regression, MLP, SVM (RBF), Random Forest, Gradient Boosting.
+  \end{itemize}
+  \item Each classifier is wrapped in a pipeline:
+  \[
+    \text{StandardScaler} \rightarrow \text{PCA}(50) \rightarrow \text{Classifier}
+  \]
+  \item Cross-validation uses \texttt{StratifiedGroupKFold} with participant ID as group key,
+        ensuring no patient appears in both train and validation folds simultaneously.
+  \item Training is done on CODA (DB0); external evaluation is done on CIRDZ (DB1).
+  \item Final reported score: mean AUROC across folds, then averaged across all classifiers.
+\end{itemize}
+\begin{block}{Goal}
+  Evaluate TB detection quality at each pipeline stage using a consistent, leakage-free protocol across multiple classifiers.
+\end{block}
+\end{frame}
+
+\begin{frame}{ComBat Harmonization}
+\begin{itemize}
+  \item ComBat is an empirical Bayes batch-effect correction method originally developed for genomics.
+  \item Each database is treated as one batch. It estimates and removes:
+  \begin{itemize}
+    \item additive batch shift $\hat{\gamma}$ (location),
+    \item multiplicative batch scale $\hat{\delta}$ (variance).
+  \end{itemize}
+  \item Harmonization quality is evaluated with Ridge-based predictability of database labels in PCA space:
+  \begin{itemize}
+    \item Raw: $R^2_{\text{db}} = 0.0198$, $R^2_{\text{dis}} = 0.0023$
+    \item ComBat: $R^2_{\text{db}} \approx $\num{2.16e-8}, $R^2_{\text{dis}} = 0.0017$
+  \end{itemize}
+  \item After ComBat, database identity (CODA vs.\ CIRDZ) is no longer predictable from the embedding space, while disease information is partially preserved.
+\end{itemize}
+\begin{block}{Purpose}
+  Reduce dataset-specific (batch) variation in embeddings so that downstream classifiers focus on TB-related acoustic structure rather than database identity.
+\end{block}
+\end{frame}
+
+\begin{frame}{ComBat Result}
+  \centering
+  \includegraphics[width=0.94\linewidth,keepaspectratio]{figures/combat.png}
+
+  \vspace{0.3em}
+  \scriptsize
+  \textbf{Caption:} PCA projections of embeddings before (left) and after (right) ComBat harmonization. Database-related variation is reduced after correction. External AUROC on CIRDZ improves from 0.4994 to 0.5119.
+\end{frame}
+
+\begin{frame}{Outlier Detection Strategy}
+\begin{itemize}
+  \item Assumed contamination rate: \textbf{5\%}.
+  \item Two complementary scores are combined:
+  \begin{itemize}
+    \item \textbf{Isolation Forest}: detects globally anomalous points in PCA-reduced (50-dim) embedding space.
+    \item \textbf{Per-database centroid distance}: flags samples whose distance from the database centroid exceeds $\sigma_{\text{threshold}} = 2.5$ standard deviations, normalized by Median Absolute Deviation.
+  \end{itemize}
+  \item Weighted ensemble outlier score:
+  \[
+    s = 0.55\,s_{\text{IF}} + 0.45\,s_{\text{centroid}}
+  \]
+  \item Samples in the top 5\% of $s$ are removed before the next stage.
+\end{itemize}
+\begin{block}{Purpose}
+  Remove samples whose embeddings are unlikely to represent clean cough signals, such as noisy recordings or non-cough acoustic content.
+\end{block}
+\end{frame}
+
+\begin{frame}{Outlier Removal Result}
+  \centering
+  \includegraphics[width=0.94\linewidth,keepaspectratio]{figures/outlier.png}
+
+  \vspace{0.3em}
+  \scriptsize
+  \textbf{Caption:} Left: detected outliers (\texttimes{}) overlaid on PCA projection. Right: retained inlier cloud after cleaning.\quad
+  Removed \textbf{836} samples (5.0\%). Mean AUROC across classifiers increases to 0.6683 and stabilises the embedding distribution before TB subtype modeling.
+\end{frame}
+
+\begin{frame}{Acoustic TB Likelihood Modeling}
+\begin{itemize}
+  \item \textbf{kNN TB score} --- makes no distributional assumption; judges each sample by its local neighborhood:
+  \begin{itemize}
+    \item Compute mean distance to $k$ TB neighbors ($d_{\text{TB}}$) and to $k$ Non-TB neighbors ($d_{\text{NonTB}}$).
+    \item $\text{score} = d_{\text{NonTB}} / (d_{\text{TB}} + d_{\text{NonTB}})$. High score $\Rightarrow$ closer to TB cluster $\Rightarrow$ higher TB likelihood.
+  \end{itemize}
+  \item \textbf{GMM posterior} --- fits class-conditional density models to handle multi-modal acoustic subtypes:
+  \begin{itemize}
+    \item Fit separate GMMs on TB and Non-TB embeddings (components selected by BIC).
+    \item Score $= P(\mathrm{TB}\mid x)$ via log-sum-exp stable Bayesian posterior. High score $\Rightarrow$ higher TB likelihood.
+  \end{itemize}
+  \item Final acoustic TB likelihood: simple average of kNN and GMM scores.
+\end{itemize}
+\begin{block}{Goal}
+  Assign each sample an unsupervised score reflecting how acoustically TB-like it is in the embedding space, to enable label refinement without additional annotations.
+\end{block}
+\end{frame}
+
+\begin{frame}{Acoustic TB Likelihood Result}
+  \centering
+  \includegraphics[width=0.90\linewidth,height=0.72\textheight,keepaspectratio]{figures/TB Likelihood.png}
+
+  \vspace{0.25em}
+  \scriptsize
+  \textbf{Caption:} Top: score distributions for TB and Non-TB. Bottom: box plots with Mann--Whitney U significance test.\quad
+  Ensemble mean scores: TB $= 0.677 \pm 0.146$, Non-TB $= 0.323 \pm 0.117$.
+\end{frame}
+
+\begin{frame}{Relabeling Strategy}
+\begin{itemize}
+  \item Only original TB-labeled samples are relabeled; Non-TB samples are unchanged.
+  \item Threshold defined as the median acoustic score among TB samples:
+  \[
+    \tau = \mathrm{median}\bigl(\{s_i : y_i = \text{TB}\}\bigr)
+  \]
+  \item Interpretation by position relative to $\tau$:
+  \begin{itemize}
+    \item score $\geq \tau$ $\Rightarrow$ \textbf{Acoustic-TB}: embedding strongly matches the TB acoustic profile.
+    \item score $< \tau$ $\Rightarrow$ \textbf{Label-only-TB}: annotated as TB but acoustically ambiguous; excluded from training.
+  \end{itemize}
+  \item This is unsupervised label refinement, not class balancing.
+\end{itemize}
+\begin{block}{Purpose}
+  Refine noisy TB annotations by retaining only samples that are both annotated as TB \emph{and} acoustically consistent with the TB embedding cluster.
+\end{block}
+\end{frame}
+
+\begin{frame}{Relabeling Result}
+  \centering
+  \includegraphics[width=0.90\linewidth,keepaspectratio]{figures/TB Likelihood - After plit.png}
+
+  \vspace{0.3em}
+  \scriptsize
+  \textbf{Caption:} Score distribution after relabeling. Left of the dashed threshold $\tau$: Label-only-TB (acoustically ambiguous, excluded). Right of $\tau$: Acoustic-TB (kept).\quad
+  Acoustic-TB: 1893 (50\%), mean score 0.8030. Label-only-TB: 1893 (50\%), mean score 0.5518.
+\end{frame}
+
+\begin{frame}{Classification Performance (AUROC)}
+\small
+\begin{table}
+\centering
+\begin{tabular}{lcc}
+\toprule
+Stage & Mean AUROC (CV, CODA) & Mean AUROC (External, CIRDZ) \\
+\midrule
+Baseline & 0.6613 & 0.4994 \\
+After ComBat & 0.6623 & 0.5119 \\
+After Outlier Removal & 0.6683 & 0.5094 \\
+After Acoustic-TB Filtering & 0.7993 & 0.7197 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\vspace{0.4em}
+\footnotesize
+\textbf{Summary:} ComBat and outlier removal provide incremental gains. Acoustic TB relabeling is the dominant step, yielding a $+$13\% gain in cross-validation AUROC and a $+$22\% gain on external DB1 evaluation.
+\end{frame}
+
+\end{document}

@@ -43,7 +43,6 @@ import utils
 from cough_datasets import (
     CoughDatasets,
     CoughDatasetsCollate,
-    CoughDatasetsProcessorCollate,
     CoughDetectionRatioBatchSampler,
     CoughDiseaseBinaryBatchSampler,
     PatientBatchSampler, AutoPatientBatchSampler
@@ -174,7 +173,7 @@ def get_collate_fn(hps):
     """Get appropriate collate function based on model type."""
     if "qwen" in hps.model.pooling_model.lower():
         from transformers import Qwen3OmniMoeProcessor
-        collate_fn = CoughDatasetsProcessorCollate(
+        collate_fn = CoughDatasetsCollate(
             hps.data.many_class,
             processor=Qwen3OmniMoeProcessor.from_pretrained(
                 "/run/media/fourier/Data1/Pras/pretrain_models/Qwen3-Omni-30B-A3B-Thinking"
@@ -326,6 +325,7 @@ def prepare_fold_data(train_fold, val_fold, hps, collate_fn, use_precomputed=Fal
         val_dataset.set_feature_path_column(feature_path_col)
     
     # Create sampler
+    # TODO : ADD Control in Hyperparam
     #sampler = create_sampler(train_fold, hps)
     sampler = None
     
@@ -336,7 +336,7 @@ def prepare_fold_data(train_fold, val_fold, hps, collate_fn, use_precomputed=Fal
     train_loader = DataLoader(
         train_dataset, 
         num_workers=28, 
-        #sampler=sampler, 
+        sampler=sampler, 
         batch_size=hps.train.batch_size,
         #batch_sampler=sampler,
         pin_memory=True, 

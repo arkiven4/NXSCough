@@ -62,15 +62,15 @@ def precompute_features(df, hparams, output_dir, split_name="train"):
             # Get the audio path
             row = df.iloc[idx]
             if hparams.cough_detection:
-                wavname = row[0]
+                wavname = row.iloc[0]
             else:
-                wavname = row[0]
+                wavname = row.iloc[0]
             
             audio_path = os.path.join(hparams.db_path, wavname)
             
             # Use CoughDatasets.get_audio() to extract features
             # This ensures consistency with training
-            dse_id = row[1] if len(row) > 1 else None
+            dse_id = row.iloc[1] if len(row) > 1 else None
             features, _ = dataset.get_audio(audio_path, dse_id=dse_id)
             
             # Remove batch dimension if present
