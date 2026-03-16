@@ -64,19 +64,13 @@ python train_hypersearch.py  --init --model_name searchlstm10fold_gammmaspectogr
 python train_hypersearch.py  --init --model_name searchlstm10fold_spectogram --pooling_model BiLSTMSelfAttASPClassifier --feature_type spectogram \
   --feature_dim 1025 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/spectogram
 
+# =========================================== Train best hyperparameter 2  ==========================================================
+python train_hypersearch.py  --init --model_name search_bilstm_mfcc --pooling_model BiLSTMClassifier --feature_type mfcc \
+  --feature_dim 13 --config_path configs/general.json
 
-python precompute_features.py \
-  --config configs/general.json  \
-  --output_dir ./precomputed_features/logmel_filtered \
-  --feature_type logmel
+python train_hypersearch.py  --init --model_name search_resnet_mfcc --pooling_model ResNet34ManualClassifier --feature_type mfcc \
+  --feature_dim 13 --config_path configs/general.json
 
-python precompute_features.py \
-  --config configs/general.json  \
-  --output_dir ./precomputed_features/mfcc_dd \
-  --feature_type mfcc
-
-python train_hypersearch.py  --init --model_name search_bilstm_logmelfiltered --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
-  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel_filtered
 # =========================================== Train best hyperparameter  ==========================================================
 python train.py  --init --model_name try_logmel --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
   --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel

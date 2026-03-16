@@ -193,6 +193,56 @@ class LSTMAudioClassifier1(nn.Module):
             "embeddings": embedding,
         }
 
+class BiLSTMClassifier(nn.Module):
+    def __init__(
+        self,
+        feature_dim: int = 39,
+        hidden_size: int = 512,
+        lstmnum_layers: int = 2,
+        hidden_dim_classifier: int = 128,
+        dropout: float = 0.1,
+        output_dim: int = 1, 
+        **kwargs
+    ):
+        super().__init__()
+
+        self.lstm = nn.LSTM(
+            input_size=feature_dim,
+            hidden_size=hidden_size,
+            num_layers=lstmnum_layers,
+            dropout=0.2 if lstmnum_layers > 1 else 0.0,
+            bidirectional=True,
+            batch_first=True,
+        )
+
+        self.norm = nn.LayerNorm(hidden_size * 2)
+        self.pool = modules.AttentiveStatisticsPooling(channels=hidden_size * 2)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size * 4, hidden_dim_classifier),
+            nn.BatchNorm1d(hidden_dim_classifier),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim_classifier, output_dim)
+        )
+
+    def forward(self, x, tabular_ids=None, train=False, **kwargs):
+        """
+        x: (B, n_mels, T) mel-spectrogram frames
+        tabular_ids: (B, tab_dim)
+        """
+        # ===== AUDIO ENCODING =====
+        x = x.permute(0, 2, 1)
+        audio_feat, _ = self.lstm(x)           # (B, T, 2H)
+        audio_feat = self.norm(audio_feat)
+        
+        audio_feat, asp_weights = self.pool(audio_feat.permute(0, 2, 1)) # torch.Size([128, 2048])
+        disease_logits = self.classifier(audio_feat)
+        return {
+            "disease_logits": disease_logits,
+            "asp_weights": asp_weights,
+        }
+
 class BiLSTMSelfAttASPClassifier(nn.Module):
     def __init__(
         self,
@@ -291,13 +341,6 @@ class BiLSTMSelfAttASPClassifier(nn.Module):
         # ===== HYBRID MODE =====
         if self.use_tabular and tabular_ids is not None:
             tab_feat = self.tab_proj(tabular_ids)
-
-            # if self.training:
-            #     r = torch.rand(1, device=audio_feat.device)
-            #     # if r < 0.2:
-            #     #     audio_feat = torch.zeros_like(audio_feat)
-            #     if r < 0.2 + 0.2:
-            #         tab_feat = torch.zeros_like(tab_feat)
 
             # ---- Dynamic Gating ----
             if self.fusion_type == "gating":

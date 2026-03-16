@@ -1,5 +1,6 @@
 # Standard library imports
 import argparse
+import gc
 import importlib.util
 import inspect
 import json
@@ -59,6 +60,22 @@ from precompute_features import precompute_features
 torch.set_float32_matmul_precision("medium")
 cmap = cm.get_cmap("viridis")
 
+
+def _is_cuda_oom_error(exc: Exception) -> bool:
+    visited = set()
+    cur = exc
+    while cur is not None and id(cur) not in visited:
+        visited.add(id(cur))
+        if isinstance(cur, torch.cuda.OutOfMemoryError):
+            return True
+        msg = str(cur).lower()
+        if "out of memory" in msg and "cuda" in msg:
+            return True
+        if "cublas_status_alloc_failed" in msg or "cudnn_status_alloc_failed" in msg:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
 #######################################################################
 # MAIN SCRIPT
 #######################################################################
@@ -113,14 +130,14 @@ def main(cli_args=None):
             "hidden_dim_classifier": trial.suggest_categorical("hidden_dim_classifier", [8, 16, 32, 64, 128, 192, 256, 384, 512]),
             "dropout": trial.suggest_float("dropout", 0.1, 0.9),
 
-            "hidden_size": trial.suggest_categorical("hidden_size", [8, 16, 32, 64, 128, 192, 256, 384, 512]),
-            "lstmnum_layers": trial.suggest_int("lstmnum_layers", 1, 4),
-            "att_head": trial.suggest_categorical("att_head", [1, 2, 4, 8]),
+            # "hidden_size": trial.suggest_categorical("hidden_size", [8, 16, 32, 64, 128, 192, 256, 384, 512]),
+            # "lstmnum_layers": trial.suggest_int("lstmnum_layers", 1, 4),
+            # "att_head": trial.suggest_categorical("att_head", [1, 2, 4, 8]),
             # "att_head_fusion": trial.suggest_categorical("att_head_fusion", [1, 2, 4, 8]),
             # "fusion_type": trial.suggest_categorical("fusion_type", ["gating", "cross_attn", "film"]),
 
-            # "resnet_type": trial.suggest_categorical("resnet_type", ["resnet18", "resnet34", "resnet50", "resnet101"]),
-            # "num_layers_resnet": trial.suggest_int("num_layers_resnet", 1, 4),
+            "resnet_type": trial.suggest_categorical("resnet_type", ["resnet18", "resnet34", "resnet50", "resnet101"]),
+            "num_layers_resnet": trial.suggest_int("num_layers_resnet", 1, 4),
         }
 
         #multimask_augment = trial.suggest_categorical("multimask_augment", [True, False])
@@ -139,12 +156,12 @@ def main(cli_args=None):
             "filter_length": filter_length,
             "hop_length": trial.suggest_categorical("hop_length", [32, 64, 128, 256, 512]),
             "win_length": win_length,
-            "n_mel_channels": trial.suggest_categorical("n_mel_channels", [40, 64, 80, 128, 160]), # [6, 13, 13 * 2, 13 * 3, 13 * 4] [40, 64, 80, 128, 160]
+            "n_mel_channels": trial.suggest_categorical("n_mel_channels", [6, 13, 13 * 2, 13 * 3, 13 * 4]), # [6, 13, 13 * 2, 13 * 3, 13 * 4] [40, 64, 80, 128, 160]
             "mel_fmin": trial.suggest_categorical("mel_fmin", [0, 20, 40, 80, 100, 120, 200, 400, 500, 600]),
             "mel_fmax": trial.suggest_categorical("mel_fmax", [5000, 6000, 7000, 8000]),
 
-            "delta_feature": trial.suggest_categorical("delta_feature", [True, False]),
-            "deltadelta_feature": trial.suggest_categorical("deltadelta_feature", [True, False]),
+            # "delta_feature": trial.suggest_categorical("delta_feature", [True, False]),
+            # "deltadelta_feature": trial.suggest_categorical("deltadelta_feature", [True, False]),
 
             # "augment_data": trial.suggest_categorical("augment_data", [True, False]),
             # "augment_prob": trial.suggest_float("augment_prob", 0.1, 0.8),
@@ -169,23 +186,21 @@ def main(cli_args=None):
         hps.data.mel_fmin = data_params["mel_fmin"]
         hps.data.mel_fmax = data_params["mel_fmax"]
 
-        hps.data.delta_feature = data_params["delta_feature"]
-        hps.data.deltadelta_feature = data_params["deltadelta_feature"]
+        # hps.data.delta_feature = data_params["delta_feature"]
+        # hps.data.deltadelta_feature = data_params["deltadelta_feature"]
 
         # hps.data.augment_data = data_params["augment_data"]
         # hps.data.augment_prob = data_params["augment_prob"]
         # hps.data.augment_rawboost = data_params["augment_rawboost"]
         # hps.data.add_noise = data_params["add_noise"]
 
-        feat_mult = 1
-        if data_params["delta_feature"]:
-            feat_mult += 1
-        if data_params["deltadelta_feature"]:
-            feat_mult += 1
-        hps.model.feature_dim = data_params["n_mel_channels"] * feat_mult
-        print(feat_mult)
-        print(data_params["n_mel_channels"])
-        print(hps.model.feature_dim)
+        # feat_mult = 1
+        # if data_params["delta_feature"]:
+        #     feat_mult += 1
+        # if data_params["deltadelta_feature"]:
+        #     feat_mult += 1
+        # hps.model.feature_dim = data_params["n_mel_channels"] * feat_mult
+        hps.model.feature_dim = data_params["n_mel_channels"]
 
         # Precompute features for this trial's spectrogram config into a temp dir
         trial_precomputed_dir = tempfile.mkdtemp(prefix=f"trial{trial.number}_", dir=hps.model_dir)
@@ -252,6 +267,11 @@ def main(cli_args=None):
                 #fold_scores.append(bacc)
                 fold_scores.append(roc_auc_score(result_fold['labels'], result_fold['probs']))
 
+                del trainer, runner_lightning, pool_model, train_loader, val_loader, test_loader
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
             test_labels_all = np.concatenate(test_metadata["labels"])
             pred_probs_all = np.concatenate(test_metadata["probs"])
             
@@ -262,22 +282,54 @@ def main(cli_args=None):
             # std_acc = np.std(fold_scores)
             # alpha = 0.0
             # final_score = mean_acc - alpha * std_acc
+        except Exception as exc:
+            if _is_cuda_oom_error(exc):
+                logger.warning(f"Trial {trial.number} skipped due to CUDA OOM: {exc}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                raise optuna.exceptions.TrialPruned("Skipped trial due to CUDA OOM")
+            raise
         finally:
             shutil.rmtree(trial_precomputed_dir, ignore_errors=True)
             for d in Path(hps.model_dir).glob("fold_*"):
                 if d.is_dir():
                     shutil.rmtree(d)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         return final_score
 
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=70) # 70 -> 5 fold, 35 -> 10 fold
+    def on_trial_end(study, trial):
+        try:
+            best_trial = study.best_trial
+        except ValueError:
+            return
 
-    print("Best params:", study.best_trial.params)
+        best_result = {
+            "params": best_trial.params,
+            "score": study.best_value,
+            "study": study,
+        }
+        with open(f"{hps.model_dir}/optuna_best.pkl", "wb") as f:
+            pickle.dump(best_result, f)
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=200,
+                   callbacks=[on_trial_end]) # 70 -> 5 fold, 35 -> 10 fold
+
+    try:
+        best_trial = study.best_trial
+    except ValueError:
+        print("No completed trials yet (all trials may have been pruned/failed).")
+        return
+
+    print("Best params:", best_trial.params)
     print("Best stability-aware score:", study.best_value)
 
     best_result = {
-        "params": study.best_trial.params,
+        "params": best_trial.params,
         "score": study.best_value,
+        "study": study,
     }
     with open(f"{hps.model_dir}/optuna_best.pkl", "wb") as f:
         pickle.dump(best_result, f)
