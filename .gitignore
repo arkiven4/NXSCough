@@ -22,3 +22,5 @@ test.ipynb
 *.ckpt
 pretrained/encoder-operaGT.ckpt
 precomputed_features_bak
+*.log
+*.pdf
