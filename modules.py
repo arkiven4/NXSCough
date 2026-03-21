@@ -886,6 +886,110 @@ class CRFSequenceHead(nn.Module):
     def decode(self, emissions, mask):
         return self.crf.decode(emissions, mask=mask)
 
+#################################################
+#  TGB
+#################################################
+
+
+from typing import Optional, List, Tuple
+
+class StochasticGateLayer(nn.Module):
+    """
+    Learnable sparse feature selector via Stochastic Gates.
+
+    Each feature i has a gate parameter μᵢ.
+    - Train: z = clamp(μ + N(0, σ²), 0, 1) — differentiable hard gate
+    - Eval : z = clamp(μ, 0, 1)             — deterministic
+    - L0 penalty approximated by Φ((μ + 0.5) / σ)
+
+    Reference: Yamada et al., "Feature selection using stochastic gates", ICML 2020.
+    """
+
+    def __init__(self, n_features: int, sigma: float = 0.5):
+        super().__init__()
+        self.n_features = n_features
+        self.sigma = sigma
+
+        # μ initialised near 0.5 so gates start half-open (explore all features)
+        self.mu = nn.Parameter(torch.zeros(n_features))
+        nn.init.normal_(self.mu, mean=0.0, std=0.01)
+
+    # ── gates ───────────────────────────────────
+    def get_gates(self) -> torch.Tensor:
+        """Deterministic gates for evaluation / feature ranking."""
+        return self.mu.clamp(0.0, 1.0)
+
+    def sample_gates(self) -> torch.Tensor:
+        """Stochastic gates for training (adds Gaussian noise)."""
+        eps = torch.randn_like(self.mu) * self.sigma
+        return (self.mu + eps).clamp(0.0, 1.0)
+
+    # ── L0 regularisation ───────────────────────
+    def l0_penalty(self) -> torch.Tensor:
+        """
+        Soft approximation of L0 norm = expected number of active gates.
+        Φ is the standard-normal CDF, used here as a smooth 0/1 probability.
+        """
+        return torch.sigmoid((self.mu + 0.5) / self.sigma).sum()
+
+    # ── forward ─────────────────────────────────
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: (batch, n_features)
+        Returns:
+            x_masked : (batch, n_features)  — gated input
+            gates    : (n_features,)        — gate values used this pass
+        """
+        if self.training:
+            gates = self.sample_gates()
+        else:
+            gates = self.get_gates()
+        return x * gates.unsqueeze(0), gates
+
+    # ── introspection ────────────────────────────
+    def active_count(self, threshold: float = 0.5) -> int:
+        """Number of features currently above threshold (eval mode)."""
+        return int((self.get_gates() > threshold).sum().item())
+
+    def top_k_indices(self, k: int) -> torch.Tensor:
+        """Indices of the k highest-gate features."""
+        return self.get_gates().topk(k).indices
+
+
+class MLPHead(nn.Module):
+    """
+    3-layer MLP with BatchNorm + Dropout.
+    Input dim matches n_features (full 6578 — STG zeroes out inactive ones).
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        hidden_dims: Tuple[int, ...] = (256, 64),
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+
+        layers: list = []
+        in_dim = n_features
+        for h in hidden_dims:
+            layers += [
+                nn.Linear(in_dim, h),
+                nn.BatchNorm1d(h),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
+            ]
+            in_dim = h
+        layers.append(nn.Linear(in_dim, 1))   # binary output (logit)
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+
 # class LayerNorm(nn.Module):
 #   def __init__(self, channels, eps=1e-4):
 #       super().__init__()

@@ -159,6 +159,7 @@ class CoughClassificationRunner(L.LightningModule):
     def on_train_batch_end(self, outputs, batch, batch_idx):
         lr = self.optimizers().param_groups[0]["lr"]
         self.log("train/lr", lr, sync_dist=True)
+        self.model.lambda_sparsity = self.model._lambda(batch_idx + 1)
 
     # def on_train_epoch_end(self):
     #     self.loss_fn.step_lambda(factor=1.1)

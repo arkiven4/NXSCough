@@ -13,6 +13,7 @@ from torchcrf import CRF
 import numpy as np
 import gc
 import torch
+from typing import Optional, List, Tuple
 
 
 import torchvision
@@ -602,3 +603,164 @@ class AST_Try1(nn.Module):
         return {
             "disease_logits": disease_logits,
         }
+
+
+class AST_Try1(nn.Module):
+    def __init__(self, input_size, output_dim, lora_rank, lora_alpha, target_modules, spk_dim, **kwargs):
+        super(AST_Try1, self).__init__()
+
+        from transformers import ASTForAudioClassification
+        temp_model = ASTForAudioClassification.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
+        self.audio_tower = temp_model.audio_spectrogram_transformer
+        self.audio_tower.cuda()
+        self.model_config = temp_model.config
+        del self.model_config.label2id
+        del self.model_config.id2label
+        del temp_model
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        self.layernorm = nn.LayerNorm(self.model_config.hidden_size, eps=self.model_config.layer_norm_eps)
+        self.classifier = nn.Linear(self.model_config.hidden_size, 1)
+
+    def forward(self, input_features, attention_mask=None, **kwargs):
+        input_features = input_features.permute(0, 2, 1)
+        pooled_output = self.audio_tower(input_values=input_features).pooler_output
+        disease_logits = self.classifier(pooled_output)
+
+        return {
+            "disease_logits": disease_logits,
+        }
+
+
+class TBSTGClassifier(nn.Module):
+    """
+    TB vs Non-TB classifier with built-in sparse feature selection.
+
+    Architecture:
+        raw features (6578) → STG layer → masked features
+                                         → MLP head → TB logit
+
+    After training, call .feature_importance_report() to get the
+    ~30 features that truly matter for TB classification.
+
+    Args:
+        n_features    : number of OpenSMILE features (default 6578)
+        hidden_dims   : MLP hidden layer sizes
+        dropout       : dropout probability in MLP
+        sigma         : noise std for stochastic gates
+        target_k      : desired number of surviving features (used only
+                        to set a sensible lambda_sparsity default)
+    """
+
+    def __init__(
+        self,
+        feature_dim: int = 6578,
+        dropout: float = 0.3, **kwargs
+    ):
+        super().__init__()
+        self.n_features = feature_dim
+        self.sigma = 0.5
+
+        self.anneal_epochs = 40
+        self.lambda_start = 5e-3
+        self.lambda_max = 5e-2
+
+        self.gate_layer = modules.StochasticGateLayer(self.n_features, sigma=self.sigma)
+        self.classifier = modules.MLPHead(self.n_features, (256, 64), dropout)
+
+        self._feature_names: Optional[List[str]] = None
+        self.lambda_sparsity = self._lambda(1)
+
+    def calc_additional_loss(self, out_model, batchs):
+        sparsity_loss = self.gate_layer.l0_penalty() / self.gate_layer.n_features  # normalised
+        sparsity_loss = self.lambda_sparsity * sparsity_loss
+        return sparsity_loss
+
+    def _lambda(self, epoch: int) -> float:
+        """Linear ramp from lambda_start to lambda_max over anneal_epochs."""
+        t = min(epoch / max(self.anneal_epochs, 1), 1.0)
+        return self.lambda_start + t * (self.lambda_max - self.lambda_start)
+
+    # ── forward ─────────────────────────────────
+    def forward(self, input_features, attention_mask=None, **kwargs):
+        """
+        Returns:
+            logits : (batch,)           — raw logits (pass through sigmoid for prob)
+            gates  : (n_features,)      — gate values used this forward pass
+        """
+        input_features = input_features.squeeze(-1)
+        x_masked, gates = self.gate_layer(input_features)
+        disease_logits = self.classifier(x_masked)
+        return {
+            "disease_logits": disease_logits,
+            "gates": gates,
+        }
+
+    # ── feature analysis ────────────────────────
+    def gate_values(self) -> np.ndarray:
+        """Gate weights (deterministic, eval) as numpy array."""
+        return self.gate_layer.get_gates().detach().cpu().numpy()
+
+    def top_features(
+        self,
+        k: Optional[int] = None,
+        threshold: float = 0.01,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Returns (indices, gate_values) of surviving features.
+
+        Args:
+            k         : return exactly top-k by gate value (overrides threshold)
+            threshold : if k is None, keep features with gate > threshold
+
+        Returns:
+            indices    : 1-D int array of feature indices
+            gate_vals  : corresponding gate values (descending)
+        """
+        gates = self.gate_values()
+        if k is not None:
+            idx = np.argsort(gates)[::-1][:k]
+        else:
+            idx = np.where(gates > threshold)[0]
+            idx = idx[np.argsort(gates[idx])[::-1]]   # sort descending
+        return idx.astype(int), gates[idx]
+
+    def feature_importance_report(
+        self,
+        feature_names: Optional[List[str]] = None,
+        top_k: Optional[int] = 30,
+        threshold: float = 0.01,
+    ) -> str:
+        """
+        Human-readable report of the most important features.
+
+        Args:
+            feature_names : list of length n_features (e.g. OpenSMILE names)
+            top_k         : show this many features (None = all above threshold)
+            threshold     : gate threshold for "active"
+        """
+        idx, vals = self.top_features(k=top_k, threshold=threshold)
+        names = feature_names if feature_names is not None else [f"feat_{i}" for i in range(self.n_features)]
+        active_count = self.gate_layer.active_count(threshold)
+
+        lines = [
+            "=" * 62,
+            f"  TB Feature Importance Report",
+            f"  Active features (gate > {threshold}): {active_count} / {self.n_features}",
+            "=" * 62,
+            f"{'Rank':<6}{'Feature name':<42}{'Gate value':>10}",
+            "-" * 62,
+        ]
+        for rank, (i, v) in enumerate(zip(idx, vals), 1):
+            bar = "█" * int(v * 20)
+            lines.append(f"{rank:<6}{names[i]:<42}{v:>10.4f}  {bar}")
+        lines.append("=" * 62)
+        return "\n".join(lines)
+
+    def set_feature_names(self, names: List[str]) -> None:
+        """Store feature names for later reporting."""
+        assert len(names) == self.n_features
+        self._feature_names = names

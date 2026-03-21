@@ -655,6 +655,7 @@ def main(cli_args=None):
     # SECTION: Setup Logger, Dataloader
     # =============================================================
     fold_thr = []
+    additional_array = []
     oof_p = np.zeros(len(df_train), dtype=float)
     oof_label = np.zeros(len(df_train), dtype=float)
     
@@ -757,15 +758,18 @@ def main(cli_args=None):
         }
         write_results_to_file("result_overall.txt", results_dict, f"{hps.model_dir}", {0: "CIRDZ " + str(fold_outter)})
 
+        additional_array.append(runner_lightning.model.gate_layer.get_gates().detach().cpu().numpy())
+
         if os.path.exists(production_path):
             os.remove(production_path)
 
-    with open(f"{hps.model_dir}/info_run.pkl", "wb") as f:
-        pickle.dump({
-            "fold_thr": fold_thr, 
-            "oof_p": oof_p, 
-            "oof_label": oof_label, 
-            }, f)
+        with open(f"{hps.model_dir}/info_run.pkl", "wb") as f:
+            pickle.dump({
+                "fold_thr": fold_thr, 
+                "oof_p": oof_p, 
+                "oof_label": oof_label, 
+                "additional_array": additional_array, 
+                }, f)
 
     if tb_process is not None:
         tb_process.terminate()

@@ -7,8 +7,8 @@
 # =========================================== Precomputed ==========================================================
 python precompute_features.py \
   --config configs/general.json  \
-  --output_dir ./precomputed_features/mfcc \
-  --feature_type mfcc
+  --output_dir ./precomputed_features/opensmile \
+  --feature_type opensmile
 
 python precompute_features.py \
   --config configs/general.json  \
@@ -65,8 +65,8 @@ python train_hypersearch.py  --init --model_name searchlstm10fold_spectogram --p
   --feature_dim 1025 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/spectogram
 
 # =========================================== Train best hyperparameter 2  ==========================================================
-python train_hypersearch.py  --init --model_name search_bilstm_mfcc --pooling_model BiLSTMClassifier --feature_type mfcc \
-  --feature_dim 13 --config_path configs/general.json
+python train_hypersearch.py  --init --model_name searchfiltered_bilstm_logmel --pooling_model BiLSTMClassifier --feature_type logmel \
+  --feature_dim 80 --config_path configs/general.json
 
 python train_hypersearch.py  --init --model_name search_resnet_mfcc --pooling_model ResNet34ManualClassifier --feature_type mfcc \
   --feature_dim 13 --config_path configs/general.json
@@ -82,6 +82,9 @@ python train.py  --init --model_name resnetbest_logmel --pooling_model ResNet34M
 python train.py  --init --model_name bilstm_logmel_wavmean --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
   --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel_wavmean
 
+
+python train.py  --init --model_name gatedmlp_opensmile --pooling_model TBSTGClassifier --feature_type opensmile \
+  --feature_dim 7511 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/opensmile
 
 # =========================================== Active learning  ==========================================================
 python train_fastrecov.py  --init --model_name fastrecov5_wavsfolds_originalweight --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \

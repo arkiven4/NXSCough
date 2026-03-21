@@ -36,17 +36,17 @@ FEATURE_SETS = [
     opensmile.FeatureSet.GeMAPSv01b,
     opensmile.FeatureSet.eGeMAPSv02,
     opensmile.FeatureSet.emobase,
-    opensmile.FeatureSet.IS09,
-    opensmile.FeatureSet.IS10,
-    opensmile.FeatureSet.IS11,
-    opensmile.FeatureSet.IS12,
-    opensmile.FeatureSet.IS13,
+    # opensmile.FeatureSet.IS09,
+    # opensmile.FeatureSet.IS10,
+    # opensmile.FeatureSet.IS11,
+    # opensmile.FeatureSet.IS12,
+    # opensmile.FeatureSet.IS13,
 ]
 
 SMILE_CLIENTS = {
     str(fs): opensmile.Smile(
         feature_set=fs,
-        feature_level=opensmile.FeatureLevel.LowLevelDescriptors
+        feature_level=opensmile.FeatureLevel.Functionals # LowLevelDescriptors Functionals
     )
     for fs in FEATURE_SETS
 }
@@ -162,14 +162,14 @@ def build_wav_transform(hparams, sampling_rate):
         )
 
     elif feature_type == "opensmile":
-        scaler = joblib.load("precomputed_stats/opensmile_global_scaler.pkl")
+        scaler = joblib.load("precomputed_features/opensmile/scaler.joblib")
         return lambda wav: torch.tensor(
             scaler.transform(
                 pd.concat(
                     [
                         client.process_signal(wav, sampling_rate)
                         .reset_index(drop=True)
-                        .add_prefix(f"{fs_name}__")
+                        .add_prefix(f"{fs_name}_")
                         for fs_name, client in SMILE_CLIENTS.items()
                     ],
                     axis=1,
@@ -209,6 +209,7 @@ class CoughDatasets(torch.utils.data.Dataset):
         """Unpack all hparams fields into instance attributes."""
         self.hop_length = getattr(hparams, "hop_length", None)
         self.max_wav_value = getattr(hparams, "max_wav_value", None)
+        self.peak_norm = getattr(hparams, "peak_norm", False)
         self.mean_std_norm = getattr(hparams, "mean_std_norm", False)
         self.cmvn_norm = getattr(hparams, "cmvn_norm", False)
         self.per_band_norm = getattr(hparams, "per_band_norm", False)
@@ -305,9 +306,14 @@ class CoughDatasets(torch.utils.data.Dataset):
                 else:
                     audio = (audio - audio.mean()) / (audio.std(unbiased=False) + 1e-16)
 
+
             if self.max_wav_value:
                 max_val = torch.max(torch.abs(audio))
                 audio = audio / max_val if max_val != 0 else audio
+
+            if self.peak_norm:
+                peak = torch.max(torch.abs(audio))
+                audio = audio / (peak + 1e-16)
 
             # audio torch.Size([80, 32])
 

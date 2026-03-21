@@ -797,6 +797,7 @@ def compute_spectrogram_stats_from_dataset(df, hparams, pickle_path="spec_stats.
     stats_hparams.augment_rawboost = False
     stats_hparams.mean_std_norm = False
     stats_hparams.max_wav_value = None
+    stats_hparams.peak_norm = False
     stats_hparams.add_noise = False
     stats_hparams.mix_audio = False
     stats_hparams.train = False

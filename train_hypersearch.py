@@ -98,6 +98,7 @@ def main(cli_args=None):
     # SECTION: Loading Data
     # =============================================================
     df_train, _ = train.load_data(hps)
+    df_train = df_train[df_train["disease_status"] != 2]
     collate_fn = train.get_collate_fn(hps)
     target_labels = df_train[hps.data.target_column]
 
@@ -136,15 +137,15 @@ def main(cli_args=None):
             # "att_head_fusion": trial.suggest_categorical("att_head_fusion", [1, 2, 4, 8]),
             # "fusion_type": trial.suggest_categorical("fusion_type", ["gating", "cross_attn", "film"]),
 
-            "resnet_type": trial.suggest_categorical("resnet_type", ["resnet18", "resnet34", "resnet50", "resnet101"]),
+            "resnet_type": trial.suggest_categorical("resnet_type", ["resnet18", "resnet34"]), # , "resnet50", "resnet101"
             "num_layers_resnet": trial.suggest_int("num_layers_resnet", 1, 4),
         }
 
         #multimask_augment = trial.suggest_categorical("multimask_augment", [True, False])
 
-        filter_length = trial.suggest_categorical("filter_length", [512, 1024, 2048])
-        win_length = trial.suggest_categorical("win_length", [256, 512, 1024])
-        win_length = min(win_length, filter_length)  # ensure win_length <= filter_length
+        # filter_length = trial.suggest_categorical("filter_length", [512, 1024, 2048])
+        # win_length = trial.suggest_categorical("win_length", [256, 512, 1024])
+        # win_length = min(win_length, filter_length)  # ensure win_length <= filter_length
 
         data_params = {
             # "multimask_augment": multimask_augment,
@@ -153,12 +154,12 @@ def main(cli_args=None):
             # "nu": trial.suggest_float("nu", 0.01, 0.5) if multimask_augment else 0.10,
             # "num_masks": trial.suggest_int("num_masks", 1, 6) if multimask_augment else 3,
 
-            "filter_length": filter_length,
-            "hop_length": trial.suggest_categorical("hop_length", [32, 64, 128, 256, 512]),
-            "win_length": win_length,
-            "n_mel_channels": trial.suggest_categorical("n_mel_channels", [6, 13, 13 * 2, 13 * 3, 13 * 4]), # [6, 13, 13 * 2, 13 * 3, 13 * 4] [40, 64, 80, 128, 160]
-            "mel_fmin": trial.suggest_categorical("mel_fmin", [0, 20, 40, 80, 100, 120, 200, 400, 500, 600]),
-            "mel_fmax": trial.suggest_categorical("mel_fmax", [5000, 6000, 7000, 8000]),
+            # "filter_length": filter_length,
+            # "hop_length": trial.suggest_categorical("hop_length", [32, 64, 128, 256, 512]),
+            # "win_length": win_length,
+            # "n_mel_channels": trial.suggest_categorical("n_mel_channels", [40, 64, 80, 128, 160]), # [6, 13, 13 * 2, 13 * 3, 13 * 4] [40, 64, 80, 128, 160]
+            # "mel_fmin": trial.suggest_categorical("mel_fmin", [0, 20, 40, 80, 100, 120, 200, 400, 500, 600]),
+            # "mel_fmax": trial.suggest_categorical("mel_fmax", [5000, 6000, 7000, 8000]),
 
             # "delta_feature": trial.suggest_categorical("delta_feature", [True, False]),
             # "deltadelta_feature": trial.suggest_categorical("deltadelta_feature", [True, False]),
@@ -179,12 +180,12 @@ def main(cli_args=None):
         # hps.data.nu = data_params["nu"]
         # hps.data.num_masks = data_params["num_masks"]
 
-        hps.data.filter_length = data_params["filter_length"]
-        hps.data.hop_length = data_params["hop_length"]
-        hps.data.win_length = data_params["win_length"]
-        hps.data.n_mel_channels = data_params["n_mel_channels"]
-        hps.data.mel_fmin = data_params["mel_fmin"]
-        hps.data.mel_fmax = data_params["mel_fmax"]
+        # hps.data.filter_length = data_params["filter_length"]
+        # hps.data.hop_length = data_params["hop_length"]
+        # hps.data.win_length = data_params["win_length"]
+        # hps.data.n_mel_channels = data_params["n_mel_channels"]
+        # hps.data.mel_fmin = data_params["mel_fmin"]
+        # hps.data.mel_fmax = data_params["mel_fmax"]
 
         # hps.data.delta_feature = data_params["delta_feature"]
         # hps.data.deltadelta_feature = data_params["deltadelta_feature"]
@@ -200,7 +201,7 @@ def main(cli_args=None):
         # if data_params["deltadelta_feature"]:
         #     feat_mult += 1
         # hps.model.feature_dim = data_params["n_mel_channels"] * feat_mult
-        hps.model.feature_dim = data_params["n_mel_channels"]
+        # hps.model.feature_dim = data_params["n_mel_channels"]
 
         # Precompute features for this trial's spectrogram config into a temp dir
         trial_precomputed_dir = tempfile.mkdtemp(prefix=f"trial{trial.number}_", dir=hps.model_dir)

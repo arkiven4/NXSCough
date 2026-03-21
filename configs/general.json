@@ -18,17 +18,18 @@
   },
   "data": {
     "max_wav_value": false,
+    "peak_norm": true,
     "mean_std_norm": false,
     "per_band_norm": false,
     "cmvn_norm": false,
     
     "sampling_rate": 16000,
-    "filter_length": 2048,
-    "hop_length": 256,
+    "filter_length": 1024,
+    "hop_length": 64,
     "win_length": 512,
     "n_mel_channels": 80,
     "mel_fmin": 50.0,
-    "mel_fmax": 8000.0,
+    "mel_fmax": 7000.0,
 
     "saming_length": false,
     "desired_length": 0.55,
@@ -37,7 +38,7 @@
     "rezize_size": [64, 256],
 
     "tabular_feature": true,
-    "acoustic_feature": false,
+    "acoustic_feature": true,
     "feature_type": "logmel",
     "delta_feature": false,
     "deltadelta_feature": false,
