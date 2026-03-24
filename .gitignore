@@ -24,3 +24,5 @@ pretrained/encoder-operaGT.ckpt
 precomputed_features_bak
 *.log
 *.pdf
+temp_*
+try*

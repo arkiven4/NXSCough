@@ -18,8 +18,8 @@
   },
   "data": {
     "max_wav_value": false,
-    "peak_norm": true,
-    "mean_std_norm": false,
+    "peak_norm": false,
+    "mean_std_norm": true,
     "per_band_norm": false,
     "cmvn_norm": false,
     

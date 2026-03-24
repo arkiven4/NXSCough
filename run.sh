@@ -79,9 +79,8 @@ python train.py  --init --model_name resnetbest_logmel --pooling_model ResNet34M
   --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
 
 
-python train.py  --init --model_name bilstm_logmel_wavmean --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
-  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel_wavmean
-
+python train.py  --init --model_name try_bilstm_logmel --pooling_model BiLSTMClassifier --feature_type logmel \
+  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel
 
 python train.py  --init --model_name gatedmlp_opensmile --pooling_model TBSTGClassifier --feature_type opensmile \
   --feature_dim 7511 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/opensmile

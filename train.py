@@ -605,6 +605,12 @@ def main(cli_args=None):
     # =============================================================
     df_train, _ = load_data(hps)
 
+    df_load = pd.read_csv("/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/try4/biomarker_predictions.csv")[['path_file', "prediction_prob","predicted_class","subgroup"]]
+    noisy_paths = set(
+        df_load.loc[df_load["subgroup"] == "noisy_label", "path_file"]
+    )
+    df_train = df_train[~df_train["path_file"].isin(noisy_paths)].copy()
+
     if args.use_fastrecov:
         fastrecov_dir = args.fastrecov_dir if args.fastrecov_dir else model_dir
         df_train = apply_fastrecov_filter(df_train, fastrecov_dir)
@@ -758,7 +764,7 @@ def main(cli_args=None):
         }
         write_results_to_file("result_overall.txt", results_dict, f"{hps.model_dir}", {0: "CIRDZ " + str(fold_outter)})
 
-        additional_array.append(runner_lightning.model.gate_layer.get_gates().detach().cpu().numpy())
+        #additional_array.append(runner_lightning.model.gate_layer.get_gates().detach().cpu().numpy())
 
         if os.path.exists(production_path):
             os.remove(production_path)
