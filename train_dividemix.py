@@ -14,7 +14,6 @@ Algorithm:
 import json
 import os
 import pickle
-import sys
 
 import numpy as np
 import pandas as pd
@@ -199,14 +198,27 @@ def _make_dm_loaders(df, hps, pred, prob, batch_size, num_workers=8,
     return lab_loader, unl_loader
 
 
-def eval_train(net, eval_loader, all_loss, device, n_samples):
+def eval_train(net, eval_loader, all_loss, device, n_samples,
+               class0_mode='default', log_fn=None):
     """
-    Compute per-sample loss → normalise → GMM → clean probability.
-    Mirrors eval_train() in Train_cifar.py.
+    Compute per-sample loss → normalise → class-conditional GMM → clean probability.
+
+    class0_mode controls how class-0 (negative / non-TB) samples are treated:
+      'default' – GMM applied to class 0 as well; noisy class-0 samples go to
+                  the unlabeled set, same as class 1  (original DivideMix behaviour)
+      'keep'   – skip GMM for class 0; all negatives are labelled clean (prob=1)
+                 (use when you trust negative labels and only want to clean positives)
+
+    Why class-conditional GMM?
+    A single GMM on all losses fails on imbalanced data: the minority class (TB)
+    is inherently harder, so it always sits in the high-loss component and gets
+    labelled 'noisy' regardless of label quality — causing progressive AUROC
+    collapse.  Per-class GMMs separate clean/noisy *within* each class.
     """
     net.eval()
     net.to(device)
-    losses = torch.zeros(n_samples)
+    losses     = torch.zeros(n_samples)
+    labels_all = torch.zeros(n_samples, dtype=torch.long)
 
     with torch.no_grad():
         for audio, labels, indices, masks in eval_loader:
@@ -218,19 +230,40 @@ def eval_train(net, eval_loader, all_loss, device, n_samples):
             else:
                 loss = F.cross_entropy(logits, labels, reduction='none')
             for b, orig_idx in enumerate(indices):
-                losses[orig_idx.item()] = loss[b].item()
+                losses[orig_idx.item()]     = loss[b].item()
+                labels_all[orig_idx.item()] = labels[b].item()
 
     losses = (losses - losses.min()) / (losses.max() - losses.min() + 1e-8)
     all_loss.append(losses)
 
-    # Average last 5 epochs for stability (same heuristic as original)
-    input_loss = torch.stack(all_loss[-5:]).mean(0) if len(all_loss) >= 5 else losses
-    input_loss_np = input_loss.reshape(-1, 1).numpy()
+    input_loss    = torch.stack(all_loss[-5:]).mean(0) if len(all_loss) >= 5 else losses
+    input_loss_np = input_loss.numpy()
+    labels_np     = labels_all.numpy()
 
-    gmm = GaussianMixture(n_components=2, max_iter=10, tol=1e-2, reg_covar=5e-4)
-    gmm.fit(input_loss_np)
-    prob = gmm.predict_proba(input_loss_np)
-    prob = prob[:, gmm.means_.argmin()]   # low-loss component = clean
+    prob = np.zeros(n_samples)
+    for cls in np.unique(labels_np):
+        mask = labels_np == cls
+
+        if cls == 0 and class0_mode == 'keep':
+            prob[mask] = 1.0   # all class-0 samples are considered clean
+            if log_fn:
+                log_fn(f"    GMM cls=0  kept as clean (class0_mode='keep')  n={mask.sum()}")
+            continue
+
+        if mask.sum() < 4:
+            prob[mask] = 1.0
+            continue
+
+        cls_loss = input_loss_np[mask].reshape(-1, 1)
+        gmm = GaussianMixture(n_components=2, max_iter=10, tol=1e-2, reg_covar=5e-4)
+        gmm.fit(cls_loss)
+        p = gmm.predict_proba(cls_loss)
+        prob[mask] = p[:, gmm.means_.argmin()]   # low-loss component = clean
+        if log_fn:
+            log_fn(f"    GMM cls={cls}  n={mask.sum()}  "
+                   f"means={gmm.means_.flatten().round(4)}  "
+                   f"weights={gmm.weights_.round(3)}")
+
     return prob, all_loss
 
 
@@ -354,7 +387,7 @@ def train_dividemix(epoch, net, peer_net, optimizer,
                    f"Lx={Lx.item():.3f}  Lu={Lu.item():.3f}  lamb={lamb:.3f}")
 
 
-def test_dividemix(net1, net2, test_loader, device, num_class):
+def test_dividemix(net1, net2, test_loader, device, log_fn=None):
     """
     Ensemble of net1+net2.  Mirrors test() in Train_cifar.py.
     test_loader uses CoughDatasetsCollate format:
@@ -363,25 +396,42 @@ def test_dividemix(net1, net2, test_loader, device, num_class):
     """
     net1.eval()
     net2.eval()
-    all_labels, all_probs = [], []
+    all_labels, all_probs, all_logits1, all_logits2 = [], [], [], []
 
     with torch.no_grad():
         for _, audio, _, masks, dse_ids, _ in test_loader:
             audio, masks = audio.to(device), masks.to(device)
             out1 = net1(audio, attention_mask=masks)['disease_logits']
             out2 = net2(audio, attention_mask=masks)['disease_logits']
+            
             if out1.shape[-1] == 1:
                 p1 = torch.sigmoid(out1.squeeze(-1))
                 p2 = torch.sigmoid(out2.squeeze(-1))
             else:
                 p1 = F.softmax(out1, dim=1)[:, 1]
                 p2 = F.softmax(out2, dim=1)[:, 1]
+            
             probs  = (p1 + p2) / 2
             labels = torch.argmax(dse_ids.float(), dim=1)
+            
             all_labels.append(labels.cpu())
             all_probs.append(probs.cpu())
+            all_logits1.append(out1.cpu())
+            all_logits2.append(out2.cpu())
 
-    return torch.cat(all_labels).numpy(), torch.cat(all_probs).numpy()
+    labels_np = torch.cat(all_labels).numpy()
+    probs_np = torch.cat(all_probs).numpy()
+    logits1_np = torch.cat(all_logits1).numpy()
+    logits2_np = torch.cat(all_logits2).numpy()
+    
+    # Debug: check distribution
+    if log_fn:
+        log_fn(f"    Test labels dist: {np.bincount(labels_np.astype(int))}")
+        log_fn(f"    Test probs: min={probs_np.min():.4f}, max={probs_np.max():.4f}, mean={probs_np.mean():.4f}")
+        log_fn(f"    Logits1 range: [{logits1_np.min():.4f}, {logits1_np.max():.4f}]")
+        log_fn(f"    Logits2 range: [{logits2_np.min():.4f}, {logits2_np.max():.4f}]")
+    
+    return labels_np, probs_np
 
 
 # =====================================================================
@@ -409,6 +459,10 @@ def main(cli_args=None):
         "T":           0.5,    # sharpening temperature
         "noise_mode":  "sym",  # 'sym' | 'asym'
         "num_class":   2,
+        # How to handle class-0 (non-TB / negative) samples in the GMM step:
+        #   'default' – GMM applied to class 0 too; noisy class-0 → unlabeled  (original DivideMix behaviour)
+        #   'keep'    – skip GMM for class-0; all negatives treated as labeled-clean
+        "class0_mode": "default",
     }
     with open(os.path.join(model_dir, "dm_config.json"), "w") as f:
         json.dump(dm_config, f, indent=2)
@@ -512,9 +566,14 @@ def main(cli_args=None):
     for epoch in range(dm_config["warm_up"], dm_config["num_epochs"] + 1):
         logger_py.info(f"\n{'='*20} Epoch {epoch}/{dm_config['num_epochs']} {'='*20}")
 
-        # --- GMM evaluation (mirrors eval_train in original) ---
-        prob1, all_loss[0] = eval_train(net1, eval_loader, all_loss[0], device, n_samples)
-        prob2, all_loss[1] = eval_train(net2, eval_loader, all_loss[1], device, n_samples)
+        # --- GMM evaluation ---
+        c0_mode = dm_config["class0_mode"]
+        prob1, all_loss[0] = eval_train(
+            net1, eval_loader, all_loss[0], device, n_samples,
+            class0_mode=c0_mode, log_fn=logger_py.info)
+        prob2, all_loss[1] = eval_train(
+            net2, eval_loader, all_loss[1], device, n_samples,
+            class0_mode=c0_mode, log_fn=logger_py.info)
 
         pred1 = prob1 > dm_config["p_threshold"]
         pred2 = prob2 > dm_config["p_threshold"]
@@ -560,7 +619,7 @@ def main(cli_args=None):
                          "n_clean_net1": int(pred1.sum()),
                          "n_clean_net2": int(pred2.sum())}
         if test_loader is not None:
-            labels_np, probs_np = test_dividemix(net1, net2, test_loader, device, dm_config["num_class"])
+            labels_np, probs_np = test_dividemix(net1, net2, test_loader, device, log_fn=logger_py.info)
             if len(np.unique(labels_np)) > 1:
                 auroc = roc_auc_score(labels_np, probs_np)
                 epoch_metrics["test_auroc"] = auroc
