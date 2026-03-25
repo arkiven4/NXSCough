@@ -100,12 +100,14 @@ python precompute_features.py \
   --output_dir ./precomputed_features/mfccdd \
   --feature_type mfccdd
 
-python train.py  --init --model_name resnet_mfcc --pooling_model ResNet34ManualClassifier --feature_type mfcc \
+python train_dividemix.py  --init --model_name dividemix_mfcc --pooling_model BiLSTMClassifier --feature_type mfcc \
   --feature_dim 13 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/mfcc
 
 python train.py  --init --model_name resnet_mfccdd --pooling_model ResNet34ManualClassifier --feature_type mfcc --delta_feature --deltadelta_feature \
   --feature_dim 39 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/mfccdd
 
+
+train_dividemix.py
 # =========================================== Active learning  ==========================================================
 python train_fastrecov.py  --init --model_name fastrecov5_wavsfolds_originalweight --pooling_model BiLSTMSelfAttASPClassifier --feature_type logmel \
  --feature_dim 80 --config_path configs/general.json --use_precomputed --precomputed_dir ./precomputed_features/logmel 

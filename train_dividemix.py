@@ -1,313 +1,396 @@
-# Standard library imports
-import argparse
-import importlib.util
-import inspect
+"""
+DivideMix training for cough / TB detection.
+Reference: Li et al. "DivideMix: Learning with Noisy Labels as
+           Semi-supervised Learning" (ICLR 2020)
+
+Algorithm:
+  Phase 1 – Warmup   : both net1 and net2 trained with CE on all data
+                        (Lightning + CoughClassificationRunner, one net at a time)
+  Phase 2 – Co-train : alternating manual loop
+                         eval_train → 2-component GMM → labeled / unlabeled split
+                         → MixMatch update (co-guess + label-refinement + MixUp)
+"""
+
 import json
-import math
 import os
 import pickle
-import random
-import shutil
-import socket
-import subprocess
 import sys
-import tempfile
-import warnings
-import glob
-from typing import Dict, List, Tuple
-from pathlib import Path
 
-# Third-party imports
-import librosa
-import lightning as L
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
+import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers.tensorboard import TensorBoardLogger
-from matplotlib import cm
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix
-from sklearn.model_selection import StratifiedKFold, KFold, train_test_split, StratifiedGroupKFold
-from torch.utils.data import DataLoader, WeightedRandomSampler
-from torchvision import datasets, transforms
-from tqdm import tqdm
 from sklearn.mixture import GaussianMixture
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedGroupKFold
+from torch.utils.data import DataLoader
 
-# Local imports
-import commons
 import lightning_wrapper
-import models
 import utils
 import train
-from cough_datasets import (
-    CoughDatasets,
-    CoughDatasetsCollate,
-    CoughDatasetsProcessorCollate,
-    CoughDetectionRatioBatchSampler,
-    CoughDiseaseBinaryBatchSampler,
-    PatientBatchSampler, AutoPatientBatchSampler
-)
-from sklearn.metrics import (
-    confusion_matrix, accuracy_score,
-    balanced_accuracy_score,
-    roc_auc_score, roc_curve
-)
+from cough_datasets import CoughDatasets
 
 torch.set_float32_matmul_precision("medium")
-cmap = cm.get_cmap("viridis")
-current_module = sys.modules[__name__]
-#######################################################################
-# REUSABLE FUNCTIONS
-#######################################################################
-
-def set_seed(seed: int = 42) -> None:
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    # When running on the CuDNN backend, two further options must be set
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    # Set a fixed value for the hash seed
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    print(f"Random seed set as {seed}")
 
 
-# def get_sample_probs(weights:np.array, tau:float) -> np.array:
-#     '''
-#     Gets sampling probability based on weights
-#     '''
-#     exp_i = np.exp(weights/tau)
-#     return exp_i/np.sum(exp_i)
+# =====================================================================
+# Loss helpers  (identical semantics to original DivideMix)
+# =====================================================================
 
-def get_sample_probs(weights: np.ndarray, tau: float) -> np.ndarray:
-    if tau == 0:
-        raise ValueError("tau=0 should use deterministic sorting")
-    z = weights / tau
-    z = z - np.max(z)  # stable softmax
-    exp_z = np.exp(z)
-    return exp_z / exp_z.sum()
+class SemiLossAudio:
+    """Lx = soft cross-entropy on labeled, Lu = MSE on unlabeled guesses."""
+    def __call__(self, outputs_x, targets_x, outputs_u, targets_u,
+                 epoch, warm_up, lambda_u=25.0):
+        probs_u = torch.softmax(outputs_u, dim=1)
+        Lx = -torch.mean(torch.sum(F.log_softmax(outputs_x, dim=1) * targets_x, dim=1))
+        Lu = torch.mean((probs_u - targets_u) ** 2)
+        ramp = float(np.clip((epoch - warm_up) / 16.0, 0.0, 1.0))
+        return Lx, Lu, lambda_u * ramp
 
-def sample_folds(n_folds:int, weights:np.array, tau:float, **kwargs) -> Tuple[List,Dict]:
-    '''
-    Given weights of the sample, performs weighted sampling into n_folds taking temperature tau into account
-    Bigger τ = more uniform, more random, less influence from weights.
-    '''
-    n_samples = len(weights)
-    #Assuming 'best' is the best fold and 'worst' is the worst fold and 'rest' are in between folds
-    fold_id = {"best":[],"rest":[],"worst":[]}
-    p_i = get_sample_probs(weights,tau)
-    if tau<0.0001:
-        #tau = 0 case, deterministic
-        ordering = np.argsort(weights)[::-1]
-    elif tau>10000:
-        #infinite tau case
-        ordering = np.random.permutation(len(weights))
-    else:
-        ordering = np.random.choice(n_samples,size=n_samples,replace=False,p=p_i)
-    fold_id["best"] = ordering[:int(n_samples/n_folds)]
-    fold_id["rest"] = ordering[int(n_samples/n_folds):(n_folds-1)*int(n_samples/n_folds)]
-    fold_id["worst"] = ordering[(n_folds-1)*int(n_samples/n_folds):]
-    # Convert into train_test splits
-    rest_ids = fold_id["rest"]
-    #split into n-2 folds with two reserved for best and worst
-    rest_ids = [rest_ids[i*int(np.ceil(len(rest_ids)/(n_folds-2))):(i+1)*int(np.ceil(len(rest_ids)/(n_folds-2)))] for i in range(n_folds-2)]
-    folds = [fold_id["best"]] + rest_ids + [fold_id["worst"]]
-    fold_splits = []
-    for i in range(n_folds):
-        temp = folds.copy()
-        test_ids = np.random.permutation(temp.pop(i))
-        train_ids = np.random.permutation(np.concatenate(temp))
-        fold_splits.append((train_ids,test_ids))
-    return fold_splits, fold_id
 
-def sample_folds_grouped(n_folds: int, weights: np.ndarray, tau: float, participant_ids: np.ndarray) -> Tuple[List, Dict]:
+class NegEntropyAudio:
+    """Negative entropy — penalises overconfident predictions (asym noise)."""
+    def __call__(self, outputs):
+        probs = torch.softmax(outputs, dim=1)
+        return torch.mean(torch.sum(probs.log() * probs, dim=1))
+
+
+# =====================================================================
+# DivideMix dataset  (wraps CoughDatasets, three modes)
+# =====================================================================
+
+class DivideMixDataset(torch.utils.data.Dataset):
     """
-    Weighted fold sampling with temperature τ, ensuring that
-    each participant appears in only ONE fold.
+    Modes
+    -----
+    'all'       → (audio, label, original_idx)         eval / warmup
+    'labeled'   → (audio1_aug, audio2_aug, label, prob) clean samples
+    'unlabeled' → (audio1_aug, audio2_aug)              noisy samples
+
+    Two augmented views come from calling the underlying dataset twice;
+    because augmentation is stochastic each call produces a different view.
     """
 
-    # --- unique participants ---
-    unique_pids, pid_inverse = np.unique(participant_ids, return_inverse=True)
-    n_participants = len(unique_pids)
+    def __init__(self, df, hps, mode='all', pred=None, prob=None, train_mode=True,
+                 use_precomputed=False, precomputed_dir=None):
+        self.mode = mode
+        self.prob = prob
 
-    # --- aggregate participant weights (mean is safest) ---
-    part_weights = np.zeros(n_participants)
-    for i in range(n_participants):
-        part_weights[i] = weights[pid_inverse == i].mean()
+        data = df
+        feature_path_col = None
+        if use_precomputed and precomputed_dir:
+            mapping_train = pd.read_csv(os.path.join(precomputed_dir, "feature_mapping_train.csv"))
+            data = df.merge(
+                mapping_train[["path_file", "feature_path"]],
+                on="path_file",
+                how="left",
+            )
+            feature_path_col = list(data.columns).index("feature_path")
 
-    # --- compute sampling probabilities ---
-    p_i = get_sample_probs(part_weights, tau)
+        self._ds = CoughDatasets(
+            data.values, hps.data,
+            wav_stats_path=f"{hps.model_dir}/wav_stats.pickle" if not use_precomputed else None,
+            train=train_mode,
+            use_precomputed=use_precomputed,
+        )
+        if use_precomputed and feature_path_col is not None:
+            self._ds.set_feature_path_column(feature_path_col)
 
-    if tau < 1e-4:
-        ordering = np.argsort(part_weights)[::-1]
-    elif tau > 1e4:
-        ordering = np.random.permutation(n_participants)
-    else:
-        ordering = np.random.choice(
-            n_participants,
-            size=n_participants,
-            replace=False,
-            p=p_i
+        if mode == 'labeled' and pred is not None:
+            self.indices = np.where(pred)[0]
+        elif mode == 'unlabeled' and pred is not None:
+            self.indices = np.where(~pred)[0]
+        else:
+            self.indices = np.arange(len(df))
+
+    # item layout from CoughDatasets.__getitem__:
+    # (orig_idx, name, audio, dse_id[1,C], spk_id, gndr_id, tabular)
+    def _label(self, item):
+        return torch.argmax(item[3].squeeze(0)).long()
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        ri = int(self.indices[idx])
+        item1 = self._ds[ri]
+        audio1 = item1[2]
+
+        if self.mode == 'labeled':
+            audio2 = self._ds[ri][2]          # different random aug
+            return audio1, audio2, self._label(item1), float(self.prob[ri])
+
+        elif self.mode == 'unlabeled':
+            audio2 = self._ds[ri][2]
+            return audio1, audio2
+
+        else:  # 'all'
+            return audio1, self._label(item1), ri
+
+
+# =====================================================================
+# Collate functions
+# =====================================================================
+
+def _pad_batch(audios):
+    """[1,C,T] or [1,T] list → [B,C,max_T], mask [B,max_T]."""
+    max_len = max(a.shape[-1] for a in audios)
+    B = len(audios)
+    s = audios[0]
+    C = s.shape[1] if s.ndim == 3 else 1
+    out = torch.zeros(B, C, max_len, dtype=s.dtype)
+    mask = torch.zeros(B, max_len)
+    for i, a in enumerate(audios):
+        L = a.shape[-1]
+        out[i, :, :L] = a if a.ndim == 3 else a.unsqueeze(0)
+        mask[i, :L] = 1.0
+    return out, mask
+
+
+def _dm_labeled_collate(batch):
+    a1s, a2s, labels, probs = zip(*batch)
+    a1, mask = _pad_batch(list(a1s))
+    a2, _    = _pad_batch(list(a2s))
+    return (a1, a2,
+            torch.tensor(labels, dtype=torch.long),
+            torch.tensor(probs,  dtype=torch.float32),
+            mask)
+
+
+def _dm_unlabeled_collate(batch):
+    a1s, a2s = zip(*batch)
+    a1, mask = _pad_batch(list(a1s))
+    a2, _    = _pad_batch(list(a2s))
+    return a1, a2, mask
+
+
+def _dm_all_collate(batch):
+    audios, labels, idxs = zip(*batch)
+    a, mask = _pad_batch(list(audios))
+    return (a,
+            torch.tensor(labels, dtype=torch.long),
+            torch.tensor(idxs,   dtype=torch.long),
+            mask)
+
+
+# =====================================================================
+# Core DivideMix functions  (mirror original Train_cifar.py structure)
+# =====================================================================
+
+def _make_dm_loaders(df, hps, pred, prob, batch_size, num_workers=8,
+                     use_precomputed=False, precomputed_dir=None):
+    """Build labeled + unlabeled loaders for one co-training step."""
+    lab_ds = DivideMixDataset(
+        df, hps, mode='labeled', pred=pred, prob=prob, train_mode=True,
+        use_precomputed=use_precomputed, precomputed_dir=precomputed_dir,
+    )
+    unl_ds = DivideMixDataset(
+        df, hps, mode='unlabeled', pred=pred, prob=prob, train_mode=True,
+        use_precomputed=use_precomputed, precomputed_dir=precomputed_dir,
+    )
+    kw = dict(num_workers=num_workers, drop_last=True, pin_memory=True)
+    lab_loader = DataLoader(lab_ds, batch_size=batch_size, shuffle=True,
+                            collate_fn=_dm_labeled_collate,   **kw)
+    unl_loader = DataLoader(unl_ds, batch_size=batch_size, shuffle=True,
+                            collate_fn=_dm_unlabeled_collate, **kw)
+    return lab_loader, unl_loader
+
+
+def eval_train(net, eval_loader, all_loss, device, n_samples):
+    """
+    Compute per-sample loss → normalise → GMM → clean probability.
+    Mirrors eval_train() in Train_cifar.py.
+    """
+    net.eval()
+    net.to(device)
+    losses = torch.zeros(n_samples)
+
+    with torch.no_grad():
+        for audio, labels, indices, masks in eval_loader:
+            audio, labels, masks = audio.to(device), labels.to(device), masks.to(device)
+            logits = net(audio, attention_mask=masks)['disease_logits']
+            if logits.shape[-1] == 1:
+                loss = F.binary_cross_entropy_with_logits(
+                    logits.squeeze(-1), labels.float(), reduction='none')
+            else:
+                loss = F.cross_entropy(logits, labels, reduction='none')
+            for b, orig_idx in enumerate(indices):
+                losses[orig_idx.item()] = loss[b].item()
+
+    losses = (losses - losses.min()) / (losses.max() - losses.min() + 1e-8)
+    all_loss.append(losses)
+
+    # Average last 5 epochs for stability (same heuristic as original)
+    input_loss = torch.stack(all_loss[-5:]).mean(0) if len(all_loss) >= 5 else losses
+    input_loss_np = input_loss.reshape(-1, 1).numpy()
+
+    gmm = GaussianMixture(n_components=2, max_iter=10, tol=1e-2, reg_covar=5e-4)
+    gmm.fit(input_loss_np)
+    prob = gmm.predict_proba(input_loss_np)
+    prob = prob[:, gmm.means_.argmin()]   # low-loss component = clean
+    return prob, all_loss
+
+
+def _probs_from_logits(logits):
+    """
+    Convert model logits to class probabilities.
+    - binary head [B,1]   -> [B,2] via sigmoid
+    - multiclass [B,C]    -> [B,C] via softmax
+    """
+    if logits.shape[-1] == 1:
+        p1 = torch.sigmoid(logits)
+        return torch.cat([1.0 - p1, p1], dim=1)
+    return F.softmax(logits, dim=1)
+
+
+def _to_multiclass_logits(logits):
+    """
+    Make logits compatible with softmax-based multi-class losses.
+    - binary head [B,1]   -> [B,2] as [0, z]
+    - multiclass [B,C]    -> [B,C]
+    """
+    if logits.shape[-1] == 1:
+        return torch.cat([torch.zeros_like(logits), logits], dim=1)
+    return logits
+
+
+def train_dividemix(epoch, net, peer_net, optimizer,
+                    lab_loader, unl_loader,
+                    warm_up, device, num_class, alpha, lambda_u, T,
+                    noise_mode='sym', log_fn=None):
+    """
+    One MixMatch co-training epoch.
+    Mirrors train() in Train_cifar.py:
+      - co-guess soft labels for unlabeled (both nets × 2 views)
+      - refine labels for labeled (clean-prob weighted)
+      - MixUp → SemiLoss + entropy penalty
+    net trains; peer_net is fixed.
+    """
+    net.train()
+    peer_net.eval()
+
+    criterion   = SemiLossAudio()
+    neg_entropy = NegEntropyAudio()
+    unl_iter    = iter(unl_loader)
+    num_iter    = len(lab_loader)
+
+    for batch_idx, (x1, x2, labels_x, w_x, masks_x) in enumerate(lab_loader):
+        try:
+            u1, u2, masks_u = next(unl_iter)
+        except StopIteration:
+            unl_iter = iter(unl_loader)
+            u1, u2, masks_u = next(unl_iter)
+
+        B = x1.size(0)
+        x1, x2   = x1.to(device),      x2.to(device)
+        u1, u2   = u1.to(device),      u2.to(device)
+        labels_x = labels_x.to(device)
+        w_x      = w_x.to(device).float().view(-1, 1)
+        masks_x  = masks_x.to(device)
+        masks_u  = masks_u.to(device)
+
+        labels_oh = torch.zeros(B, num_class, device=device)
+        labels_oh.scatter_(1, labels_x.view(-1, 1), 1)
+
+        with torch.no_grad():
+            # --- co-guess labels for unlabeled (avg of both nets on 2 views) ---
+            ou11 = peer_net(u1, attention_mask=masks_u)['disease_logits']
+            ou12 = peer_net(u2, attention_mask=masks_u)['disease_logits']
+            ou21 = net(u1,     attention_mask=masks_u)['disease_logits']
+            ou22 = net(u2,     attention_mask=masks_u)['disease_logits']
+            pu   = (_probs_from_logits(ou11) + _probs_from_logits(ou12) +
+                _probs_from_logits(ou21) + _probs_from_logits(ou22)) / 4
+            ptu      = pu ** (1.0 / T)
+            targets_u = (ptu / ptu.sum(dim=1, keepdim=True)).detach()
+
+            # --- label refinement for labeled ---
+            ox1 = net(x1, attention_mask=masks_x)['disease_logits']
+            ox2 = net(x2, attention_mask=masks_x)['disease_logits']
+            px  = (_probs_from_logits(ox1) + _probs_from_logits(ox2)) / 2
+            px  = w_x * labels_oh + (1.0 - w_x) * px
+            ptx      = px ** (1.0 / T)
+            targets_x = (ptx / ptx.sum(dim=1, keepdim=True)).detach()
+
+        # --- MixUp ---
+        lam = np.random.beta(alpha, alpha)
+        lam = max(lam, 1.0 - lam)
+
+        all_in  = torch.cat([x1, x2, u1, u2], dim=0)
+        all_tgt = torch.cat([targets_x, targets_x, targets_u, targets_u], dim=0)
+        all_msk = torch.cat([masks_x, masks_x, masks_u, masks_u], dim=0)
+
+        perm      = torch.randperm(all_in.size(0), device=device)
+        mixed_in  = lam * all_in  + (1.0 - lam) * all_in[perm]
+        mixed_tgt = lam * all_tgt + (1.0 - lam) * all_tgt[perm]
+        mixed_msk = torch.max(all_msk, all_msk[perm])
+
+        logits_all_raw = net(mixed_in, attention_mask=mixed_msk, train=True)['disease_logits']
+        logits_all = _to_multiclass_logits(logits_all_raw)
+        logits_x_  = logits_all[:B * 2]
+        logits_u_  = logits_all[B * 2:]
+
+        Lx, Lu, lamb = criterion(
+            logits_x_, mixed_tgt[:B * 2],
+            logits_u_, mixed_tgt[B * 2:],
+            epoch + batch_idx / num_iter, warm_up, lambda_u,
         )
 
-    # --- split participants into best/rest/worst ---
-    fold_id = {"best": [], "rest": [], "worst": []}
+        prior    = torch.ones(num_class, device=device) / num_class
+        pred_avg = F.softmax(logits_all, dim=1).mean(0)
+        penalty  = torch.sum(prior * torch.log(prior / (pred_avg + 1e-8)))
+        if noise_mode == 'asym':
+            penalty = penalty + neg_entropy(logits_all)
 
-    fold_size = int(n_participants / n_folds)
+        loss = Lx + lamb * Lu + penalty
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-    fold_id["best"] = ordering[:fold_size]
-    fold_id["rest"] = ordering[fold_size:(n_folds - 1) * fold_size]
-    fold_id["worst"] = ordering[(n_folds - 1) * fold_size:]
+        if log_fn and batch_idx % 50 == 0:
+            log_fn(f"    [{batch_idx:4d}/{num_iter}] "
+                   f"Lx={Lx.item():.3f}  Lu={Lu.item():.3f}  lamb={lamb:.3f}")
 
-    # split rest into n_folds-2 parts
-    rest_ids = fold_id["rest"]
-    chunk = int(np.ceil(len(rest_ids) / (n_folds - 2)))
 
-    rest_ids = [
-        rest_ids[i * chunk:(i + 1) * chunk]
-        for i in range(n_folds - 2)
-    ]
-
-    part_folds = [fold_id["best"]] + rest_ids + [fold_id["worst"]]
-
-    # --- expand participant folds → sample index folds ---
-    fold_splits = []
-
-    for i in range(n_folds):
-        temp = part_folds.copy()
-
-        test_pids = temp.pop(i)
-        train_pids = np.concatenate(temp)
-
-        # map participants → sample indices
-        test_mask = np.isin(pid_inverse, test_pids)
-        train_mask = np.isin(pid_inverse, train_pids)
-
-        test_ids = np.random.permutation(np.where(test_mask)[0])
-        train_ids = np.random.permutation(np.where(train_mask)[0])
-
-        fold_splits.append((train_ids, test_ids))
-
-    return fold_splits, fold_id
-
-# -------------------------------------------------
-# tau Updater schedule
-# -------------------------------------------------
-def update_tau_variance(tau, memory, alpha=5.0, tau_min=1e-4, tau_max=10.0):
+def test_dividemix(net1, net2, test_loader, device, num_class):
     """
-    Variance-driven temperature schedule
-    Decrease tau when memory variance is large (signal clear),
-    increase tau when variance is small (need exploration).
-    Larger alpha -> tau decreases faster when variance is high
+    Ensemble of net1+net2.  Mirrors test() in Train_cifar.py.
+    test_loader uses CoughDatasetsCollate format:
+      (wav_names, wav_padded, None, attention_masks, dse_ids, [...])
+    Returns (labels_np, probs_np).
     """
-    var = np.var(memory)
-    tau_new = tau * np.exp(-alpha * var)
-    return float(np.clip(tau_new, tau_min, tau_max))
+    net1.eval()
+    net2.eval()
+    all_labels, all_probs = [], []
 
-def update_tau_validation(tau, fold_metrics, beta=1.5, tau_min=1e-4, tau_max=10.0):
-    """
-    Validation-metric feedback schedule
-    If fold std is high (too greedy) → increase tau  -> (need exploration).
-    If std is low (can exploit) → decrease tau  -> (signal clear).
-    """
-    std = np.std(fold_metrics)
-    tau_new = tau * np.exp(beta * std)
-    return float(np.clip(tau_new, tau_min, tau_max))
+    with torch.no_grad():
+        for _, audio, _, masks, dse_ids, _ in test_loader:
+            audio, masks = audio.to(device), masks.to(device)
+            out1 = net1(audio, attention_mask=masks)['disease_logits']
+            out2 = net2(audio, attention_mask=masks)['disease_logits']
+            if out1.shape[-1] == 1:
+                p1 = torch.sigmoid(out1.squeeze(-1))
+                p2 = torch.sigmoid(out2.squeeze(-1))
+            else:
+                p1 = F.softmax(out1, dim=1)[:, 1]
+                p2 = F.softmax(out2, dim=1)[:, 1]
+            probs  = (p1 + p2) / 2
+            labels = torch.argmax(dse_ids.float(), dim=1)
+            all_labels.append(labels.cpu())
+            all_probs.append(probs.cpu())
 
-# -------------------------------------------------
-# Noisy Rate Adaptive
-# -------------------------------------------------
-def update_noisy_drop_variance(memory, drop_min=0.1, drop_max=0.9, scale=5.0):
-    """
-    Increase drop rate as memory variance increases.
-    """
-    var = np.var(memory)
-    drop = drop_min + (drop_max - drop_min) * (1 - np.exp(-scale * var))
-    return float(np.clip(drop, drop_min, drop_max))
+    return torch.cat(all_labels).numpy(), torch.cat(all_probs).numpy()
 
 
-def update_noisy_drop_gmm(memory, drop_min=0.1, drop_max=0.9):
-    mem = memory.reshape(-1, 1)
+# =====================================================================
+# Main
+# =====================================================================
 
-    gmm = GaussianMixture(n_components=2, random_state=0)
-    gmm.fit(mem)
-
-    means = np.sort(gmm.means_.flatten())
-    separation = abs(means[1] - means[0])
-
-    # normalize separation to [0,1] scale assumption
-    sep_scaled = np.clip(separation, 0, 1)
-
-    drop = drop_min + (drop_max - drop_min) * sep_scaled
-    return float(np.clip(drop, drop_min, drop_max))
-
-def update_noisy_drop_validation(current_drop, prev_val_mean, current_val_mean,
-                                 step=0.05, drop_min=0.05, drop_max=0.95):
-    """
-    Increase drop if validation improves,
-    decrease if validation degrades.
-    """
-    if current_val_mean > prev_val_mean:
-        new_drop = current_drop + step
-    else:
-        new_drop = current_drop - step
-
-    return float(np.clip(new_drop, drop_min, drop_max))
-
-# -------------------------------------------------
-# GMM-based threshold between clean vs noisy clusters
-# -------------------------------------------------
-def estimate_noise_threshold_gmm(memory, alpha=0.5):
-    """
-    Fit 2-component Gaussian mixture and
-    return intersection midpoint between means.
-    < 0.5 shifts toward clean_mean
-    """
-    mem = memory.reshape(-1, 1)
-
-    gmm = GaussianMixture(n_components=2, covariance_type="full", random_state=0)
-    gmm.fit(mem)
-
-    means = gmm.means_.flatten()
-    order = np.argsort(means)
-
-    noisy_mean = means[order[0]]
-    clean_mean = means[order[1]]
-
-    # midpoint between clusters (robust + simple)
-    #threshold = float((noisy_mean + clean_mean) / 2.0)
-    threshold = alpha * noisy_mean + (1 - alpha) * clean_mean
-    return threshold
-
-def update_memory_alpha(weights: np.ndarray,
-    memory: np.ndarray, prev_alpha: float = 0.3,
-    alpha_min: float = 0.10, alpha_max: float = 0.60,
-    k: float = 5.0, smooth: float = 0.8) -> float:
-    """
-    Adaptive EMA alpha:
-    - larger drift |weights - memory| -> larger alpha (faster update)
-    - smaller drift -> smaller alpha (more smoothing)
-    """
-    drift = float(np.mean(np.abs(weights - memory)))  # in [0,1] after your min-max
-    raw_alpha = alpha_min + (alpha_max - alpha_min) * (1.0 - np.exp(-k * drift))
-    alpha = smooth * prev_alpha + (1.0 - smooth) * raw_alpha
-    return float(np.clip(alpha, alpha_min, alpha_max))
-
-def memory_alpha_fixated(weights: np.ndarray, memory: np.ndarray, prev_alpha: float = 0.3, **kwargs) -> float:
-    return 0.3
-
-#######################################################################
-# MAIN SCRIPT
-#######################################################################
 def main(cli_args=None):
     parser = train.parse_args()
-    args = parser.parse_args(cli_args)
+    args   = parser.parse_args(cli_args)
 
     model_dir = os.path.join("./logs", args.model_name)
     os.makedirs(model_dir, exist_ok=True)
@@ -315,211 +398,187 @@ def main(cli_args=None):
     config_path = args.config_path if args.init else os.path.join(model_dir, "config.json")
     hps = train.load_config(config_path, model_dir, args)
     hps.model.spk_dim = 0
-    # =============================================================
-    # SECTION: Loading Data
-    # =============================================================
+
+    # --- DivideMix hyper-parameters ---
+    dm_config = {
+        "warm_up":     10,
+        "num_epochs":  300,
+        "alpha":       4.0,    # Beta(alpha,alpha) for MixUp
+        "lambda_u":    25.0,   # unsupervised loss weight
+        "p_threshold": 0.5,    # GMM clean-probability threshold
+        "T":           0.5,    # sharpening temperature
+        "noise_mode":  "sym",  # 'sym' | 'asym'
+        "num_class":   2,
+    }
+    with open(os.path.join(model_dir, "dm_config.json"), "w") as f:
+        json.dump(dm_config, f, indent=2)
+
+    # --- Data ---
     df_train, _ = train.load_data(hps)
-    collate_fn = train.get_collate_fn(hps)
-    target_labels = df_train[hps.data.target_column]
-    print(target_labels.shape)
+    collate_fn        = train.get_collate_fn(hps)
+    target_labels     = df_train[hps.data.target_column]
 
     if not args.use_precomputed:
         utils.compute_spectrogram_stats_from_dataset(
-            df_train, hps.data, 
-            pickle_path=f"{hps.model_dir}/wav_stats.pickle"
+            df_train, hps.data,
+            pickle_path=f"{hps.model_dir}/wav_stats.pickle",
         )
 
-    # =============================================================
-    # SECTION: Model Setup
-    # =============================================================
-    logger = utils.get_logger(hps.model_dir)
-    logger.info(hps)
+    logger_py = utils.get_logger(hps.model_dir)
+    logger_py.info(hps)
+    logger_py.info(f"DivideMix config: {dm_config}")
 
-    logger.info(f"======================================")
-    logger.info(f"✨ Loss: {hps.train.loss_function}")
-    logger.info(f"✨ Use Between Class Training: {hps.data.mix_audio}")
-    logger.info(f"✨ Use Augment: {hps.data.augment_data}")
-    logger.info(f"✨ Use Augment: Prob {hps.data.augment_prob}")
-    logger.info(f"✨ Use Rawboost Augment: {hps.data.augment_rawboost}")
-    logger.info(f"✨ Padding Type: {hps.data.pad_types}")
-    logger.info(f"✨ Using Model: {hps.model.pooling_model}")
-    logger.info(f"======================================")
-    
+    # Validation holdout (warmup early-stopping only)
+    sgkf = StratifiedGroupKFold(n_splits=5, random_state=42, shuffle=True)
+    wu_trn_idx, wu_val_idx = next(
+        sgkf.split(df_train, target_labels, df_train["participant"])
+    )
+    df_wu_trn = df_train.iloc[wu_trn_idx].reset_index(drop=True)
+    df_wu_val = df_train.iloc[wu_val_idx].reset_index(drop=True)
+
+    # Use evaluation holdout derived from df_train (ignore external df_test).
+    df_test = df_wu_val.copy()
+
+    # --- Models ---
     pool_net = train.setup_model(hps, is_init=args.init)
-    # =============================================================
-    # SECTION: Setup Logger, Dataloader
-    # =============================================================
-    RANDOM_STATE = 1
-    NOISY_DROP = 0.1 # Dropping bottom N * NOISY_DROP of the dataset 
-    MEM_ALPHA = 0.3
-    TAU = 5.0
-    
-    recov_config = {
-        "epoch": 100,
-        "n_fold": 10, # beta ↓ when N_FOLDS ↑
-        "weight_OF": [1.0, 0.0, 0.0],
-        "sample_fold_fn": "sample_folds", # sample_folds sample_folds_grouped
-        "noisy_drop_fn": "update_noisy_drop_variance", # update_noisy_drop_variance update_noisy_drop_gmm
-        "memory_alpha_fn": "update_memory_alpha", # memory_alpha_fixated update_memory_alpha
-        "tau_update_fn": "update_tau_variance", # update_tau_validation update_tau_variance
-        "noise_thr_fn": "estimate_noise_threshold_gmm", # estimate_noise_threshold_gmm
-        "noise_threshold_gmm_alpha": 0.1, 
-    }
-    with open(os.path.join(model_dir, "recov_config.json"), "w") as f:
-        json.dump(recov_config, f, indent=2)
-    hps_recov = utils.HParams(**recov_config)
-    
-    sgkf = StratifiedGroupKFold(n_splits=hps_recov.n_fold, random_state=RANDOM_STATE, shuffle=True)
-    fold_splits = list(sgkf.split(X=df_train, y=target_labels, groups=df_train["participant"]))
-    #kf = KFold(n_splits=N_FOLDS, random_state=RANDOM_STATE, shuffle=True)
-    #fold_splits = list(kf.split(df_train, target_labels))
+    net1 = pool_net(**hps.model)
+    net2 = pool_net(**hps.model)
 
-    identified = []
-    memory = np.zeros_like(target_labels, dtype=np.float64)
-    runs_metadata = {}    
-    runs_metadata[0] = {
-        'metrics': {
-            'confidence_mean': np.mean(memory[memory > 0.0]),
-            'memory_mean': np.mean(memory),
-            'identified_ratio': len(identified) / len(df_train),
-            'roc-auc': 0.0,
-            'TAU': TAU,
-            'MEMORY_NOISE_THRES': 0.0,
-            'NOISY_DROP': NOISY_DROP,
-            'MEM_ALPHA': MEM_ALPHA,
-        },
-        'memory': memory,
-    }
-    for run_idx, seed in enumerate(range(RANDOM_STATE, RANDOM_STATE + hps_recov.epoch)):
-        logger.info(f"\n{'='*20} Run {seed}/{hps_recov.epoch} {'='*20}")
-        set_seed(seed)
-        test_metadata = {"labels": [], "probs": [],
-            "patient_ids": [], "ids": [],
-        }
-        for fold, (train_idx, test_idx) in enumerate(fold_splits):
-            if len(identified) > 0:
-                NOISY_DROP = getattr(current_module, hps_recov.noisy_drop_fn)(memory)
-                drop_idx = np.random.permutation(identified)[:int(NOISY_DROP * len(identified))]
-                train_idx = list(set(train_idx) - set(drop_idx))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net1, net2 = net1.to(device), net2.to(device)
 
-            trainval_fold = df_train.iloc[train_idx].reset_index(drop=True)
-            test_fold = df_train.iloc[test_idx].reset_index(drop=True)
+    opt1 = torch.optim.AdamW(net1.parameters(), lr=hps.train.learning_rate)
+    opt2 = torch.optim.AdamW(net2.parameters(), lr=hps.train.learning_rate)
 
-            mask_proper, mask_cp = train.stratified_group_holdout(trainval_fold[hps.data.target_column].values, trainval_fold["participant"].values, 
-                                                                    test_size=0.15, seed=seed)
-            
-            train_fold = trainval_fold.iloc[mask_proper].reset_index(drop=True)
-            val_fold = trainval_fold.iloc[mask_cp].reset_index(drop=True)
+    # =========================================================
+    # Phase 1 – Warmup  (Lightning, one net at a time)
+    # Uses CoughClassificationRunner + prepare_fold_data as-is.
+    # =========================================================
+    logger_py.info(f"\n{'='*20} Warmup ({dm_config['warm_up']} epochs) {'='*20}")
 
-            train_loader, val_loader = train.prepare_fold_data(
-                train_fold, val_fold, hps, collate_fn,
+    wu_train_loader, wu_val_loader = train.prepare_fold_data(
+        df_wu_trn, df_wu_val, hps, collate_fn,
+        use_precomputed=args.use_precomputed,
+        precomputed_dir=args.precomputed_dir,
+    )
+    tb_logger = TensorBoardLogger(hps.model_dir, name="dividemix")
+
+    for net, tag in [(net1, "net1"), (net2, "net2")]:
+        logger_py.info(f"  Warmup {tag}")
+        runner = lightning_wrapper.CoughClassificationRunner(net, hps, logger_py)
+        ckpt_cb   = ModelCheckpoint(
+            dirpath=f"{hps.model_dir}/warmup_{tag}",
+            monitor="val/loss", filename="best", save_top_k=1, mode="min")
+        early_stop = EarlyStopping(monitor="val/loss", patience=5, mode="min")
+        trainer = L.Trainer(
+            max_epochs=dm_config["warm_up"],
+            callbacks=[ckpt_cb, early_stop],
+            accelerator="gpu" if torch.cuda.is_available() else "cpu",
+            devices="auto",
+            default_root_dir=hps.model_dir,
+            logger=tb_logger,
+        )
+        trainer.fit(runner,
+                    train_dataloaders=wu_train_loader,
+                    val_dataloaders=wu_val_loader)
+        # net weights updated in-place (runner.model IS net via shared reference)
+
+    # =========================================================
+    # Phase 2 – Co-training  (manual loop, matches original)
+    # =========================================================
+    logger_py.info(f"\n{'='*20} Co-training {'='*20}")
+
+    eval_ds = DivideMixDataset(
+        df_train, hps, mode='all', train_mode=False,
+        use_precomputed=args.use_precomputed, precomputed_dir=args.precomputed_dir,
+    )
+    eval_loader = DataLoader(
+        eval_ds, batch_size=hps.train.batch_size, shuffle=False,
+        num_workers=8, collate_fn=_dm_all_collate, pin_memory=True,
+    )
+
+    test_loader = None
+    if df_test is not None:
+        _, test_loader = train.prepare_fold_data(
+            df_wu_val, df_test, hps, collate_fn,
+            use_precomputed=args.use_precomputed,
+            precomputed_dir=args.precomputed_dir,
+        )
+
+    all_loss       = [[], []]
+    n_samples      = len(df_train)
+    metrics_history = {}
+
+    for epoch in range(dm_config["warm_up"], dm_config["num_epochs"] + 1):
+        logger_py.info(f"\n{'='*20} Epoch {epoch}/{dm_config['num_epochs']} {'='*20}")
+
+        # --- GMM evaluation (mirrors eval_train in original) ---
+        prob1, all_loss[0] = eval_train(net1, eval_loader, all_loss[0], device, n_samples)
+        prob2, all_loss[1] = eval_train(net2, eval_loader, all_loss[1], device, n_samples)
+
+        pred1 = prob1 > dm_config["p_threshold"]
+        pred2 = prob2 > dm_config["p_threshold"]
+        logger_py.info(
+            f"  Clean — net1:{pred1.sum()}  net2:{pred2.sum()}  total:{n_samples}")
+
+        # --- Train net1 with net2's co-divide ---
+        if pred2.sum() > 0 and (~pred2).sum() > 0:
+            lab_loader, unl_loader = _make_dm_loaders(
+                df_train, hps, pred2, prob2, hps.train.batch_size,
                 use_precomputed=args.use_precomputed,
-                precomputed_dir=args.precomputed_dir
+                precomputed_dir=args.precomputed_dir,
             )
-
-            pool_model = pool_net(**hps.model)
-            runner_lightning = lightning_wrapper.CoughClassificationRunner(pool_model, hps=hps, custom_logger=logger, class_weights=[])
-
-            checkpoint_callback = ModelCheckpoint(
-                dirpath=f"{hps.model_dir}/fold_{fold}", monitor="val/loss",
-                filename=f"pool_fold{fold}_{{epoch:02d}}", save_top_k=1, mode="min",
+            train_dividemix(
+                epoch, net1, net2, opt1, lab_loader, unl_loader,
+                dm_config["warm_up"], device,
+                dm_config["num_class"], dm_config["alpha"],
+                dm_config["lambda_u"], dm_config["T"], dm_config["noise_mode"],
+                log_fn=logger_py.info,
             )
-            early_stopping = EarlyStopping(monitor="val/loss", patience=7, mode="min", verbose=False)
-            trainer = L.Trainer(max_epochs=10000, callbacks=[checkpoint_callback, early_stopping],
-                accelerator="gpu" if torch.cuda.is_available() else "cpu", devices="auto",
-                default_root_dir=hps.model_dir
-            )
-            trainer.fit(runner_lightning, train_dataloaders=train_loader, val_dataloaders=val_loader)
-            
-            runner_lightning.calibrate_threshold = True
-            trainer.test(runner_lightning, dataloaders=val_loader, ckpt_path="best")
+        else:
+            logger_py.warning("  net2 GMM degenerate — skipping net1 update")
 
-            _, test_loader = train.prepare_fold_data(
-                test_fold, test_fold, hps, collate_fn,
+        # --- Train net2 with net1's co-divide ---
+        if pred1.sum() > 0 and (~pred1).sum() > 0:
+            lab_loader, unl_loader = _make_dm_loaders(
+                df_train, hps, pred1, prob1, hps.train.batch_size,
                 use_precomputed=args.use_precomputed,
-                precomputed_dir=args.precomputed_dir
+                precomputed_dir=args.precomputed_dir,
             )
-            trainer.test(runner_lightning, dataloaders=test_loader, ckpt_path="best")
-            result_fold = runner_lightning.test_outputs
+            train_dividemix(
+                epoch, net2, net1, opt2, lab_loader, unl_loader,
+                dm_config["warm_up"], device,
+                dm_config["num_class"], dm_config["alpha"],
+                dm_config["lambda_u"], dm_config["T"], dm_config["noise_mode"],
+                log_fn=logger_py.info,
+            )
+        else:
+            logger_py.warning("  net1 GMM degenerate — skipping net2 update")
 
-            test_metadata["labels"].append(result_fold['labels'])
-            test_metadata["probs"].append(result_fold['probs'])
-            test_metadata["patient_ids"].append(result_fold['patient_ids'])
-            test_metadata["ids"].append(test_idx)
-            
-        test_labels_all = np.concatenate(test_metadata["labels"])
-        pred_probs_all = np.concatenate(test_metadata["probs"])
-        test_patient_ids_all = np.concatenate(test_metadata["patient_ids"])
-        number_ids = [len(i) for i in test_metadata["ids"]]
-        test_ids_all = np.concatenate(test_metadata["ids"])
-        order = np.argsort(test_ids_all)
+        # --- Test (ensemble) ---
+        epoch_metrics = {"epoch": epoch,
+                         "n_clean_net1": int(pred1.sum()),
+                         "n_clean_net2": int(pred2.sum())}
+        if test_loader is not None:
+            labels_np, probs_np = test_dividemix(net1, net2, test_loader, device, dm_config["num_class"])
+            if len(np.unique(labels_np)) > 1:
+                auroc = roc_auc_score(labels_np, probs_np)
+                epoch_metrics["test_auroc"] = auroc
+                logger_py.info(f"  AUROC (ensemble): {auroc:.4f}")
 
-        # weights_acc = np.max(test_accs_np) - test_accs_np # distance from best fold, distance = 0, larger value.
-        # weights_acc = safe_minmax_scale(weights_acc) # 0 - 1 Norm
-        # weights_acc = 1 - weights_acc # Best fold → weight ≈ 1
-        # weights_acc = np.concatenate([[weights_acc[i]]*number_ids[i] for i in range(N_FOLDS)])
-        
-        # “How confident is the model that the ground-truth label is correct?”
-        # idx_temp = np.stack((np.arange(len(test_labels_all)), test_labels_all))
-        # temp =  pred_probs_all[idx_temp[0,:], idx_temp[1,:]] # For Multiclass, Extract Only True Probs
-        temp = np.where(test_labels_all == 1, pred_probs_all, 1 - pred_probs_all)
-        #weights_probs = (temp - temp.min()) / (temp.max() - temp.min() + 1e-8) # Why We 0 1 Norm?
-        weights_probs = 1 - (temp.max() - temp)
-        weights = weights_probs #+ hps_recov.weight_OF[0] * weights_acc
-        weights = weights[order]
+        metrics_history[epoch] = epoch_metrics
 
-        # # Participant Aggregatiion
-        # test_patient_ids_all = test_patient_ids_all[order]
-        # _, inverse = np.unique(test_patient_ids_all, return_inverse=True)
-        # pid_sum = np.bincount(inverse, weights=weights)
-        # pid_cnt = np.bincount(inverse)
-        # pid_mean = pid_sum / pid_cnt
-        # weights = pid_mean[inverse]
+        if epoch % 10 == 0:
+            torch.save(net1.state_dict(), f"{hps.model_dir}/net1_ep{epoch:04d}.pt")
+            torch.save(net2.state_dict(), f"{hps.model_dir}/net2_ep{epoch:04d}.pt")
 
-        MEM_ALPHA = getattr(current_module, hps_recov.memory_alpha_fn)(weights=weights, memory=memory, prev_alpha=MEM_ALPHA)
-        memory = MEM_ALPHA * weights + (1.0 - MEM_ALPHA) * memory
+    torch.save(net1.state_dict(), f"{hps.model_dir}/net1_final.pt")
+    torch.save(net2.state_dict(), f"{hps.model_dir}/net2_final.pt")
+    with open(os.path.join(hps.model_dir, "dm_metrics.pkl"), "wb") as f:
+        pickle.dump(metrics_history, f)
 
-        TAU = getattr(current_module, hps_recov.tau_update_fn)(TAU, memory) # 1) variance-driven. memory -> test_youden 2) validation-feedback (use Youden or b_acc)
-        MEMORY_NOISE_THRES = getattr(current_module, hps_recov.noise_thr_fn)(memory, alpha=hps_recov.noise_threshold_gmm_alpha)
-        
-        fold_splits, _ = getattr(current_module, hps_recov.sample_fold_fn)(hps_recov.n_fold, memory, TAU, participant_ids=df_train["participant"].values)
-        identified = np.where(memory <= MEMORY_NOISE_THRES)[0]
+    logger_py.info("DivideMix training complete.")
 
-        runs_metadata[seed] = {
-            'metrics': {
-                'confidence_mean': np.mean(memory[memory > MEMORY_NOISE_THRES]),
-                'memory_mean': np.mean(memory),
-                'identified_ratio': len(identified) / len(df_train),
-                'roc-auc': roc_auc_score(test_labels_all, pred_probs_all),
-                'TAU': TAU,
-                'MEMORY_NOISE_THRES': MEMORY_NOISE_THRES,
-                'NOISY_DROP': NOISY_DROP,
-                'MEM_ALPHA': MEM_ALPHA,
-            },
-            'memory': memory,
-        }
 
-        for metric in runs_metadata[seed]['metrics'].keys():
-            values_mean = []
-            for _, values in runs_metadata.items():
-                values_mean.append(values['metrics'][metric])
-            plt.figure()
-            plt.plot(values_mean)
-            plt.xlabel("Runs")
-            plt.ylabel(metric)
-            plt.title(f"{metric} across runs")
-            plt.grid(True)
-            plt.savefig(f"{hps.model_dir}/{metric}_across_runs.png", dpi=300, bbox_inches="tight")
-            plt.close()
-
-        np.save(f"{hps.model_dir}/memory.npy", memory)
-        np.save(f"{hps.model_dir}/identified.npy", identified)
-        with open(os.path.join(hps.model_dir, "runs_metadata.pkl"), "wb") as f:
-            pickle.dump(runs_metadata, f)
-
-        for d in Path(hps.model_dir).glob("fold_*"):
-            if d.is_dir():
-                shutil.rmtree(d)
-    
 if __name__ == "__main__":
     main()
