@@ -39,8 +39,7 @@ from torchvision import datasets, transforms
 from tqdm import tqdm
 from sklearn.isotonic import IsotonicRegression
 import optuna
-from sklearn.metrics import log_loss
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import log_loss, roc_auc_score, average_precision_score
 
 # Local imports
 import commons
@@ -128,10 +127,10 @@ def main(cli_args=None):
     # =============================================================
     def sample_params(trial):
         model_params = {
-            "hidden_dim_classifier": trial.suggest_categorical("hidden_dim_classifier", [8, 16, 32, 64, 128, 192, 256, 384, 512]),
-            "dropout": trial.suggest_float("dropout", 0.1, 0.9),
+            "hidden_dim_classifier": trial.suggest_categorical("hidden_dim_classifier", [8, 16, 32, 64, 128, 192, 256, 384]), # 8, 16, 32, 64, 
+            "dropout": trial.suggest_float("dropout", 0.4, 0.9),
 
-            "hidden_size": trial.suggest_categorical("hidden_size", [8, 16, 32, 64, 128, 192, 256, 384, 512]),
+            "hidden_size": trial.suggest_categorical("hidden_size", [32, 64, 128, 192, 256, 384]),
             "lstmnum_layers": trial.suggest_int("lstmnum_layers", 1, 4),
             # "att_head": trial.suggest_categorical("att_head", [1, 2, 4, 8]),
             # "att_head_fusion": trial.suggest_categorical("att_head_fusion", [1, 2, 4, 8]),
@@ -143,9 +142,9 @@ def main(cli_args=None):
 
         #multimask_augment = trial.suggest_categorical("multimask_augment", [True, False])
 
-        # filter_length = trial.suggest_categorical("filter_length", [512, 1024, 2048])
-        # win_length = trial.suggest_categorical("win_length", [256, 512, 1024])
-        # win_length = min(win_length, filter_length)  # ensure win_length <= filter_length
+        filter_length = trial.suggest_categorical("filter_length", [512, 1024, 2048])
+        win_length = trial.suggest_categorical("win_length", [256, 512, 1024])
+        win_length = min(win_length, filter_length)  # ensure win_length <= filter_length
 
         data_params = {
             # "multimask_augment": multimask_augment,
@@ -154,10 +153,10 @@ def main(cli_args=None):
             # "nu": trial.suggest_float("nu", 0.01, 0.5) if multimask_augment else 0.10,
             # "num_masks": trial.suggest_int("num_masks", 1, 6) if multimask_augment else 3,
 
-            # "filter_length": filter_length,
-            # "hop_length": trial.suggest_categorical("hop_length", [32, 64, 128, 256, 512]),
-            # "win_length": win_length,
-            # "n_mel_channels": trial.suggest_categorical("n_mel_channels", [40, 64, 80, 128, 160]), # [6, 13, 13 * 2, 13 * 3, 13 * 4] [40, 64, 80, 128, 160]
+            "filter_length": filter_length,
+            "hop_length": trial.suggest_categorical("hop_length", [32, 64, 128, 256, 512]),
+            "win_length": win_length,
+            "n_mel_channels": trial.suggest_categorical("n_mel_channels", [40, 80, 128]), # [6, 13, 13 * 2, 13 * 3, 13 * 4] [40, 64, 80, 128, 160]
             # "mel_fmin": trial.suggest_categorical("mel_fmin", [0, 20, 40, 80, 100, 120, 200, 400, 500, 600]),
             # "mel_fmax": trial.suggest_categorical("mel_fmax", [5000, 6000, 7000, 8000]),
 
@@ -180,10 +179,10 @@ def main(cli_args=None):
         # hps.data.nu = data_params["nu"]
         # hps.data.num_masks = data_params["num_masks"]
 
-        # hps.data.filter_length = data_params["filter_length"]
-        # hps.data.hop_length = data_params["hop_length"]
-        # hps.data.win_length = data_params["win_length"]
-        # hps.data.n_mel_channels = data_params["n_mel_channels"]
+        hps.data.filter_length = data_params["filter_length"]
+        hps.data.hop_length = data_params["hop_length"]
+        hps.data.win_length = data_params["win_length"]
+        hps.data.n_mel_channels = data_params["n_mel_channels"]
         # hps.data.mel_fmin = data_params["mel_fmin"]
         # hps.data.mel_fmax = data_params["mel_fmax"]
 
@@ -195,13 +194,12 @@ def main(cli_args=None):
         # hps.data.augment_rawboost = data_params["augment_rawboost"]
         # hps.data.add_noise = data_params["add_noise"]
 
-        # feat_mult = 1
+        feat_mult = 1
         # if data_params["delta_feature"]:
         #     feat_mult += 1
         # if data_params["deltadelta_feature"]:
         #     feat_mult += 1
-        # hps.model.feature_dim = data_params["n_mel_channels"] * feat_mult
-        # hps.model.feature_dim = data_params["n_mel_channels"]
+        hps.model.feature_dim = data_params["n_mel_channels"] * feat_mult
 
         # Precompute features for this trial's spectrogram config into a temp dir
         trial_precomputed_dir = tempfile.mkdtemp(prefix=f"trial{trial.number}_", dir=hps.model_dir)
@@ -277,7 +275,8 @@ def main(cli_args=None):
             pred_probs_all = np.concatenate(test_metadata["probs"])
             
             #final_score = -log_loss(test_labels_all, pred_probs_all)
-            final_score = roc_auc_score(test_labels_all, pred_probs_all)
+            #final_score = roc_auc_score(test_labels_all, pred_probs_all) # AUCROC
+            final_score = average_precision_score(test_labels_all, pred_probs_all) # auprc
 
             # mean_acc = np.mean(fold_scores)
             # std_acc = np.std(fold_scores)

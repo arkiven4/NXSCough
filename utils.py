@@ -774,9 +774,9 @@ def compute_spectrogram_stats_from_dataset(df, hparams, pickle_path="spec_stats.
             - "mean_delta_db", "std_delta_db": Delta feature statistics (if enabled)
             - "mean_deltadelta_db", "std_deltadelta_db": Deltadelta feature statistics (if enabled)
     """
-    if os.path.exists(pickle_path):
-        with open(pickle_path, "rb") as f:
-            return pickle.load(f)
+    # if os.path.exists(pickle_path):
+    #     with open(pickle_path, "rb") as f:
+    #         return pickle.load(f)
 
     # Import here to avoid circular dependency
     from cough_datasets import CoughDatasets

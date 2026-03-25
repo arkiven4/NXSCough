@@ -12,7 +12,7 @@ from peft import PeftModel
 from sklearn.metrics import (
     confusion_matrix, accuracy_score,
     balanced_accuracy_score,
-    roc_auc_score, roc_curve
+    roc_auc_score, roc_curve, average_precision_score
 )
 
 import commons
@@ -259,6 +259,7 @@ class CoughClassificationRunner(L.LightningModule):
         # if unique_labels.size == 2:
         if n_classes == 2:
             auroc = roc_auc_score(labels, probs)
+            auprc = average_precision_score(labels, probs)
 
             fpr, tpr, thresholds = roc_curve(labels, probs)
             spec_curve = 1 - fpr
@@ -271,6 +272,7 @@ class CoughClassificationRunner(L.LightningModule):
                 p_auroc = 0.0
         else:
             auroc = 0.0
+            auprc = 0.0
             p_auroc = 0.0
 
         # -----------------------------------------
@@ -282,6 +284,7 @@ class CoughClassificationRunner(L.LightningModule):
         self.log("test_spec", spec, sync_dist=True)
         self.log("test_auroc", auroc, sync_dist=True)
         self.log("test_pauroc", p_auroc, sync_dist=True)
+        self.log("test_auprc", auprc, sync_dist=True)
 
         # -----------------------------------------
         # Save CM
@@ -354,6 +357,7 @@ class CoughClassificationRunner(L.LightningModule):
             "spec": spec,
             "auroc": auroc,
             "pauroc": p_auroc,
+            "auprc": auprc,
         }
 
 

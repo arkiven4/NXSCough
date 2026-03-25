@@ -526,7 +526,8 @@ def write_results_to_file(filename, results_dict, model_dir, db_map=None):
                 f"Sens {results['test_sens']:.4f} | "
                 f"Spec {results['test_spec']:.4f} | "
                 f"AUROC {results['test_auroc']:.4f} | "
-                f"pAUROC {results['test_pauroc']:.4f}\n"
+                f"pAUROC {results['test_pauroc']:.4f} | "
+                f"AUPRC {results['test_auprc']:.4f}\n"
             )
 
 
@@ -603,13 +604,11 @@ def main(cli_args=None):
     # =============================================================
     # SECTION: Loading Data
     # =============================================================
-    df_train, _ = load_data(hps)
+    #df_filt = pd.read_csv("/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/temp_data/metadata.csv")
+    #valid_paths = set(df_filt["path_file"].unique())
 
-    df_load = pd.read_csv("/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/try4/biomarker_predictions.csv")[['path_file', "prediction_prob","predicted_class","subgroup"]]
-    noisy_paths = set(
-        df_load.loc[df_load["subgroup"] == "noisy_label", "path_file"]
-    )
-    df_train = df_train[~df_train["path_file"].isin(noisy_paths)].copy()
+    df_train, _ = load_data(hps)
+    #df_train = df_train[df_train["path_file"].isin(valid_paths)].copy()
 
     if args.use_fastrecov:
         fastrecov_dir = args.fastrecov_dir if args.fastrecov_dir else model_dir
@@ -638,6 +637,13 @@ def main(cli_args=None):
     df_cirdz = pd.read_csv(f'/run/media/fourier/Data1/Pras/Thesis_Nexus/NXSCough/data/metadata_cirdz.csv.train')
     df_cirdz = df_cirdz.reset_index(drop=True)
     df_cirdz = df_cirdz[hps.data.column_order]
+
+    df_tbscreen = pd.read_csv(f'/run/media/fourier/Data1/Pras/DatabaseLLM/TBscreen_Dataset/metadata.csv')
+    df_tbscreen = df_tbscreen.reset_index(drop=True)
+    df_tbscreen = df_tbscreen[hps.data.column_order]
+    df_tbscreen["participant"] = df_tbscreen["participant"].astype("category").cat.codes
+    #df_tbscreen = df_tbscreen[df_tbscreen["path_file"].isin(valid_paths)].copy()
+
     # =============================================================
     # SECTION: Model Setup
     # =============================================================
@@ -763,6 +769,28 @@ def main(cli_args=None):
             "raw_data": runner_lightning.test_outputs,
         }
         write_results_to_file("result_overall.txt", results_dict, f"{hps.model_dir}", {0: "CIRDZ " + str(fold_outter)})
+
+        results_dict = {}
+        loader = DataLoader(
+            CoughDatasets(
+                df_tbscreen.values, 
+                hps.data,
+                wav_stats_path=f"{args.precomputed_dir}/wav_stats.pickle", 
+                train=False,
+                use_precomputed=False
+            ), 
+            num_workers=28, 
+            shuffle=False, 
+            batch_size=hps.train.batch_size,
+            pin_memory=True, 
+            collate_fn=collate_fn
+        )
+        results = trainer.test(runner_lightning, dataloaders=loader)[0]
+        results_dict[0] = {
+            "metrics": results,
+            "raw_data": runner_lightning.test_outputs,
+        }
+        write_results_to_file("result_overall.txt", results_dict, f"{hps.model_dir}", {0: "TBScreen " + str(fold_outter)})
 
         #additional_array.append(runner_lightning.model.gate_layer.get_gates().detach().cpu().numpy())
 
