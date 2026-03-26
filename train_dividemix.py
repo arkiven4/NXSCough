@@ -371,7 +371,12 @@ def train_dividemix(epoch, net, peer_net, optimizer,
             epoch + batch_idx / num_iter, warm_up, lambda_u,
         )
 
-        prior    = torch.ones(num_class, device=device) / num_class
+        # Use class frequencies from the labeled batch as prior.
+        # Original DivideMix uses uniform prior (fine for balanced CIFAR).
+        # For imbalanced data (e.g. 80% non-TB / 20% TB), a uniform prior
+        # pushes predictions toward 50/50, collapsing AUROC over epochs.
+        prior    = labels_oh.mean(0).detach()
+        prior    = (prior + 1e-8) / (prior.sum() + 1e-8)
         pred_avg = F.softmax(logits_all, dim=1).mean(0)
         penalty  = torch.sum(prior * torch.log(prior / (pred_avg + 1e-8)))
         if noise_mode == 'asym':
@@ -385,6 +390,42 @@ def train_dividemix(epoch, net, peer_net, optimizer,
         if log_fn and batch_idx % 50 == 0:
             log_fn(f"    [{batch_idx:4d}/{num_iter}] "
                    f"Lx={Lx.item():.3f}  Lu={Lu.item():.3f}  lamb={lamb:.3f}")
+
+
+def eval_agreement(net1, net2, eval_loader, device, log_fn=None):
+    """
+    Compute net1–net2 prediction agreement on the training set.
+
+    Used as a proxy convergence metric when test labels are unreliable.
+    Higher agreement → more stable co-training; watch for it plateauing or dropping.
+
+    eval_loader must use _dm_all_collate format: (audio, labels, indices, masks)
+    Returns agreement rate in [0, 1].
+    """
+    net1.eval()
+    net2.eval()
+    agree = total = 0
+
+    with torch.no_grad():
+        for audio, labels, _, masks in eval_loader:
+            audio, masks = audio.to(device), masks.to(device)
+            out1 = net1(audio, attention_mask=masks)['disease_logits']
+            out2 = net2(audio, attention_mask=masks)['disease_logits']
+
+            if out1.shape[-1] == 1:
+                pred1 = (torch.sigmoid(out1.squeeze(-1)) > 0.5).long()
+                pred2 = (torch.sigmoid(out2.squeeze(-1)) > 0.5).long()
+            else:
+                pred1 = out1.argmax(dim=1)
+                pred2 = out2.argmax(dim=1)
+
+            agree += (pred1 == pred2).sum().item()
+            total += labels.size(0)
+
+    rate = agree / max(total, 1)
+    if log_fn:
+        log_fn(f"  Net1–Net2 agreement: {agree}/{total} = {rate:.4f}")
+    return rate
 
 
 def test_dividemix(net1, net2, test_loader, device, log_fn=None):
@@ -424,13 +465,17 @@ def test_dividemix(net1, net2, test_loader, device, log_fn=None):
     logits1_np = torch.cat(all_logits1).numpy()
     logits2_np = torch.cat(all_logits2).numpy()
     
-    # Debug: check distribution
     if log_fn:
         log_fn(f"    Test labels dist: {np.bincount(labels_np.astype(int))}")
         log_fn(f"    Test probs: min={probs_np.min():.4f}, max={probs_np.max():.4f}, mean={probs_np.mean():.4f}")
         log_fn(f"    Logits1 range: [{logits1_np.min():.4f}, {logits1_np.max():.4f}]")
         log_fn(f"    Logits2 range: [{logits2_np.min():.4f}, {logits2_np.max():.4f}]")
-    
+        # Flip diagnostic: mean P(class=1) should be HIGHER for true positives (class=1).
+        # If it is lower, predictions are inverted — class index ordering may be wrong.
+        for cls in np.unique(labels_np.astype(int)):
+            m = labels_np == cls
+            log_fn(f"    mean P(class=1) | true_label={cls}: {probs_np[m].mean():.4f}")
+
     return labels_np, probs_np
 
 
@@ -451,18 +496,49 @@ def main(cli_args=None):
 
     # --- DivideMix hyper-parameters ---
     dm_config = {
-        "warm_up":     10,
-        "num_epochs":  300,
-        "alpha":       4.0,    # Beta(alpha,alpha) for MixUp
-        "lambda_u":    25.0,   # unsupervised loss weight
-        "p_threshold": 0.5,    # GMM clean-probability threshold
-        "T":           0.5,    # sharpening temperature
-        "noise_mode":  "sym",  # 'sym' | 'asym'
-        "num_class":   2,
-        # How to handle class-0 (non-TB / negative) samples in the GMM step:
-        #   'default' – GMM applied to class 0 too; noisy class-0 → unlabeled  (original DivideMix behaviour)
-        #   'keep'    – skip GMM for class-0; all negatives treated as labeled-clean
-        "class0_mode": "default",
+        # Warmup epochs: standard CE on all data before co-training starts.
+        # ↑ more  → cleaner network initialisation, slower start
+        # ↓ fewer → faster, but noisier starting point for GMM
+        "warm_up": 10,
+
+        # Total training epochs (warmup + co-training).
+        # ↑ more  → longer convergence, risk of memorising noise if GMM is imperfect
+        # ↓ fewer → faster, may underfit
+        "num_epochs": 300,
+
+        # MixUp interpolation strength: samples drawn from Beta(alpha, alpha).
+        # ↑ larger (e.g. 8) → stronger mixing, more regularisation, smoother boundaries
+        # ↓ smaller (→0)    → less mixing, closer to standard training
+        "alpha": 4.0,
+
+        # Weight for the unsupervised (unlabeled) loss component.
+        # ↑ larger → model relies more on co-guessed pseudo-labels
+        # ↓ smaller → model focuses on the labeled (clean) set only
+        # Ramped linearly from 0 to lambda_u over 16 epochs after warm_up.
+        "lambda_u": 25.0,
+
+        # GMM clean-probability threshold: samples with prob > threshold → labeled set.
+        # ↑ larger (e.g. 0.7) → stricter, fewer but purer labeled samples
+        # ↓ smaller (e.g. 0.3) → more samples labeled clean, higher noise tolerance
+        # 0.5 is the natural midpoint with class-conditional GMM (recommended).
+        "p_threshold": 0.5,
+
+        # Temperature for label sharpening (0 < T ≤ 1).
+        # ↑ larger (→1) → softer pseudo-labels, more entropy kept
+        # ↓ smaller (→0) → harder pseudo-labels, more confident but noisier
+        "T": 0.5,
+
+        # Noise model assumption, affects the entropy penalty term:
+        # 'sym'  → symmetric noise (random flips); no extra penalty
+        # 'asym' → asymmetric noise (class-specific flips); adds neg-entropy penalty
+        "noise_mode": "sym",
+
+        "num_class": 2,
+
+        # How class-0 (non-TB / negative) samples are treated in the GMM step:
+        # 'default' → GMM applied to class 0 too (original DivideMix behaviour)
+        # 'keep'    → skip GMM for class-0; all negatives treated as labeled-clean
+        "class0_mode": "keep",
     }
     with open(os.path.join(model_dir, "dm_config.json"), "w") as f:
         json.dump(dm_config, f, indent=2)
@@ -489,9 +565,7 @@ def main(cli_args=None):
     )
     df_wu_trn = df_train.iloc[wu_trn_idx].reset_index(drop=True)
     df_wu_val = df_train.iloc[wu_val_idx].reset_index(drop=True)
-
-    # Use evaluation holdout derived from df_train (ignore external df_test).
-    df_test = df_wu_val.copy()
+    # Note: no trusted test set — evaluation uses net1–net2 agreement as proxy metric.
 
     # --- Models ---
     pool_net = train.setup_model(hps, is_init=args.init)
@@ -551,14 +625,6 @@ def main(cli_args=None):
         num_workers=8, collate_fn=_dm_all_collate, pin_memory=True,
     )
 
-    test_loader = None
-    if df_test is not None:
-        _, test_loader = train.prepare_fold_data(
-            df_wu_val, df_test, hps, collate_fn,
-            use_precomputed=args.use_precomputed,
-            precomputed_dir=args.precomputed_dir,
-        )
-
     all_loss       = [[], []]
     n_samples      = len(df_train)
     metrics_history = {}
@@ -614,16 +680,24 @@ def main(cli_args=None):
         else:
             logger_py.warning("  net1 GMM degenerate — skipping net2 update")
 
-        # --- Test (ensemble) ---
-        epoch_metrics = {"epoch": epoch,
-                         "n_clean_net1": int(pred1.sum()),
-                         "n_clean_net2": int(pred2.sum())}
-        if test_loader is not None:
-            labels_np, probs_np = test_dividemix(net1, net2, test_loader, device, log_fn=logger_py.info)
-            if len(np.unique(labels_np)) > 1:
-                auroc = roc_auc_score(labels_np, probs_np)
-                epoch_metrics["test_auroc"] = auroc
-                logger_py.info(f"  AUROC (ensemble): {auroc:.4f}")
+        # --- Proxy metrics (no trusted test set) ---
+        # Net1–Net2 agreement: proxy for training stability.
+        #   Rising   → networks converging on consistent predictions (good)
+        #   Dropping → co-training destabilising (check lambda_u / p_threshold)
+        # Clean fraction: fraction of training samples GMM considers clean.
+        #   Too low  → most data pushed to unlabeled; semi-supervised signal dominates
+        #   Too high → GMM not filtering effectively; increase p_threshold
+        agreement = eval_agreement(net1, net2, eval_loader, device, log_fn=logger_py.info)
+        clean_frac = ((pred1.sum() + pred2.sum()) / 2) / n_samples
+        logger_py.info(f"  Clean fraction (avg): {clean_frac:.3f}")
+
+        epoch_metrics = {
+            "epoch":        epoch,
+            "agreement":    agreement,
+            "clean_frac":   float(clean_frac),
+            "n_clean_net1": int(pred1.sum()),
+            "n_clean_net2": int(pred2.sum()),
+        }
 
         metrics_history[epoch] = epoch_metrics
 
