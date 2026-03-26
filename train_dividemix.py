@@ -23,7 +23,6 @@ import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers.tensorboard import TensorBoardLogger
 from sklearn.mixture import GaussianMixture
-from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import DataLoader
 
@@ -428,6 +427,73 @@ def eval_agreement(net1, net2, eval_loader, device, log_fn=None):
     return rate
 
 
+def save_label_analysis(net1, net2, eval_loader, noisy_labels,
+                        prob1, prob2, p_threshold, save_path, device, log_fn=None):
+    """
+    Run ensemble inference on the full training set and write per-sample analysis to CSV.
+
+    Columns
+    -------
+    noisy_label     : original label from the dataset (may be wrong)
+    clean_prob_net1 : GMM cleanness probability from net1  (↑ = more likely clean label)
+    clean_prob_net2 : GMM cleanness probability from net2
+    clean_prob_avg  : average of the two — recommended label-quality score
+    is_clean        : True when clean_prob_avg > p_threshold
+    pred_prob_tb    : ensemble P(TB) from the final net1+net2 models
+    pred_label      : hard predicted label (1=TB, 0=NTB) at threshold 0.5
+
+    How to read the output
+    ----------------------
+    - pred_label  : the denoised label suggested by the trained ensemble
+    - clean_prob_avg close to 1 + pred_label matches noisy_label → high-confidence clean sample
+    - clean_prob_avg close to 0 → GMM flagged as noisy; pred_label may differ from noisy_label
+    """
+    net1.eval()
+    net2.eval()
+    n = len(noisy_labels)
+    pred_probs = torch.zeros(n)
+
+    with torch.no_grad():
+        for audio, _, indices, masks in eval_loader:
+            audio, masks = audio.to(device), masks.to(device)
+            out1 = net1(audio, attention_mask=masks)['disease_logits']
+            out2 = net2(audio, attention_mask=masks)['disease_logits']
+
+            if out1.shape[-1] == 1:
+                p1 = torch.sigmoid(out1.squeeze(-1))
+                p2 = torch.sigmoid(out2.squeeze(-1))
+            else:
+                p1 = F.softmax(out1, dim=1)[:, 1]
+                p2 = F.softmax(out2, dim=1)[:, 1]
+
+            for b, idx in enumerate(indices):
+                pred_probs[idx.item()] = ((p1[b] + p2[b]) / 2).item()
+
+    clean_avg = (prob1 + prob2) / 2
+    pred_np   = pred_probs.numpy()
+
+    result = pd.DataFrame({
+        'noisy_label':     noisy_labels,
+        'clean_prob_net1': prob1,
+        'clean_prob_net2': prob2,
+        'clean_prob_avg':  clean_avg,
+        'is_clean':        clean_avg > p_threshold,
+        'pred_prob_tb':    pred_np,
+        'pred_label':      (pred_np > 0.5).astype(int),
+    })
+    result.to_csv(save_path, index=False)
+
+    if log_fn:
+        n_clean    = int(result['is_clean'].sum())
+        n_pred_tb  = int(result['pred_label'].sum())
+        n_noisy_tb = int((noisy_labels == 1).sum())
+        n_changed  = int((result['pred_label'].values != noisy_labels).sum())
+        log_fn(f"  Label analysis saved → {save_path}")
+        log_fn(f"  GMM clean samples : {n_clean} / {n}")
+        log_fn(f"  Pred TB (class 1) : {n_pred_tb}  (noisy TB: {n_noisy_tb})")
+        log_fn(f"  Label changes     : {n_changed} samples differ from noisy_label")
+
+
 def test_dividemix(net1, net2, test_loader, device, log_fn=None):
     """
     Ensemble of net1+net2.  Mirrors test() in Train_cifar.py.
@@ -521,7 +587,7 @@ def main(cli_args=None):
         # ↑ larger (e.g. 0.7) → stricter, fewer but purer labeled samples
         # ↓ smaller (e.g. 0.3) → more samples labeled clean, higher noise tolerance
         # 0.5 is the natural midpoint with class-conditional GMM (recommended).
-        "p_threshold": 0.5,
+        "p_threshold": 0.7,
 
         # Temperature for label sharpening (0 < T ≤ 1).
         # ↑ larger (→1) → softer pseudo-labels, more entropy kept
@@ -709,6 +775,17 @@ def main(cli_args=None):
     torch.save(net2.state_dict(), f"{hps.model_dir}/net2_final.pt")
     with open(os.path.join(hps.model_dir, "dm_metrics.pkl"), "wb") as f:
         pickle.dump(metrics_history, f)
+
+    # --- Save label analysis (denoised labels + cleanness scores) ---
+    logger_py.info("\nGenerating label analysis...")
+    save_label_analysis(
+        net1, net2, eval_loader,
+        noisy_labels=df_train[hps.data.target_column].values,
+        prob1=prob1, prob2=prob2,
+        p_threshold=dm_config["p_threshold"],
+        save_path=os.path.join(hps.model_dir, "label_analysis.csv"),
+        device=device, log_fn=logger_py.info,
+    )
 
     logger_py.info("DivideMix training complete.")
 

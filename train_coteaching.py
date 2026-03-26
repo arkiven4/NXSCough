@@ -32,13 +32,14 @@ import json
 import os
 import pickle
 
-import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers.tensorboard import TensorBoardLogger
 from sklearn.model_selection import StratifiedGroupKFold
+from torch.utils.data import DataLoader
 
 import lightning_wrapper
 import utils
@@ -85,7 +86,7 @@ def _keep_ratio(epoch, warmup, noise_rate, T_k):
 # =====================================================================
 
 def train_coteaching_epoch(net1, net2, opt1, opt2, loader,
-                           keep_ratio, device, log_fn=None):
+                           keep_ratio, device, class0_mode='keep', log_fn=None):
     """
     One co-teaching epoch.
 
@@ -94,8 +95,15 @@ def train_coteaching_epoch(net1, net2, opt1, opt2, loader,
       - net1's small-loss indices  → net2 is updated on those samples.
       - net2's small-loss indices  → net1 is updated on those samples.
 
+    class0_mode controls how class-0 (NTB / negative) samples are handled:
+      'keep'   → all samples used in co-teaching (default)
+      'remove' → class-0 samples dropped from every mini-batch before training;
+                 only class-1 (TB) samples are used for the co-teaching update
+
     Returns (avg_loss_net1, avg_loss_net2).
     """
+    net1.cuda()
+    net2.cuda()
     net1.train()
     net2.train()
     total1 = total2 = 0.0
@@ -106,6 +114,15 @@ def train_coteaching_epoch(net1, net2, opt1, opt2, loader,
         audio  = audio.to(device)
         masks  = masks.to(device)
         labels = torch.argmax(dse_ids.float(), dim=1).to(device)
+
+        if class0_mode == 'remove':
+            keep = labels != 0
+            if keep.sum() < 2:   # need ≥ 2 samples for a meaningful update
+                continue
+            audio  = audio[keep]
+            masks  = masks[keep]
+            labels = labels[keep]
+
         N      = labels.size(0)
         n_keep = max(1, int(keep_ratio * N))
 
@@ -184,6 +201,74 @@ def eval_agreement(net1, net2, loader, device, log_fn=None):
     return rate
 
 
+def save_label_analysis(net1, net2, df_train, hps, noisy_labels,
+                        save_path, device, use_precomputed, precomputed_dir,
+                        log_fn=None):
+    """
+    Run ensemble inference on the full training set and write per-sample analysis to CSV.
+
+    Columns
+    -------
+    noisy_label   : original label from the dataset (may be wrong)
+    pred_prob_tb  : ensemble P(TB) from the final net1+net2 models
+    pred_label    : hard predicted label (1=TB, 0=NTB) at threshold 0.5
+
+    How to read the output
+    ----------------------
+    - pred_label  : the denoised label suggested by the trained ensemble
+    - pred_prob_tb close to 0 or 1 → model is confident; close to 0.5 → uncertain
+    - pred_label ≠ noisy_label → model disagrees with original label (likely noisy)
+    """
+    # Import dataset utilities from train_dividemix to avoid duplicating eval logic
+    from train_dividemix import DivideMixDataset, _dm_all_collate
+
+    eval_ds = DivideMixDataset(
+        df_train, hps, mode='all', train_mode=False,
+        use_precomputed=use_precomputed, precomputed_dir=precomputed_dir,
+    )
+    eval_loader = DataLoader(
+        eval_ds, batch_size=hps.train.batch_size, shuffle=False,
+        num_workers=4, collate_fn=_dm_all_collate, pin_memory=True,
+    )
+
+    net1.eval()
+    net2.eval()
+    n = len(noisy_labels)
+    pred_probs = torch.zeros(n)
+
+    with torch.no_grad():
+        for audio, _, indices, masks in eval_loader:
+            audio, masks = audio.to(device), masks.to(device)
+            out1 = net1(audio, attention_mask=masks)['disease_logits']
+            out2 = net2(audio, attention_mask=masks)['disease_logits']
+
+            if out1.shape[-1] == 1:
+                p1 = torch.sigmoid(out1.squeeze(-1))
+                p2 = torch.sigmoid(out2.squeeze(-1))
+            else:
+                p1 = F.softmax(out1, dim=1)[:, 1]
+                p2 = F.softmax(out2, dim=1)[:, 1]
+
+            for b, idx in enumerate(indices):
+                pred_probs[idx.item()] = ((p1[b] + p2[b]) / 2).item()
+
+    pred_np = pred_probs.numpy()
+    result = pd.DataFrame({
+        'noisy_label':  noisy_labels,
+        'pred_prob_tb': pred_np,
+        'pred_label':   (pred_np > 0.5).astype(int),
+    })
+    result.to_csv(save_path, index=False)
+
+    if log_fn:
+        n_pred_tb  = int(result['pred_label'].sum())
+        n_noisy_tb = int((noisy_labels == 1).sum())
+        n_changed  = int((result['pred_label'].values != noisy_labels).sum())
+        log_fn(f"  Label analysis saved → {save_path}")
+        log_fn(f"  Pred TB (class 1) : {n_pred_tb}  (noisy TB: {n_noisy_tb})")
+        log_fn(f"  Label changes     : {n_changed} samples differ from noisy_label")
+
+
 # =====================================================================
 # Main
 # =====================================================================
@@ -215,12 +300,19 @@ def main(cli_args=None):
         # ↑ larger → smaller keep set per batch, more aggressive filtering
         # ↓ smaller → closer to standard training (keep almost all samples)
         # Rule of thumb: set to your estimated noise fraction (e.g. 0.2 for 20 % noise).
-        "noise_rate": 0.2,
+        "noise_rate": 0.7,
 
         # Ramp length: how many epochs (after warmup) to linearly increase R from 0 to noise_rate.
         # ↑ more  → slower, gentler increase of the noise filter
         # ↓ fewer → noise filter kicks in more aggressively early on
         "T_k": 10,
+
+        # How class-0 (NTB / negative) samples are handled during co-teaching:
+        # 'keep'   → all samples participate in training (default)
+        # 'remove' → class-0 dropped from every mini-batch; only TB samples used
+        #            (use when you want the model to focus purely on TB detection
+        #             and do not trust negative labels at all)
+        "class0_mode": "keep",
     }
     with open(os.path.join(model_dir, "ct_config.json"), "w") as f:
         json.dump(ct_config, f, indent=2)
@@ -314,7 +406,7 @@ def main(cli_args=None):
 
         l1, l2 = train_coteaching_epoch(
             net1, net2, opt1, opt2, train_loader, kr, device,
-            log_fn=logger_py.info)
+            class0_mode=ct_config["class0_mode"], log_fn=logger_py.info)
         logger_py.info(f"  avg_loss: net1={l1:.4f}  net2={l2:.4f}")
 
         # --- Proxy metric: net1–net2 prediction agreement ---
@@ -339,6 +431,18 @@ def main(cli_args=None):
     torch.save(net2.state_dict(), f"{hps.model_dir}/net2_final.pt")
     with open(os.path.join(hps.model_dir, "ct_metrics.pkl"), "wb") as f:
         pickle.dump(metrics_history, f)
+
+    # --- Save label analysis (denoised labels) ---
+    logger_py.info("\nGenerating label analysis...")
+    save_label_analysis(
+        net1, net2, df_train, hps,
+        noisy_labels=df_train[hps.data.target_column].values,
+        save_path=os.path.join(hps.model_dir, "label_analysis.csv"),
+        device=device,
+        use_precomputed=args.use_precomputed,
+        precomputed_dir=args.precomputed_dir,
+        log_fn=logger_py.info,
+    )
 
     logger_py.info("Co-Teaching training complete.")
 
